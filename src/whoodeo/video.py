@@ -1,6 +1,12 @@
+import io
+
 import av
 import numpy as np
 import torch
+from PIL import Image
+
+# Fast lossless. These files are for looking, not for the smallest archive.
+_PNG_COMPRESS = 1
 
 
 def rgb_image(tensor):
@@ -11,6 +17,13 @@ def rgb_image(tensor):
         raise ValueError(f"expected RGB channels first, got {tuple(tensor.shape)}")
     image = tensor.detach().permute(1, 2, 0).cpu().numpy()
     return (np.clip(image, 0, 1) * 255.0).astype(np.uint8)
+
+
+def png_bytes(rgb):
+    """HWC uint8 RGB as a PNG."""
+    buffer = io.BytesIO()
+    Image.fromarray(rgb, mode="RGB").save(buffer, format="PNG", compress_level=_PNG_COMPRESS)
+    return buffer.getvalue()
 
 
 def read_video_frames(video_path, start_sec=0):

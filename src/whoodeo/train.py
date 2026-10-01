@@ -36,7 +36,7 @@ from whoodeo.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.live import add_live_args, open_live
 from whoodeo.nets import build_model
 from whoodeo.objective import Objective, pixel_loss
-from whoodeo.video import rgb_image
+from whoodeo.video import png_bytes, rgb_image
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 SCALE = 2
@@ -443,8 +443,22 @@ def measure_raw_means(model, films, specs, radius, batch_size, device, cfg, obje
     return layer_means, term_means
 
 
-def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, discriminator):
-    """Mean of the weighted objective. The GAN part uses the center crop."""
+def save_val_images(directory, step, index, low, pred, high, width):
+    """Write one validation sample. low and master stay; the upscale is per step."""
+    folder = directory / f"{index:0{width}d}"
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, tensor in (("low", low), ("master", high)):
+        path = folder / f"{name}.png"
+        if not path.is_file():
+            path.write_bytes(png_bytes(rgb_image(tensor)))
+    (folder / f"upscale-{step:06d}.png").write_bytes(png_bytes(rgb_image(pred)))
+
+
+def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, discriminator, image_dir=None, step=None):
+    """Mean of the weighted objective. The GAN part uses the center crop.
+
+    With image_dir set, each sample is written under image_dir/<index>/.
+    """
     model.eval()
     disc_training = discriminator is not None and discriminator.training
     if discriminator is not None:
@@ -456,12 +470,25 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
     d_acc = 0.0
     saw_d = False
     count = 0
+    saved = 0
+    width = max(2, len(str(max(len(specs) - 1, 0))))
+    center = radius * 3
     gan = cfg.term("gan")
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
             low, high = batch_from_specs(films, chunk, radius, device)
             pred = model(low)
+            if image_dir is not None:
+                for offset in range(len(chunk)):
+                    save_val_images(
+                        image_dir, step, saved + offset,
+                        low[offset, center:center + 3],
+                        pred[offset],
+                        high[offset],
+                        width,
+                    )
+                saved += len(chunk)
             box = None
             d_here = None
             if gan is not None:
@@ -764,6 +791,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
                 val_loss, val_pixel, val_vgg, val_gan, val_d = evaluate(
                     model, films, val_specs, radius, cfg.batch, device,
                     cfg, objective, discriminator,
+                    image_dir=out_dir / "val", step=step,
                 )
                 val_parts = logged_parts(val_pixel, val_vgg, val_gan, val_d)
                 checkpoint()

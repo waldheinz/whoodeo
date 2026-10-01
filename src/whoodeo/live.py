@@ -1,7 +1,7 @@
 """A local web page with the latest frames and any chart series the caller pushes.
 
 The page is served from this process. ``show`` copies the newest images and
-returns; a background thread encodes JPEG with PyAV. Closing the browser
+returns; a background thread encodes PNG with Pillow. Closing the browser
 does not stop the caller.
 """
 
@@ -10,14 +10,14 @@ import re
 import secrets
 import threading
 import time
-from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-import av
 import numpy as np
+
+from whoodeo.video import png_bytes
 
 _PAGE = (Path(__file__).with_name("live.html")).read_bytes()
 _COPY_INTERVAL = 0.2
@@ -81,7 +81,7 @@ class Live:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._pending = None
-        self._jpegs = {}
+        self._pngs = {}
         self._series = {}
         self._status = ""
         self._generation = 0
@@ -97,7 +97,7 @@ class Live:
         self._httpd.live = self
         actual_port = self._httpd.server_address[1]
         self.url = f"http://{_url_host(host)}:{actual_port}{self._prefix}/"
-        self._encoder = threading.Thread(target=self._encode_loop, name="whoodeo-live-jpeg", daemon=True)
+        self._encoder = threading.Thread(target=self._encode_loop, name="whoodeo-live-png", daemon=True)
         self._server_thread = threading.Thread(
             target=self._httpd.serve_forever,
             kwargs={"poll_interval": 0.2},
@@ -112,7 +112,7 @@ class Live:
         """Replace the images on the page. ``frames`` maps a name to HWC uint8 RGB.
 
         Calls closer than five per second are dropped, and this never waits
-        for a browser or for the JPEG encoder.
+        for a browser or for the PNG encoder.
         """
         if not isinstance(frames, dict) or not frames:
             raise ValueError("show() needs at least one named frame")
@@ -188,14 +188,14 @@ class Live:
         if path == "/state.json":
             _send(handler, 200, json.dumps(self._state()).encode(), "application/json")
             return
-        if path.startswith("/frames/") and path.endswith(".jpg"):
-            name = unquote(path[len("/frames/"):-len(".jpg")])
+        if path.startswith("/frames/") and path.endswith(".png"):
+            name = unquote(path[len("/frames/"):-len(".png")])
             with self._lock:
-                blob = self._jpegs.get(name)
+                blob = self._pngs.get(name)
             if blob is None:
                 _send(handler, 404, b"", "text/plain; charset=utf-8")
                 return
-            _send(handler, 200, blob, "image/jpeg")
+            _send(handler, 200, blob, "image/png")
             return
         _send(handler, 404, b"", "text/plain; charset=utf-8")
 
@@ -205,7 +205,7 @@ class Live:
             return {
                 "status": self._status,
                 "generation": self._generation,
-                "frames": list(self._jpegs),
+                "frames": list(self._pngs),
                 "series": series,
             }
 
@@ -219,7 +219,7 @@ class Live:
                 self._wake.clear()
                 continue
             try:
-                encoded = {name: _jpeg(image) for name, image in pending.items()}
+                encoded = {name: png_bytes(image) for name, image in pending.items()}
             except Exception as exc:
                 with self._lock:
                     if not self._reported_encode_error:
@@ -228,7 +228,7 @@ class Live:
                 continue
             with self._lock:
                 self._reported_encode_error = False
-                self._jpegs = encoded
+                self._pngs = encoded
                 self._generation += 1
 
 
@@ -245,20 +245,6 @@ def _url_host(host):
     if ":" in host:
         return f"[{host}]"
     return host
-
-
-def _jpeg(rgb):
-    height, width, _channels = rgb.shape
-    frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
-    codec = av.CodecContext.create("mjpeg", "w")
-    codec.width = width
-    codec.height = height
-    codec.pix_fmt = "yuvj420p"
-    codec.time_base = Fraction(1, 25)
-    codec.options = {"qscale": "4"}
-    packets = list(codec.encode(frame))
-    packets.extend(codec.encode(None))
-    return b"".join(bytes(packet) for packet in packets)
 
 
 def _downsample(points):

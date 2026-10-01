@@ -119,7 +119,7 @@ function render() {
   } else {
     const key = chosen + ":" + state.generation;
     if (key !== shown) {
-      frameEl.src = "frames/" + encodeURIComponent(chosen) + ".jpg?g=" + state.generation;
+      frameEl.src = "frames/" + encodeURIComponent(chosen) + ".png?g=" + state.generation;
       frameEl.alt = chosen;
       shown = key;
     }
