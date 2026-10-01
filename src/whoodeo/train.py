@@ -9,6 +9,9 @@ The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
 before the first step. balance running keeps the weights as shares.
 
+A fresh run validates once at step 0, before any update. The residual is
+zero at init, so that pass is a 2× bilinear upscale.
+
 A gan term adds a U-Net discriminator. Its weights and Adam state are stored
 in the checkpoint. whoodeo-apply reads only the generator. Resuming requires
 the same architecture and the same loss. Learning rates come from the file.
@@ -697,7 +700,22 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
     start_step = int(resumed["step"]) if resumed is not None else 0
     step = start_step
     steps_done = 0
+
+    def validate():
+        """Validation loss, images, and a checkpoint at the current step."""
+        loss, pixel, vgg, gan_value, d_value = evaluate(
+            model, films, val_specs, radius, cfg.batch, device,
+            cfg, objective, discriminator,
+            image_dir=out_dir / "val", step=step,
+        )
+        checkpoint()
+        return loss, logged_parts(pixel, vgg, gan_value, d_value)
+
     try:
+        # Untrained residual is zero, so this is the 2× bilinear baseline.
+        if resumed is None:
+            val_loss, val_parts = validate()
+            log(step, None, val_loss, None, val_parts)
         while cfg.steps is None or steps_done < cfg.steps:
             step += 1
             steps_done += 1
@@ -788,13 +806,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
             val_loss = None
             val_parts = None
             if do_val:
-                val_loss, val_pixel, val_vgg, val_gan, val_d = evaluate(
-                    model, films, val_specs, radius, cfg.batch, device,
-                    cfg, objective, discriminator,
-                    image_dir=out_dir / "val", step=step,
-                )
-                val_parts = logged_parts(val_pixel, val_vgg, val_gan, val_d)
-                checkpoint()
+                val_loss, val_parts = validate()
             log(step, train_loss, val_loss, train_parts, val_parts)
     except KeyboardInterrupt:
         checkpoint()

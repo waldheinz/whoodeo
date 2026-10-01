@@ -7,11 +7,9 @@ does not stop the caller.
 
 import json
 import re
-import secrets
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -88,15 +86,13 @@ class Live:
         self._next_copy = 0.0
         self._reported_encode_error = False
         self._closed = False
-        self._token = None if _loopback(host) else secrets.token_urlsafe(16)
-        self._prefix = "" if self._token is None else f"/{self._token}"
         try:
             self._httpd = _Server((host, port), _Handler)
         except OSError as exc:
             raise SystemExit(f"cannot bind live page at {host}:{port}: {exc}") from exc
         self._httpd.live = self
         actual_port = self._httpd.server_address[1]
-        self.url = f"http://{_url_host(host)}:{actual_port}{self._prefix}/"
+        self.url = f"http://{_url_host(host)}:{actual_port}/"
         self._encoder = threading.Thread(target=self._encode_loop, name="whoodeo-live-png", daemon=True)
         self._server_thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -172,16 +168,6 @@ class Live:
 
     def handle_get(self, handler):
         path = urlparse(handler.path).path
-        prefix = self._prefix
-        if prefix:
-            if path == prefix:
-                _redirect(handler, prefix + "/")
-                return
-            head = prefix + "/"
-            if not path.startswith(head):
-                _send(handler, 404, b"", "text/plain; charset=utf-8")
-                return
-            path = path[len(prefix):] or "/"
         if path == "/":
             _send(handler, 200, _PAGE, "text/html; charset=utf-8")
             return
@@ -232,15 +218,6 @@ class Live:
                 self._generation += 1
 
 
-def _loopback(host):
-    if host == "localhost":
-        return True
-    try:
-        return ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _url_host(host):
     if ":" in host:
         return f"[{host}]"
@@ -256,14 +233,6 @@ def _downsample(points):
         stride = (count - 1) / (_PLOT_LIMIT - 1)
         chosen = [points[min(count - 1, round(index * stride))] for index in range(_PLOT_LIMIT)]
     return [[x, y] for x, y in chosen]
-
-
-def _redirect(handler, location):
-    handler.send_response(302)
-    handler.send_header("Location", location)
-    handler.send_header("Content-Length", "0")
-    handler.send_header("Cache-Control", "no-store")
-    handler.end_headers()
 
 
 def _send(handler, code, body, content_type):
