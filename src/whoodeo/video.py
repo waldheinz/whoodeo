@@ -1,7 +1,17 @@
-import cv2
 import av
-import torch
 import numpy as np
+import torch
+
+
+def rgb_image(tensor):
+    """CHW or NCHW float image in 0..1 as HWC uint8 RGB."""
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    if tensor.dim() != 3 or tensor.shape[0] != 3:
+        raise ValueError(f"expected RGB channels first, got {tuple(tensor.shape)}")
+    image = tensor.detach().permute(1, 2, 0).cpu().numpy()
+    return (np.clip(image, 0, 1) * 255.0).astype(np.uint8)
+
 
 def read_video_frames(video_path, start_sec=0):
     with av.open(video_path) as container:
@@ -14,79 +24,6 @@ def read_video_frames(video_path, start_sec=0):
             array = frame.to_ndarray(format='rgb24')  # Shape: (height, width, 3)
             tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 255.0
             yield tensor
-
-
-def chw_to_bgr(tensor):
-    image = tensor.detach().cpu().numpy().transpose(1, 2, 0)
-    image = (np.clip(image, 0, 1) * 255).astype('uint8')
-    return cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-
-def label(image, text, x):
-    origin = (x, 32)
-    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 1, cv2.LINE_AA)
-
-
-def preview_image(item):
-    if not isinstance(item, tuple):
-        return chw_to_bgr(item)
-    low, recon = item
-    _, recon_h, recon_w = recon.shape
-    low_bgr = chw_to_bgr(low)
-    low_bgr = cv2.resize(low_bgr, (recon_w, recon_h), interpolation=cv2.INTER_NEAREST)
-    recon_bgr = chw_to_bgr(recon)
-    gap = np.zeros((recon_h, 4, 3), dtype=np.uint8)
-    image = np.concatenate([low_bgr, gap, recon_bgr], axis=1)
-    label(image, "low-res", 16)
-    label(image, "recon", recon_w + 4 + 16)
-    return image
-
-
-def frame_for_display(item, min_height=0):
-    image = preview_image(item)
-    height, width = image.shape[:2]
-    if min_height and height < min_height:
-        scale = min_height / height
-        image = cv2.resize(
-            image,
-            (int(round(width * scale)), min_height),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        height, width = image.shape[:2]
-    if width > 1800:
-        scale = 1800 / width
-        image = cv2.resize(
-            image,
-            (1800, int(round(height * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    return image
-
-
-class Preview:
-    def __init__(self, min_height=0):
-        self.min_height = min_height
-        self.ready = False
-
-    def show(self, item):
-        image = frame_for_display(item, self.min_height)
-        if not self.ready:
-            cv2.namedWindow("Live Display", cv2.WINDOW_NORMAL)
-            self.ready = True
-        cv2.imshow("Live Display", image)
-        cv2.waitKey(1)
-
-    def close(self):
-        if self.ready:
-            cv2.destroyAllWindows()
-
-
-def show_video_window(gen):
-    preview = Preview()
-    for item in gen:
-        preview.show(item)
-    preview.close()
 
 
 def write_video(generator, output_path, fps=30):

@@ -2,7 +2,7 @@
 
 The network runs on each full frame. A 5-frame model sees the center frame
 plus two neighbors on either side, repeating the first or last frame at the
-ends. The live window shows the input beside the reconstruction. Audio
+ends. The live page shows the input and the reconstruction. Audio
 streams are copied packet for packet, without re-encoding.
 """
 
@@ -16,8 +16,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from whoodeo.live import add_live_args, open_live
 from whoodeo.nets import build_model
-from whoodeo.video import Preview, read_video_frames
+from whoodeo.video import read_video_frames, rgb_image
 
 
 def get_device():
@@ -223,59 +224,67 @@ def apply(args):
         print("audio none", flush=True)
     print(f"output {out}  libx265 main10 yuv420p10le crf 25", flush=True)
 
-    preview = None if args.no_preview else Preview()
-    container = av.open(str(out), "w")
-    stream = container.add_stream("libx265", rate=fps)
-    stream.options = {"crf": "25", "profile": "main10", "x265-params": "log-level=error"}
+    live = open_live(args.live_bind, not args.no_preview)
     try:
-        audio_map = attach_audio(container, source)
-    except ValueError as exc:
-        container.close()
-        source.close()
-        out.unlink(missing_ok=True)
-        raise SystemExit(f"cannot copy audio into {out.name}: {exc}") from exc
-    configured = [False]
-    frames = iter_reconstructions(
-        model,
-        read_video_frames(args.input),
-        in_frames // 2,
-        device,
-    )
-    count = 0
-    interrupted = False
-    bar = tqdm(
-        total=output_frame_count(source, video_in, fps, args.frames),
-        desc=out.name,
-        unit="frame",
-    )
-    try:
-        for low, recon in frames:
-            count += 1
-            if preview is not None:
-                preview.show((low, recon))
-            encode_frame(container, stream, recon, configured)
-            bar.update(1)
-            if args.frames and count >= args.frames:
-                break
-    except KeyboardInterrupt:
-        interrupted = True
-        bar.close()
-        print(f"interrupted after {count} frames", flush=True)
-    finally:
-        frames.close()
-        bar.close()
+        container = av.open(str(out), "w")
+        stream = container.add_stream("libx265", rate=fps)
+        stream.options = {"crf": "25", "profile": "main10", "x265-params": "log-level=error"}
         try:
-            if configured[0]:
-                for packet in stream.encode():
-                    container.mux(packet)
-                limit = count / float(fps) if args.frames or interrupted else None
-                copy_audio(container, source, audio_map, limit)
-        finally:
+            audio_map = attach_audio(container, source)
+        except ValueError as exc:
             container.close()
             source.close()
-            if preview is not None:
-                preview.close()
-    print(f"wrote {count} frames  {out}", flush=True)
+            out.unlink(missing_ok=True)
+            raise SystemExit(f"cannot copy audio into {out.name}: {exc}") from exc
+        configured = [False]
+        frames = iter_reconstructions(
+            model,
+            read_video_frames(args.input),
+            in_frames // 2,
+            device,
+        )
+        count = 0
+        interrupted = False
+        total = output_frame_count(source, video_in, fps, args.frames)
+        bar = tqdm(
+            total=total,
+            desc=out.name,
+            unit="frame",
+        )
+        try:
+            for low, recon in frames:
+                count += 1
+                if live is not None:
+                    progress = f"{count}/{total}" if total else str(count)
+                    live.status(f"{out.name}  {progress}")
+                    live.show({
+                        "low": rgb_image(low),
+                        "recon": rgb_image(recon),
+                    })
+                encode_frame(container, stream, recon, configured)
+                bar.update(1)
+                if args.frames and count >= args.frames:
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            bar.close()
+            print(f"interrupted after {count} frames", flush=True)
+        finally:
+            frames.close()
+            bar.close()
+            try:
+                if configured[0]:
+                    for packet in stream.encode():
+                        container.mux(packet)
+                    limit = count / float(fps) if args.frames or interrupted else None
+                    copy_audio(container, source, audio_map, limit)
+            finally:
+                container.close()
+                source.close()
+        print(f"wrote {count} frames  {out}", flush=True)
+    finally:
+        if live is not None:
+            live.close()
 
 
 def parse_args():
@@ -284,7 +293,7 @@ def parse_args():
     parser.add_argument("input", type=Path, help="video to reconstruct")
     parser.add_argument("--out", type=Path, default=None, help="mkv to write (default: next to the checkpoint)")
     parser.add_argument("--frames", type=int, default=0, help="stop after this many frames; 0 means the whole video")
-    parser.add_argument("--no-preview", action="store_true", help="do not open the live window")
+    add_live_args(parser)
     return parser.parse_args()
 
 

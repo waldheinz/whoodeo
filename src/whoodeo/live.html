@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>whoodeo</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      background: #141414;
+      color: #e8e8e8;
+      font: 15px/1.4 system-ui, sans-serif;
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    #status {
+      min-height: 1.4em;
+      margin: 0 0 12px;
+      color: #c8c8c8;
+      word-break: break-word;
+    }
+    #views { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    button {
+      background: #242424;
+      color: inherit;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      padding: 6px 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button[aria-pressed="true"] { background: #2c4a6e; border-color: #4d78ab; }
+    #stage {
+      background: #0c0c0c;
+      border-radius: 8px;
+      min-height: 240px;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }
+    #frame { max-width: 100%; max-height: 70vh; display: none; }
+    #waiting { margin: 0; color: #8a8a8a; }
+    #chart { margin-top: 16px; }
+    #plot { width: 100%; height: 280px; display: block; }
+    #legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+    .key { display: inline-flex; align-items: center; gap: 6px; }
+    .swatch { width: 12px; height: 12px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+<main>
+  <p id="status"></p>
+  <div id="views"></div>
+  <div id="stage">
+    <img id="frame" alt="">
+    <p id="waiting">waiting for a frame</p>
+  </div>
+  <section id="chart" hidden>
+    <canvas id="plot"></canvas>
+    <div id="legend"></div>
+  </section>
+</main>
+<script>
+const COLORS = ["#9ec1e6", "#e3a15a", "#8dca9e", "#d2a4de", "#e6d38a", "#8fd0d0", "#e7a8a0", "#c5c8c6"];
+const PREFERRED = ["upscale", "recon", "master", "low"];
+const statusEl = document.getElementById("status");
+const viewsEl = document.getElementById("views");
+const frameEl = document.getElementById("frame");
+const waitingEl = document.getElementById("waiting");
+const chartEl = document.getElementById("chart");
+const plotEl = document.getElementById("plot");
+const legendEl = document.getElementById("legend");
+let chosen = null;
+let shown = "";
+let legendKey = "";
+let framesKey = "";
+let last = { status: "", generation: 0, frames: [], series: {} };
+
+function pick(frames) {
+  if (chosen && frames.includes(chosen)) return chosen;
+  for (const name of PREFERRED) {
+    if (frames.includes(name)) return name;
+  }
+  return frames[0] || null;
+}
+
+function render() {
+  const state = last;
+  statusEl.textContent = state.status || "";
+  const frames = state.frames || [];
+  chosen = pick(frames);
+  const key = frames.join("\0");
+  if (key !== framesKey) {
+    framesKey = key;
+    viewsEl.replaceChildren(...frames.map((name) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = name;
+      button.dataset.name = name;
+      button.addEventListener("click", () => {
+        chosen = name;
+        render();
+      });
+      return button;
+    }));
+  }
+  for (const button of viewsEl.querySelectorAll("button")) {
+    button.setAttribute("aria-pressed", button.dataset.name === chosen ? "true" : "false");
+  }
+  if (!chosen || !state.generation) {
+    frameEl.style.display = "none";
+    frameEl.removeAttribute("src");
+    waitingEl.hidden = false;
+    shown = "";
+  } else {
+    const key = chosen + ":" + state.generation;
+    if (key !== shown) {
+      frameEl.src = "frames/" + encodeURIComponent(chosen) + ".jpg?g=" + state.generation;
+      frameEl.alt = chosen;
+      shown = key;
+    }
+    frameEl.style.display = "block";
+    waitingEl.hidden = true;
+  }
+  draw(state.series || {});
+}
+
+function draw(series) {
+  const names = Object.keys(series);
+  chartEl.hidden = names.length === 0;
+  if (!names.length) return;
+  const nextLegend = names.join("\0");
+  if (nextLegend !== legendKey) {
+    legendKey = nextLegend;
+    legendEl.replaceChildren(...names.map((name, index) => {
+      const item = document.createElement("span");
+      item.className = "key";
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = COLORS[index % COLORS.length];
+      item.append(swatch, document.createTextNode(name));
+      return item;
+    }));
+  }
+  const dpr = window.devicePixelRatio || 1;
+  const width = plotEl.clientWidth || 600;
+  const height = plotEl.clientHeight || 280;
+  plotEl.width = Math.round(width * dpr);
+  plotEl.height = Math.round(height * dpr);
+  const g = plotEl.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, width, height);
+  const pad = { left: 64, right: 12, top: 12, bottom: 28 };
+  const plotW = width - pad.left - pad.right;
+  const plotH = height - pad.top - pad.bottom;
+  let xs = [];
+  let ys = [];
+  for (const name of names) {
+    for (const point of series[name]) {
+      if (point[1] > 0) {
+        xs.push(point[0]);
+        ys.push(point[1]);
+      }
+    }
+  }
+  if (!xs.length || plotW < 10 || plotH < 10) return;
+  let x0 = Math.min(...xs);
+  let x1 = Math.max(...xs);
+  let y0 = Math.min(...ys);
+  let y1 = Math.max(...ys);
+  if (x0 === x1) { x0 -= 1; x1 += 1; }
+  if (y0 === y1) { y0 *= 0.8; y1 *= 1.25; }
+  const log0 = Math.log(y0);
+  const log1 = Math.log(y1);
+  const xOf = (x) => pad.left + (x - x0) / (x1 - x0) * plotW;
+  const yOf = (y) => pad.top + (1 - (Math.log(y) - log0) / (log1 - log0)) * plotH;
+  g.strokeStyle = "#2e2e2e";
+  g.fillStyle = "#9a9a9a";
+  g.font = "12px system-ui, sans-serif";
+  g.textAlign = "right";
+  g.textBaseline = "middle";
+  for (let tick = 0; tick < 4; tick += 1) {
+    const y = y0 * Math.exp((log1 - log0) * tick / 3);
+    const py = yOf(y);
+    g.beginPath();
+    g.moveTo(pad.left, py);
+    g.lineTo(width - pad.right, py);
+    g.stroke();
+    g.fillText(y.toPrecision(3), pad.left - 8, py);
+  }
+  g.textAlign = "center";
+  g.textBaseline = "top";
+  g.fillText(String(x0), pad.left, height - pad.bottom + 8);
+  g.fillText(String(x1), width - pad.right, height - pad.bottom + 8);
+  names.forEach((name, index) => {
+    const points = series[name].filter((point) => point[1] > 0);
+    if (!points.length) return;
+    g.strokeStyle = COLORS[index % COLORS.length];
+    g.lineWidth = 1.5;
+    g.beginPath();
+    points.forEach((point, i) => {
+      const px = xOf(point[0]);
+      const py = yOf(point[1]);
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    });
+    g.stroke();
+  });
+}
+
+async function tick() {
+  try {
+    const response = await fetch("state.json", { cache: "no-store" });
+    if (!response.ok) return;
+    last = await response.json();
+    render();
+  } catch (error) {
+    statusEl.textContent = "live page disconnected";
+  }
+}
+
+tick();
+setInterval(tick, 500);
+</script>
+</body>
+</html>

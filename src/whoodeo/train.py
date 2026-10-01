@@ -33,9 +33,10 @@ import torch
 from whoodeo.catalog import data_root
 from whoodeo.config import assert_resume_matches, load_config, shape_text
 from whoodeo.discriminator import UNetDiscriminatorSN, gan_bce
+from whoodeo.live import add_live_args, open_live
 from whoodeo.nets import build_model
 from whoodeo.objective import Objective, pixel_loss
-from whoodeo.video import Preview
+from whoodeo.video import rgb_image
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 SCALE = 2
@@ -497,7 +498,31 @@ def apply_learning_rate(optimizer, lr):
         group["lr"] = lr
 
 
-def train(cfg, preview=True):
+_LOSS_SERIES = (
+    ("train", 1),
+    ("val", 2),
+    ("pixel", 3),
+    ("vgg", 4),
+    ("gan", 5),
+    ("d", 6),
+    ("val pixel", 7),
+    ("val vgg", 8),
+    ("val gan", 9),
+    ("val d", 10),
+)
+
+
+def push_loss_series(live, rows):
+    if live is None:
+        return
+    for name, index in _LOSS_SERIES:
+        xs = [row[0] for row in rows if row[index] is not None]
+        ys = [row[index] for row in rows if row[index] is not None]
+        if xs:
+            live.series(name, xs, ys)
+
+
+def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
     rng = random.Random(cfg.seed)
     torch.manual_seed(cfg.seed)
     radius = cfg.in_frames // 2
@@ -604,7 +629,9 @@ def train(cfg, preview=True):
         objective.calibrate(layer_means, term_means)
     describe_loss(cfg, objective)
 
-    preview = Preview() if preview else None
+    live = open_live(live_bind, preview)
+    if live is not None:
+        push_loss_series(live, rows)
     running = 0.0
     running_pixel = 0.0
     running_vgg = 0.0
@@ -624,12 +651,15 @@ def train(cfg, preview=True):
 
     def log(step, train_loss, val_loss, train_parts, val_parts):
         append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts)
+        push_loss_series(live, rows)
         if val_loss is None:
             return
         message = f"step {step:06d}  val {val_loss:.6f}"
         if val_parts is not None:
             message += "  " + part_text(*val_parts)
         print(message, flush=True)
+        if live is not None:
+            live.status(message)
 
     def checkpoint():
         save_checkpoint(
@@ -690,20 +720,22 @@ def train(cfg, preview=True):
                 weighted["gan"].item() if gan is not None else None,
                 d_value,
             )
-            print(
+            line = (
                 f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
                 f"loss {loss.item():.6f}  {part_text(*batch_parts)}  "
                 f"{batch_variant.low.width}x{batch_variant.low.height}  "
-                f"{batch_variant.name}  {batch_film.name}",
-                flush=True,
+                f"{batch_variant.name}  {batch_film.name}"
             )
+            print(line, flush=True)
 
-            if preview is not None:
+            if live is not None:
                 center = radius * 3
-                preview.show((
-                    low[0, center:center + 3].detach(),
-                    pred[0].detach(),
-                ))
+                live.status(line)
+                live.show({
+                    "low": rgb_image(low[0, center:center + 3]),
+                    "upscale": rgb_image(pred[0]),
+                    "master": rgb_image(high[0]),
+                })
 
             finished = cfg.steps is not None and steps_done == cfg.steps
             do_log = step % cfg.log_every == 0 or finished
@@ -739,12 +771,11 @@ def train(cfg, preview=True):
     except KeyboardInterrupt:
         checkpoint()
         print(f"interrupted, saved {ckpt_path}", flush=True)
-        if preview is not None:
-            preview.close()
         return
+    finally:
+        if live is not None:
+            live.close()
 
-    if preview is not None:
-        preview.close()
     for film in films:
         film.orig.close()
         for variant in film.variants:
@@ -755,9 +786,9 @@ def train(cfg, preview=True):
 def main():
     parser = argparse.ArgumentParser(description="train on random paired video frames")
     parser.add_argument("config", type=Path, help="training recipe")
-    parser.add_argument("--no-preview", action="store_true", help="do not open the live window")
+    add_live_args(parser)
     args = parser.parse_args()
-    train(load_config(args.config), preview=not args.no_preview)
+    train(load_config(args.config), preview=not args.no_preview, live_bind=args.live_bind)
 
 
 if __name__ == "__main__":
