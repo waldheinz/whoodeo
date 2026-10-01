@@ -1,0 +1,33 @@
+[project]
+name = "whoodeo"
+version = "0.1.0"
+description = "Train a video super-resolution model and reconstruct a video with it"
+requires-python = ">=3.14"
+dependencies = [
+    "av",
+    "matplotlib",
+    "numpy",
+    "opencv-python",
+    "torch",
+    "torchvision",
+    "tqdm",
+]
+
+[project.scripts]
+whoodeo-train = "whoodeo.train:main"
+whoodeo-apply = "whoodeo.apply:main"
+whoodeo-make-low = "whoodeo.make_low:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# PyPI ships the CUDA wheel on Linux and the macOS wheel (MPS included) on
+# darwin. uv lock records both. uv sync installs the wheel for the machine
+# it runs on. No extra index: the PyPI Linux build is the CUDA 13 build.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whoodeo"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/whoodeo/degrade.json" = "whoodeo/degrade.json"
