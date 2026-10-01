@@ -1,0 +1,29 @@
+# Full-frame 2x training. The first term anchors the loss magnitude.
+# balance: start freezes the scales on the validation frames.
+# balance: running keeps the weights as shares (EMA 0.99).
+# Optional keys, omitted here: steps, out, resume.
+
+arch: modified
+blocks: 32
+channels: 256
+in_frames: 5
+batch: 1
+lr: 2.0e-5
+holdout: 0.1
+log_every: 50
+val_every: 500
+val_count: 32
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 0.45
+      kind: mse
+    - name: vgg
+      weight: 0.45
+      layers: [relu2_2, relu3_4]
+    - name: gan
+      weight: 0.10
+      crop: 256
+      disc_lr: 1.0e-4

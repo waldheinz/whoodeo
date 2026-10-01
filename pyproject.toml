@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "opencv-python",
+    "pyyaml>=6.0.3",
     "torch",
     "torchvision",
     "tqdm",

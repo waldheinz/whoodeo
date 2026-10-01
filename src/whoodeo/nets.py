@@ -1,9 +1,8 @@
 """Named networks shared by train and apply.
 
-`modified` is a residual ESPCN. Its default, 32 blocks and 64 channels, is about
-2.4 million parameters. `deform` keeps that stack and aligns the neighbor frames
-with a deformable 3x3. `espcn` and `edsr` are the other architectures already
-in the repo. `--blocks` and `--channels` override the preset for modified, deform, and edsr.
+`modified` is a residual ESPCN. `deform` keeps that stack and aligns the
+neighbor frames with a deformable 3x3. `espcn` and `edsr` are the other
+architectures. The training config sets depth, width, and input frames.
 """
 
 from whoodeo.model import DeformESPCN, ESPCN, ModifiedESPCN
@@ -17,13 +16,6 @@ PRESETS = {
 }
 
 
-def add_model_args(parser):
-    parser.add_argument("--arch", default="modified", choices=sorted(PRESETS))
-    parser.add_argument("--blocks", type=int, default=None, help="override preset depth")
-    parser.add_argument("--channels", type=int, default=None, help="override preset width")
-    parser.add_argument("--in-frames", type=int, default=5)
-
-
 def build_model(arch, blocks=None, channels=None, in_frames=5):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -34,7 +26,7 @@ def build_model(arch, blocks=None, channels=None, in_frames=5):
         raise SystemExit(f"{arch} takes {fixed_frames} input frame, not {in_frames}")
     if arch == "espcn":
         if blocks is not None or channels is not None:
-            raise SystemExit("espcn has a fixed size; --blocks and --channels apply to modified, deform, and edsr")
+            raise SystemExit("espcn has a fixed size")
         model = ESPCN()
         label = f"espcn in_frames 1 parameters {sum(p.numel() for p in model.parameters())}"
         return model, label
@@ -42,7 +34,7 @@ def build_model(arch, blocks=None, channels=None, in_frames=5):
     depth = preset["blocks"] if blocks is None else blocks
     width = preset["channels"] if channels is None else channels
     if depth < 1 or width < 1:
-        raise SystemExit("--blocks and --channels must be positive")
+        raise SystemExit("blocks and channels must be positive")
     if arch == "modified":
         model = ModifiedESPCN(num_res_blocks=depth, num_filters=width, in_frames=in_frames)
     elif arch == "deform":

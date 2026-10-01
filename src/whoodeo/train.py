@@ -1,26 +1,24 @@
 """Train on random full frames from paired videos.
 
-Masters live in --orig. Each subdirectory of --low is one degradation
-variant and keeps the source filename. A step picks one film, then one of
-its variants, then as many center times as the batch size. Two time spans
-per variant are held out for validation.
+The recipe is a YAML file. Masters live in $WHOODEO_DATA/orig and degraded
+variants in $WHOODEO_DATA/low. A step picks one film, then one variant, then
+as many center times as the batch size. Two time spans per variant are held
+out for validation.
 
-When --gan is above zero, a U-Net discriminator scores one HD crop per step.
-Its weights and Adam state are stored in the checkpoint and restored by
---resume. whoodeo-apply reads only the generator.
+The loss is the weighted sum of the terms in the file. The first term anchors
+the magnitude. balance start freezes the scales on the validation frames
+before the first step. balance running keeps the weights as shares.
 
-A fresh run trains modified ESPCN at 32 blocks, 256 channels, batch 1,
-generator learning rate 2e-5, discriminator learning rate 1e-4, and GAN
-share 0.1. --resume keeps the checkpoint's architecture, width, batch, and
-generator learning rate unless those flags are passed. The discriminator
-learning rate is the current --disc-lr, including after a resume.
+A gan term adds a U-Net discriminator. Its weights and Adam state are stored
+in the checkpoint. whoodeo-apply reads only the generator. Resuming requires
+the same architecture and the same loss. Learning rates come from the file.
 """
 
 import argparse
 import csv
 import os
 import random
-import sys
+import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -32,54 +30,15 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from whoodeo.apply import detect_arch, infer_deform, infer_edsr, infer_modified
-from whoodeo.catalog import EnvPath, resolve_data
+from whoodeo.catalog import data_root
+from whoodeo.config import assert_resume_matches, load_config, shape_text
 from whoodeo.discriminator import UNetDiscriminatorSN, gan_bce
-from whoodeo.nets import add_model_args, build_model
+from whoodeo.nets import build_model
+from whoodeo.objective import Objective, pixel_loss
 from whoodeo.video import Preview
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 SCALE = 2
-
-
-class VGGLoss(nn.Module):
-    """Mean L1 on frozen VGG19 relu2_2 and relu3_4. The classifier head is dropped."""
-
-    LAYERS = (8, 17)
-
-    def __init__(self):
-        super().__init__()
-        from torchvision.models import VGG19_Weights, vgg19
-
-        features = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features[: self.LAYERS[-1] + 1]
-        for layer in features:
-            if isinstance(layer, nn.ReLU):
-                layer.inplace = False
-        self.features = features.eval()
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def maps(self, image):
-        hidden = (image - self.mean) / self.std
-        found = []
-        for index, layer in enumerate(self.features):
-            hidden = layer(hidden)
-            if index in self.LAYERS:
-                found.append(hidden)
-        return found
-
-    def forward(self, pred, target):
-        pred_maps = self.maps(pred.clamp(0, 1))
-        with torch.no_grad():
-            target_maps = self.maps(target.clamp(0, 1))
-        loss = pred.new_zeros(())
-        for pred_map, target_map in zip(pred_maps, target_maps):
-            loss = loss + F.l1_loss(pred_map, target_map)
-        return loss / len(self.LAYERS)
 
 
 def get_device():
@@ -258,8 +217,8 @@ def batch_from_specs(films, specs, radius, device):
 
 CSV_COLUMNS = [
     "step", "train_loss", "val_loss",
-    "train_mse", "train_vgg", "train_gan", "train_d",
-    "val_mse", "val_vgg", "val_gan", "val_d",
+    "train_pixel", "train_vgg", "train_gan", "train_d",
+    "val_pixel", "val_vgg", "val_gan", "val_d",
 ]
 
 
@@ -315,12 +274,12 @@ def write_loss_csv(csv_path, rows):
             writer.writerow([row[0], *(format_cell(value) for value in row[1:])])
 
 
-def save_checkpoint(path, step, model, optimizer, args, discriminator=None, disc_optimizer=None):
+def save_checkpoint(path, step, model, optimizer, saved, discriminator=None, disc_optimizer=None):
     payload = {
         "step": step,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "args": vars(args),
+        "args": saved,
     }
     if discriminator is not None:
         payload["discriminator"] = discriminator.state_dict()
@@ -352,11 +311,11 @@ def load_rows(csv_path):
                 int(record["step"]),
                 cell("train_loss"),
                 cell("val_loss"),
-                cell("train_mse"),
+                cell("train_pixel"),
                 cell("train_vgg"),
                 cell("train_gan"),
                 cell("train_d"),
-                cell("val_mse"),
+                cell("val_pixel"),
                 cell("val_vgg"),
                 cell("val_gan"),
                 cell("val_d"),
@@ -385,52 +344,140 @@ def take(image, box):
     return image[:, :, top:top + crop_h, left:left + crop_w]
 
 
-def objective_parts(pred, high, perceptual, vgg_scale):
-    mse = F.mse_loss(pred, high)
-    if perceptual is None:
-        return mse, mse, mse.new_zeros(())
-    vgg_term = vgg_scale * perceptual(pred, high)
-    return mse + vgg_term, mse, vgg_term
+def part_text(pixel, vgg, gan, d_loss):
+    parts = []
+    if pixel is not None:
+        parts.append(f"pixel {pixel:.6f}")
+    if vgg is not None:
+        parts.append(f"vgg {vgg:.6f}")
+    if gan is not None:
+        parts.append(f"gan {gan:.6f}")
+    if d_loss is not None:
+        parts.append(f"d {d_loss:.4f}")
+    return "  ".join(parts)
 
 
-def evaluate(model, films, specs, radius, batch_size, device, perceptual, vgg_scale,
-             discriminator, gan_scale, gan_crop):
-    """Mean of the generator objective and its MSE, VGG, and weighted GAN parts.
+def checkpoint_args(cfg, objective):
+    gan = cfg.term("gan")
+    return {
+        "arch": cfg.arch,
+        "blocks": cfg.blocks,
+        "channels": cfg.channels,
+        "in_frames": cfg.in_frames,
+        "batch": cfg.batch,
+        "lr": cfg.lr,
+        "disc_lr": None if gan is None else gan.disc_lr,
+        "loss": cfg.loss_recipe(),
+        "objective": objective.state_dict(),
+    }
 
-    The GAN part uses the center crop. Validation does not update either network.
-    """
+
+def describe_loss(cfg, objective):
+    print(f"loss balance {cfg.balance}  anchor {cfg.terms[0].name}", flush=True)
+    for term in cfg.terms:
+        raw = objective.term_ref[term.name]
+        scale = objective.scale[term.name]
+        weighted = scale * raw
+        if term.name == "pixel":
+            detail = term.kind
+        elif term.name == "vgg":
+            detail = "+".join(term.layers)
+        else:
+            detail = f"crop {term.crop}"
+        print(
+            f"  {term.name} {detail}  weight {term.weight:.2f}  "
+            f"scale {scale:.6g}  ref {raw:.6g}  weighted {weighted:.6g}",
+            flush=True,
+        )
+
+
+def raw_terms(objective, cfg, pred, high, discriminator, box):
+    raw = {}
+    layer_raw = {}
+    pixel = cfg.term("pixel")
+    if pixel is not None:
+        raw["pixel"] = pixel_loss(pred, high, pixel.kind)
+    if cfg.term("vgg") is not None:
+        raw["vgg"], layer_raw = objective.vgg_raw(pred, high)
+    if cfg.term("gan") is not None:
+        raw["gan"] = gan_bce(discriminator(take(pred, box)), True)
+    return raw, layer_raw
+
+
+def measure_raw_means(model, films, specs, radius, batch_size, device, cfg, objective, discriminator):
     model.eval()
-    disc_training = discriminator is not None and discriminator.training
     if discriminator is not None:
         discriminator.eval()
-    loss_acc = 0.0
-    mse_acc = 0.0
-    vgg_acc = 0.0
-    gan_acc = 0.0
-    d_acc = 0.0
-    saw_d = False
     count = 0
+    pixel_acc = 0.0
+    gan_acc = 0.0
+    layer_acc = {name: 0.0 for name in objective.vgg_layers}
+    pixel = cfg.term("pixel")
+    gan = cfg.term("gan")
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
             low, high = batch_from_specs(films, chunk, radius, device)
             pred = model(low)
-            mse_total, mse, vgg_term = objective_parts(pred, high, perceptual, vgg_scale)
-            gan_term = pred.new_zeros(())
-            d_here = None
-            if discriminator is not None and gan_scale != 0:
-                box = sample_box(high, gan_crop, None)
-                fake_logits = discriminator(take(pred, box))
-                real_logits = discriminator(take(high, box))
-                gan_term = gan_scale * gan_bce(fake_logits, True)
-                d_here = 0.5 * (
-                    gan_bce(real_logits, True).item() + gan_bce(fake_logits, False).item()
-                )
             frames = len(chunk)
-            loss_acc += (mse_total + gan_term).item() * frames
-            mse_acc += mse.item() * frames
-            vgg_acc += vgg_term.item() * frames
-            gan_acc += gan_term.item() * frames
+            if pixel is not None:
+                pixel_acc += pixel_loss(pred, high, pixel.kind).item() * frames
+            if objective.vgg is not None:
+                for name, loss in objective.vgg.layer_losses(pred, high).items():
+                    layer_acc[name] += loss.item() * frames
+            if gan is not None:
+                box = sample_box(high, gan.crop, None)
+                fake = discriminator(take(pred, box))
+                gan_acc += gan_bce(fake, True).item() * frames
+            count += frames
+    model.train()
+    if discriminator is not None:
+        discriminator.train()
+    term_means = {}
+    if pixel is not None:
+        term_means["pixel"] = pixel_acc / count
+    if gan is not None:
+        term_means["gan"] = gan_acc / count
+    layer_means = {name: value / count for name, value in layer_acc.items()}
+    return layer_means, term_means
+
+
+def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, discriminator):
+    """Mean of the weighted objective. The GAN part uses the center crop."""
+    model.eval()
+    disc_training = discriminator is not None and discriminator.training
+    if discriminator is not None:
+        discriminator.eval()
+    loss_acc = 0.0
+    pixel_acc = 0.0
+    vgg_acc = 0.0
+    gan_acc = 0.0
+    d_acc = 0.0
+    saw_d = False
+    count = 0
+    gan = cfg.term("gan")
+    with torch.no_grad():
+        for start in range(0, len(specs), batch_size):
+            chunk = specs[start:start + batch_size]
+            low, high = batch_from_specs(films, chunk, radius, device)
+            pred = model(low)
+            box = None
+            d_here = None
+            if gan is not None:
+                box = sample_box(high, gan.crop, None)
+                fake = discriminator(take(pred, box))
+                real = discriminator(take(high, box))
+                d_here = 0.5 * (gan_bce(real, True).item() + gan_bce(fake, False).item())
+            raw, _layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
+            total, weighted = objective.combine(raw)
+            frames = len(chunk)
+            loss_acc += total.item() * frames
+            if "pixel" in weighted:
+                pixel_acc += weighted["pixel"].item() * frames
+            if "vgg" in weighted:
+                vgg_acc += weighted["vgg"].item() * frames
+            if "gan" in weighted:
+                gan_acc += weighted["gan"].item() * frames
             if d_here is not None:
                 d_acc += d_here * frames
                 saw_d = True
@@ -438,96 +485,40 @@ def evaluate(model, films, specs, radius, batch_size, device, perceptual, vgg_sc
     model.train()
     if disc_training:
         discriminator.train()
+    pixel_mean = pixel_acc / count if cfg.term("pixel") is not None else None
+    vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
+    gan_mean = gan_acc / count if gan is not None else None
     d_mean = d_acc / count if saw_d else None
-    return loss_acc / count, mse_acc / count, vgg_acc / count, gan_acc / count, d_mean
+    return loss_acc / count, pixel_mean, vgg_mean, gan_mean, d_mean
 
 
-def option_passed(name):
-    flag = f"--{name}"
-    for token in sys.argv[1:]:
-        if token.split("=", 1)[0] == flag:
-            return True
-    return False
+def apply_learning_rate(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
-def checkpoint_shape(arch, state, saved_args):
-    """Blocks, channels, and frames stored in a checkpoint, filled in from the weights."""
-    blocks = saved_args.get("blocks")
-    channels = saved_args.get("channels")
-    in_frames = saved_args.get("in_frames")
-    if arch == "modified":
-        found_blocks, found_channels, found_frames = infer_modified(state)
-    elif arch == "deform":
-        found_blocks, found_channels, found_frames = infer_deform(state)
-    elif arch == "edsr":
-        found_blocks, found_channels = infer_edsr(state)
-        found_frames = 1
-    else:
-        return None, None, 1 if in_frames is None else in_frames
-    if blocks is None:
-        blocks = found_blocks
-    if channels is None:
-        channels = found_channels
-    if in_frames is None:
-        in_frames = found_frames
-    return blocks, channels, in_frames
-
-
-def adopt_checkpoint_run(args, state, saved_args):
-    """Continue the saved run. Flags on the command line still win."""
-    if not option_passed("arch"):
-        args.arch = saved_args.get("arch") or detect_arch(state)
-    blocks, channels, in_frames = checkpoint_shape(args.arch, state, saved_args)
-    if not option_passed("blocks"):
-        args.blocks = blocks
-    if not option_passed("channels"):
-        args.channels = channels
-    if not option_passed("in-frames") and in_frames is not None:
-        args.in_frames = in_frames
-    if not option_passed("batch") and saved_args.get("batch") is not None:
-        args.batch = int(saved_args["batch"])
-    if not option_passed("lr") and saved_args.get("lr") is not None:
-        args.lr = float(saved_args["lr"])
-
-
-def part_text(mse, vgg, gan, d_loss):
-    text = f"mse {mse:.6f}"
-    if vgg is not None:
-        text += f"  vgg {vgg:.6f}"
-    if gan is not None:
-        text += f"  gan {gan:.6f}"
-    if d_loss is not None:
-        text += f"  d {d_loss:.4f}"
-    return text
-
-
-def train(args):
-    if args.vgg < 0 or args.vgg >= 1:
-        raise SystemExit("--vgg must be in [0, 1)")
-    if args.gan < 0 or args.gan >= 1:
-        raise SystemExit("--gan must be in [0, 1)")
-    if args.gan > 0 and (args.gan_crop < 8 or args.gan_crop % 8 != 0):
-        raise SystemExit("--gan-crop must be a positive multiple of 8")
-    rng = random.Random(args.seed)
-    torch.manual_seed(args.seed)
-    if args.in_frames % 2 != 1:
-        raise SystemExit("--in-frames must be odd")
-    radius = args.in_frames // 2
+def train(cfg, preview=True):
+    rng = random.Random(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    radius = cfg.in_frames // 2
     device = get_device()
+    root = data_root()
 
     resumed = None
     resume_path = None
-    if args.resume is not None:
-        resume_path = args.resume if args.resume.is_file() else args.resume / "model.pt"
+    saved_args = {}
+    if cfg.resume is not None:
+        resume_path = cfg.resume if cfg.resume.is_file() else cfg.resume / "model.pt"
         if not resume_path.is_file():
             raise SystemExit(f"no checkpoint: {resume_path}")
         resumed = torch.load(resume_path, map_location="cpu", weights_only=False)
         saved_args = resumed.get("args") or {}
-    else:
-        saved_args = {}
+        assert_resume_matches(cfg, saved_args, resume_path)
 
-    films = open_films(args.orig, args.low, args.holdout)
+    films = open_films(root / "orig", root / "low", cfg.holdout)
     print(f"device {device}", flush=True)
+    print(f"config {cfg.source}", flush=True)
+    print(f"network {shape_text(*cfg.arch_key())}", flush=True)
     for film in films:
         for variant in film.variants:
             spans = ", ".join(f"{start:.1f}-{end:.1f}s" for start, end in variant.holdouts)
@@ -538,16 +529,23 @@ def train(args):
                 flush=True,
             )
 
-    out_dir = args.out
+    out_dir = cfg.out
     if out_dir is None and resume_path is not None:
         out_dir = resume_path.parent
     elif out_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = Path.cwd() / "runs" / f"train-{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    copied = out_dir / "config.yaml"
+    if cfg.source.resolve() != copied.resolve():
+        shutil.copyfile(cfg.source, copied)
     csv_path = out_dir / "loss.csv"
     ckpt_path = out_dir / "model.pt"
-    continuing = resume_path is not None and out_dir == resume_path.parent and csv_path.is_file()
+    continuing = (
+        resume_path is not None
+        and out_dir.resolve() == resume_path.parent.resolve()
+        and csv_path.is_file()
+    )
     rows = load_rows(csv_path) if continuing else []
     if not continuing:
         write_loss_csv(csv_path, [])
@@ -556,152 +554,107 @@ def train(args):
             header = next(csv.reader(handle), [])
         if header != CSV_COLUMNS:
             write_loss_csv(csv_path, rows)
-    limit = "until Ctrl-C" if args.steps is None else str(args.steps)
+    limit = "until Ctrl-C" if cfg.steps is None else str(cfg.steps)
     print(f"run {out_dir}  steps {limit}", flush=True)
 
-    if resumed is not None:
-        adopt_checkpoint_run(args, resumed["model"], saved_args)
-    model, label = build_model(args.arch, args.blocks, args.channels, args.in_frames)
+    model, label = build_model(cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames)
     model = model.train().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     print(label, flush=True)
     if resumed is not None:
         model.load_state_dict(resumed["model"])
         optimizer.load_state_dict(resumed["optimizer"])
         move_optimizer(optimizer, device)
+        apply_learning_rate(optimizer, cfg.lr)
         print(f"resume step {int(resumed['step'])}", flush=True)
 
+    gan = cfg.term("gan")
     discriminator = None
     disc_optimizer = None
-    if args.gan > 0:
+    if gan is not None:
         discriminator = UNetDiscriminatorSN().train().to(device)
-        disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=args.disc_lr)
+        disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=gan.disc_lr)
         count = sum(parameter.numel() for parameter in discriminator.parameters())
-        if resumed is not None and resumed.get("discriminator"):
+        if resumed is not None:
+            if "discriminator" not in resumed or "disc_optimizer" not in resumed:
+                raise SystemExit(f"checkpoint {resume_path} has no discriminator")
             discriminator.load_state_dict(resumed["discriminator"])
-            if resumed.get("disc_optimizer"):
-                disc_optimizer.load_state_dict(resumed["disc_optimizer"])
-                move_optimizer(disc_optimizer, device)
+            disc_optimizer.load_state_dict(resumed["disc_optimizer"])
+            move_optimizer(disc_optimizer, device)
+            apply_learning_rate(disc_optimizer, gan.disc_lr)
             print("loaded discriminator", flush=True)
-        for group in disc_optimizer.param_groups:
-            group["lr"] = args.disc_lr
         print(
-            f"discriminator unet-sn  {count} parameters  crop {args.gan_crop}  "
-            f"lr {args.disc_lr:g}",
+            f"discriminator unet-sn  {count} parameters  crop {gan.crop}  "
+            f"lr {gan.disc_lr:g}",
             flush=True,
         )
 
+    objective = Objective(cfg, device)
     val_specs = []
-    while len(val_specs) < args.val_count:
-        need = min(args.batch, args.val_count - len(val_specs))
+    while len(val_specs) < cfg.val_count:
+        need = min(cfg.batch, cfg.val_count - len(val_specs))
         val_specs.extend(make_batch_specs(rng, films, "val", need))
-
-    perceptual = None
-    vgg_scale = 0.0
-    args.vgg_scale = 0.0
-    if args.vgg > 0 and saved_args.get("vgg_scale") is not None:
-        perceptual = VGGLoss().to(device)
-        vgg_scale = float(saved_args["vgg_scale"])
-        args.vgg_scale = vgg_scale
-        print(f"vgg scale {vgg_scale:.6g} from checkpoint", flush=True)
-    elif args.vgg > 0:
-        perceptual = VGGLoss().to(device)
-        # Raw feature L1 is orders of magnitude above pixel MSE. One scale,
-        # measured on the val frames before any step, makes `args.vgg` the
-        # VGG share of MSE plus VGG at the start. It stays fixed afterwards.
-        _total, mse_mean, perc_mean, _gan, _d = evaluate(
-            model, films, val_specs, radius, args.batch, device,
-            perceptual, 1.0, None, 0.0, args.gan_crop,
-        )
-        if perc_mean <= 0:
-            raise SystemExit("VGG loss on the val frames is zero")
-        vgg_scale = (args.vgg / (1.0 - args.vgg)) * (mse_mean / perc_mean)
-        args.vgg_scale = vgg_scale
-        print(
-            f"vgg relu2_2+relu3_4  share {args.vgg:.2f}  scale {vgg_scale:.6g}  "
-            f"val mse {mse_mean:.6f}  val vgg {vgg_scale * perc_mean:.6f}",
-            flush=True,
-        )
+    if resumed is not None:
+        objective.load_state_dict(saved_args["objective"])
+        print("loss scales from checkpoint", flush=True)
     else:
-        mse_mean = None
-        print("loss mse", flush=True)
-
-    gan_scale = 0.0
-    args.gan_scale = 0.0
-    saved_disc = resumed is not None and bool(resumed.get("discriminator"))
-    if args.gan > 0 and saved_disc and saved_args.get("gan_scale") is not None:
-        gan_scale = float(saved_args["gan_scale"])
-        args.gan_scale = gan_scale
-        print(f"gan scale {gan_scale:.6g} from checkpoint", flush=True)
-    elif args.gan > 0:
-        if args.vgg > 0 and saved_args.get("vgg_scale") is None:
-            base = mse_mean + args.vgg_scale * perc_mean
-        else:
-            _total, base_mse, base_vgg, _gan, _d = evaluate(
-                model, films, val_specs, radius, args.batch, device,
-                perceptual, vgg_scale, None, 0.0, args.gan_crop,
-            )
-            base = base_mse + base_vgg
-        _total, _mse, _vgg, raw_gan, _d = evaluate(
-            model, films, val_specs, radius, args.batch, device,
-            None, 0.0, discriminator, 1.0, args.gan_crop,
+        layer_means, term_means = measure_raw_means(
+            model, films, val_specs, radius, cfg.batch, device, cfg, objective, discriminator,
         )
-        if raw_gan <= 0:
-            raise SystemExit("GAN loss on the val frames is zero")
-        gan_scale = (args.gan / (1.0 - args.gan)) * (base / raw_gan)
-        args.gan_scale = gan_scale
-        print(
-            f"gan unet-sn  share {args.gan:.2f}  scale {gan_scale:.6g}  "
-            f"val gan {gan_scale * raw_gan:.6f}",
-            flush=True,
-        )
+        objective.calibrate(layer_means, term_means)
+    describe_loss(cfg, objective)
 
-    preview = None if args.no_preview else Preview()
+    preview = Preview() if preview else None
     running = 0.0
-    running_mse = 0.0
+    running_pixel = 0.0
     running_vgg = 0.0
     running_gan = 0.0
     running_d = 0.0
     running_n = 0
-    show_parts = perceptual is not None or discriminator is not None
+    has_pixel = cfg.term("pixel") is not None
+    has_vgg = cfg.term("vgg") is not None
+
+    def logged_parts(pixel, vgg, gan_value, d_value):
+        return (
+            pixel if has_pixel else None,
+            vgg if has_vgg else None,
+            gan_value if gan is not None else None,
+            d_value if gan is not None else None,
+        )
 
     def log(step, train_loss, val_loss, train_parts, val_parts):
         append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts)
-        message = f"step {step:06d}"
-        if train_loss is not None:
-            message += f"  train {train_loss:.6f}"
-            if train_parts is not None:
-                message += "  " + part_text(*train_parts)
-        if val_loss is not None:
-            message += f"  val {val_loss:.6f}"
-            if val_parts is not None:
-                message += "  " + part_text(*val_parts)
+        if val_loss is None:
+            return
+        message = f"step {step:06d}  val {val_loss:.6f}"
+        if val_parts is not None:
+            message += "  " + part_text(*val_parts)
         print(message, flush=True)
 
     def checkpoint():
         save_checkpoint(
-            ckpt_path, step, model, optimizer, args, discriminator, disc_optimizer,
+            ckpt_path, step, model, optimizer, checkpoint_args(cfg, objective),
+            discriminator, disc_optimizer,
         )
 
     start_step = int(resumed["step"]) if resumed is not None else 0
     step = start_step
     steps_done = 0
     try:
-        while args.steps is None or steps_done < args.steps:
+        while cfg.steps is None or steps_done < cfg.steps:
             step += 1
             steps_done += 1
             started = time.perf_counter()
-            specs = make_batch_specs(rng, films, "train", args.batch)
+            specs = make_batch_specs(rng, films, "train", cfg.batch)
             film_index, variant_index, _time_sec = specs[0]
             batch_film = films[film_index]
             batch_variant = batch_film.variants[variant_index]
             low, high = batch_from_specs(films, specs, radius, device)
             pred = model(low)
-            mse_total, mse, vgg_term = objective_parts(pred, high, perceptual, vgg_scale)
-            gan_term = pred.new_zeros(())
+            box = None
             d_value = None
-            if discriminator is not None:
-                box = sample_box(high, args.gan_crop, rng)
+            if gan is not None:
+                box = sample_box(high, gan.crop, rng)
                 d_loss = 0.5 * (
                     gan_bce(discriminator(take(high, box)), True)
                     + gan_bce(discriminator(take(pred.detach(), box)), False)
@@ -712,25 +665,29 @@ def train(args):
                 d_value = d_loss.item()
                 for parameter in discriminator.parameters():
                     parameter.requires_grad_(False)
-                gan_term = gan_scale * gan_bce(discriminator(take(pred, box)), True)
-            loss = mse_total + gan_term
+            raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
+            loss, weighted = objective.combine(raw)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             if discriminator is not None:
                 for parameter in discriminator.parameters():
                     parameter.requires_grad_(True)
+            objective.observe(layer_raw, {name: value.detach() for name, value in raw.items()})
             running += loss.item()
-            running_mse += mse.item()
-            running_vgg += vgg_term.item()
-            running_gan += gan_term.item()
+            if has_pixel:
+                running_pixel += weighted["pixel"].item()
+            if has_vgg:
+                running_vgg += weighted["vgg"].item()
+            if gan is not None:
+                running_gan += weighted["gan"].item()
             if d_value is not None:
                 running_d += d_value
             running_n += 1
-            batch_parts = (
-                mse.item(),
-                vgg_term.item() if perceptual is not None else None,
-                gan_term.item() if discriminator is not None else None,
+            batch_parts = logged_parts(
+                weighted["pixel"].item() if has_pixel else None,
+                weighted["vgg"].item() if has_vgg else None,
+                weighted["gan"].item() if gan is not None else None,
                 d_value,
             )
             print(
@@ -748,24 +705,23 @@ def train(args):
                     pred[0].detach(),
                 ))
 
-            finished = args.steps is not None and steps_done == args.steps
-            do_log = step % args.log_every == 0 or finished
-            do_val = step % args.val_every == 0 or finished
+            finished = cfg.steps is not None and steps_done == cfg.steps
+            do_log = step % cfg.log_every == 0 or finished
+            do_val = step % cfg.val_every == 0 or finished
             if not (do_log or do_val):
                 continue
             train_loss = None
             train_parts = None
             if do_log:
                 train_loss = running / running_n
-                if show_parts:
-                    train_parts = (
-                        running_mse / running_n,
-                        running_vgg / running_n if perceptual is not None else None,
-                        running_gan / running_n if discriminator is not None else None,
-                        running_d / running_n if discriminator is not None else None,
-                    )
+                train_parts = logged_parts(
+                    running_pixel / running_n if has_pixel else None,
+                    running_vgg / running_n if has_vgg else None,
+                    running_gan / running_n if gan is not None else None,
+                    running_d / running_n if gan is not None else None,
+                )
                 running = 0.0
-                running_mse = 0.0
+                running_pixel = 0.0
                 running_vgg = 0.0
                 running_gan = 0.0
                 running_d = 0.0
@@ -773,18 +729,11 @@ def train(args):
             val_loss = None
             val_parts = None
             if do_val:
-                print(f"step {step:06d}  val", flush=True)
-                val_loss, val_mse, val_vgg, val_gan, val_d = evaluate(
-                    model, films, val_specs, radius, args.batch, device,
-                    perceptual, vgg_scale, discriminator, gan_scale, args.gan_crop,
+                val_loss, val_pixel, val_vgg, val_gan, val_d = evaluate(
+                    model, films, val_specs, radius, cfg.batch, device,
+                    cfg, objective, discriminator,
                 )
-                if show_parts:
-                    val_parts = (
-                        val_mse,
-                        val_vgg if perceptual is not None else None,
-                        val_gan if discriminator is not None else None,
-                        val_d if discriminator is not None else None,
-                    )
+                val_parts = logged_parts(val_pixel, val_vgg, val_gan, val_d)
                 checkpoint()
             log(step, train_loss, val_loss, train_parts, val_parts)
     except KeyboardInterrupt:
@@ -803,78 +752,12 @@ def train(args):
     print(f"done  {csv_path}  {ckpt_path}", flush=True)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="train on random paired video frames",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--orig", type=Path, default=EnvPath("orig"), help="master videos")
-    parser.add_argument("--low", type=Path, default=EnvPath("low"), help="degraded variants")
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=None,
-        help="stop after this many steps; default runs until Ctrl-C",
-    )
-    parser.add_argument("--batch", type=int, default=1, help="frames per step, all from one film")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Adam learning rate of the generator")
-    parser.add_argument(
-        "--disc-lr",
-        type=float,
-        default=1e-4,
-        help="Adam learning rate of the discriminator; applied again after --resume",
-    )
-    add_model_args(parser)
-    parser.set_defaults(blocks=32, channels=256)
-    for action in parser._actions:
-        if action.dest == "arch":
-            action.help = "network"
-        elif action.dest == "blocks":
-            action.help = "residual blocks; 32 for a fresh modified run, otherwise that arch's preset"
-        elif action.dest == "channels":
-            action.help = "feature channels; 256 for a fresh modified run, otherwise that arch's preset"
-    parser.add_argument("--holdout", type=float, default=0.1)
-    parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--val-every", type=int, default=500)
-    parser.add_argument("--val-count", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", type=Path, default=None)
-    parser.add_argument("--resume", type=Path, default=None, help="checkpoint or run directory to continue")
-    parser.add_argument("--no-preview", action="store_true", help="do not open the live window")
-    parser.add_argument(
-        "--vgg",
-        type=float,
-        default=0.5,
-        help="VGG share of MSE+VGG at the start; 0.5 matches MSE, 0 uses MSE only",
-    )
-    parser.add_argument(
-        "--gan",
-        type=float,
-        default=0.1,
-        help="GAN share of MSE+VGG+GAN at the start; 0 leaves the discriminator out",
-    )
-    parser.add_argument(
-        "--gan-crop",
-        type=int,
-        default=256,
-        help="HD crop scored by the discriminator; must be a multiple of 8",
-    )
-    args = parser.parse_args()
-    args.orig = resolve_data(args.orig)
-    args.low = resolve_data(args.low)
-    # 32x256 is the fresh modified default. Other archs keep their preset, and
-    # a resumed run takes its shape from the checkpoint unless the flag was passed.
-    fresh_modified = args.resume is None and args.arch == "modified"
-    if not fresh_modified:
-        if not option_passed("blocks"):
-            args.blocks = None
-        if not option_passed("channels"):
-            args.channels = None
-    return args
-
-
 def main():
-    train(parse_args())
+    parser = argparse.ArgumentParser(description="train on random paired video frames")
+    parser.add_argument("config", type=Path, help="training recipe")
+    parser.add_argument("--no-preview", action="store_true", help="do not open the live window")
+    args = parser.parse_args()
+    train(load_config(args.config), preview=not args.no_preview)
 
 
 if __name__ == "__main__":

@@ -28,45 +28,6 @@ def get_device():
     return torch.device("cpu")
 
 
-def infer_modified(state):
-    weight = state["initial_conv.weight"]
-    channels = int(weight.shape[0])
-    in_frames = int(weight.shape[1] // 3)
-    blocks = 1 + max(int(key.split(".")[1]) for key in state if key.startswith("res_blocks."))
-    return blocks, channels, in_frames
-
-
-def infer_edsr(state):
-    channels = int(state["head.0.weight"].shape[0]) if "head.0.weight" in state else None
-    block_ids = [
-        int(key.split(".")[1])
-        for key in state
-        if key.startswith("body.") and ".body." in key
-    ]
-    blocks = max(block_ids) + 1 if block_ids else None
-    return blocks, channels
-
-
-def infer_deform(state):
-    weight = state["stem.weight"]
-    channels = int(weight.shape[0])
-    in_frames = int(state["fuse.weight"].shape[1] // channels)
-    blocks = 1 + max(int(key.split(".")[1]) for key in state if key.startswith("res_blocks."))
-    return blocks, channels, in_frames
-
-
-def detect_arch(state):
-    if any(key.startswith("stem.") for key in state):
-        return "deform"
-    if any(key.startswith("initial_conv.") for key in state):
-        return "modified"
-    if any(key.startswith("head.") for key in state):
-        return "edsr"
-    if "conv1.weight" in state:
-        return "espcn"
-    raise SystemExit("checkpoint weights do not match modified, deform, edsr, or espcn")
-
-
 def load_checkpoint(path, device):
     path = Path(path)
     if path.is_dir():
@@ -74,31 +35,26 @@ def load_checkpoint(path, device):
     if not path.is_file():
         raise SystemExit(f"no checkpoint: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    state = checkpoint["model"]
     saved = checkpoint.get("args") or {}
-    arch = saved.get("arch") or detect_arch(state)
-    blocks = saved.get("blocks")
-    channels = saved.get("channels")
-    in_frames = saved.get("in_frames")
-    if arch == "modified":
-        found_blocks, found_channels, found_frames = infer_modified(state)
-        blocks = found_blocks if blocks is None else blocks
-        channels = found_channels if channels is None else channels
-        in_frames = found_frames if in_frames is None else in_frames
-    elif arch == "deform":
-        found_blocks, found_channels, found_frames = infer_deform(state)
-        blocks = found_blocks if blocks is None else blocks
-        channels = found_channels if channels is None else channels
-        in_frames = found_frames if in_frames is None else in_frames
-    elif arch == "edsr":
-        found_blocks, found_channels = infer_edsr(state)
-        blocks = found_blocks if blocks is None else blocks
-        channels = found_channels if channels is None else channels
-        in_frames = 1 if in_frames is None else in_frames
+    missing = [key for key in ("arch", "in_frames") if key not in saved]
+    if missing:
+        raise SystemExit(f"checkpoint {path} has no {', '.join(missing)}")
+    arch = saved["arch"]
+    in_frames = saved["in_frames"]
+    if not isinstance(in_frames, int) or isinstance(in_frames, bool):
+        raise SystemExit(f"checkpoint {path} has no in_frames")
+    if arch == "espcn":
+        blocks = None
+        channels = None
     else:
-        in_frames = 1 if in_frames is None else in_frames
+        blocks = saved.get("blocks")
+        channels = saved.get("channels")
+        if not isinstance(blocks, int) or not isinstance(channels, int):
+            raise SystemExit(f"checkpoint {path} has no blocks or channels")
+        if isinstance(blocks, bool) or isinstance(channels, bool):
+            raise SystemExit(f"checkpoint {path} has no blocks or channels")
     model, label = build_model(arch, blocks, channels, in_frames)
-    model.load_state_dict(state)
+    model.load_state_dict(checkpoint["model"])
     model.eval().to(device)
     return model, label, in_frames, checkpoint.get("step"), path
 
