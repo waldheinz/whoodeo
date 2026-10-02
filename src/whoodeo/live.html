@@ -13,9 +13,8 @@
       font: 15px/1.4 system-ui, sans-serif;
     }
     main {
-      max-width: 1100px;
       margin: 0 auto;
-      padding: 16px;
+      padding: 16px 20px 28px;
     }
     #status {
       min-height: 1.4em;
@@ -25,27 +24,73 @@
       white-space: nowrap;
       text-overflow: ellipsis;
     }
-    #views { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
-    button {
-      background: #242424;
-      color: inherit;
-      border: 1px solid #3a3a3a;
-      border-radius: 6px;
-      padding: 6px 12px;
-      font: inherit;
-      cursor: pointer;
-    }
-    button[aria-pressed="true"] { background: #2c4a6e; border-color: #4d78ab; }
     #stage {
+      position: relative;
+      width: min(100%, calc(78vh * 16 / 9));
+      aspect-ratio: 16 / 9;
+      margin: 0 auto;
       background: #0c0c0c;
       border-radius: 8px;
-      min-height: 240px;
-      display: grid;
-      place-items: center;
+      overflow: hidden;
+      cursor: pointer;
+      user-select: none;
+    }
+    #stage.locked { box-shadow: inset 0 0 0 1px #4d78ab; }
+    .pane {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: calc(100% / 3);
       overflow: hidden;
     }
-    #frame { max-width: 100%; max-height: 70vh; display: none; }
-    #waiting { margin: 0; color: #8a8a8a; }
+    .pane[data-pane="low"] { left: 0; }
+    .pane[data-pane="upscale"] { left: calc(100% / 3); }
+    .pane[data-pane="master"] { left: calc(200% / 3); }
+    #stage.solo .pane { display: none; }
+    #stage.solo .pane.on {
+      display: block;
+      left: 0;
+      width: 100%;
+    }
+    .pane img {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 300%;
+      height: 100%;
+      max-width: none;
+      object-fit: contain;
+      background: #0c0c0c;
+    }
+    .pane[data-pane="upscale"] img { left: -100%; }
+    .pane[data-pane="master"] img { left: -200%; }
+    #stage.solo .pane.on img {
+      width: 100%;
+      left: 0;
+    }
+    .pane img:not([src]) { visibility: hidden; }
+    .tag {
+      position: absolute;
+      left: 8px;
+      bottom: 8px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.55);
+      color: #ddd;
+      font-size: 12px;
+      line-height: 1.3;
+      pointer-events: none;
+    }
+    #waiting {
+      position: absolute;
+      inset: 0;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      color: #8a8a8a;
+      pointer-events: none;
+    }
+    #waiting[hidden] { display: none; }
     #chart { margin-top: 16px; }
     #plot { width: 100%; height: 280px; display: block; }
     #legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
@@ -56,9 +101,19 @@
 <body>
 <main>
   <p id="status"></p>
-  <div id="views"></div>
   <div id="stage">
-    <img id="frame" alt="">
+    <div class="pane" data-pane="low">
+      <img alt="" draggable="false">
+      <span class="tag">low</span>
+    </div>
+    <div class="pane" data-pane="upscale">
+      <img alt="" draggable="false">
+      <span class="tag">upscale</span>
+    </div>
+    <div class="pane" data-pane="master">
+      <img alt="" draggable="false">
+      <span class="tag">master</span>
+    </div>
     <p id="waiting">waiting for a frame</p>
   </div>
   <section id="chart" hidden>
@@ -68,68 +123,102 @@
 </main>
 <script>
 const COLORS = ["#9ec1e6", "#e3a15a", "#8dca9e", "#d2a4de", "#e6d38a", "#8fd0d0", "#e7a8a0", "#c5c8c6"];
-const PREFERRED = ["upscale", "recon", "master", "low"];
+const PANES = [
+  { id: "low", names: ["low"] },
+  { id: "upscale", names: ["upscale", "recon"] },
+  { id: "master", names: ["master"] },
+];
 const statusEl = document.getElementById("status");
-const viewsEl = document.getElementById("views");
-const frameEl = document.getElementById("frame");
+const stageEl = document.getElementById("stage");
 const waitingEl = document.getElementById("waiting");
 const chartEl = document.getElementById("chart");
 const plotEl = document.getElementById("plot");
 const legendEl = document.getElementById("legend");
-let chosen = null;
-let shown = "";
+const paneEls = new Map([...stageEl.querySelectorAll(".pane")].map((el) => [el.dataset.pane, el]));
+let pinned = null;
+let hover = null;
+let armHover = true;
 let legendKey = "";
-let framesKey = "";
 let last = { status: "", generation: 0, frames: [], series: {} };
 
-function pick(frames) {
-  if (chosen && frames.includes(chosen)) return chosen;
-  for (const name of PREFERRED) {
-    if (frames.includes(name)) return name;
+function paneAt(event) {
+  for (const el of paneEls.values()) {
+    const rect = el.getBoundingClientRect();
+    if (event.clientX >= rect.left && event.clientX < rect.right &&
+        event.clientY >= rect.top && event.clientY < rect.bottom) {
+      return el.dataset.pane;
+    }
   }
-  return frames[0] || null;
+  return null;
+}
+
+function applyFocus() {
+  const focus = pinned || hover;
+  stageEl.classList.toggle("solo", Boolean(focus));
+  stageEl.classList.toggle("locked", Boolean(pinned));
+  for (const [id, el] of paneEls) {
+    el.classList.toggle("on", id === focus);
+  }
 }
 
 function render() {
   const state = last;
   statusEl.textContent = state.status || "";
-  const frames = state.frames || [];
-  chosen = pick(frames);
-  const key = frames.join("\0");
-  if (key !== framesKey) {
-    framesKey = key;
-    viewsEl.replaceChildren(...frames.map((name) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = name;
-      button.dataset.name = name;
-      button.addEventListener("click", () => {
-        chosen = name;
-        render();
-      });
-      return button;
-    }));
-  }
-  for (const button of viewsEl.querySelectorAll("button")) {
-    button.setAttribute("aria-pressed", button.dataset.name === chosen ? "true" : "false");
-  }
-  if (!chosen || !state.generation) {
-    frameEl.style.display = "none";
-    frameEl.removeAttribute("src");
-    waitingEl.hidden = false;
-    shown = "";
-  } else {
-    const key = chosen + ":" + state.generation;
-    if (key !== shown) {
-      frameEl.src = "frames/" + encodeURIComponent(chosen) + ".png?g=" + state.generation;
-      frameEl.alt = chosen;
-      shown = key;
+  const frames = new Set(state.frames || []);
+  for (const pane of PANES) {
+    const el = paneEls.get(pane.id);
+    const name = pane.names.find((candidate) => frames.has(candidate)) || null;
+    el.querySelector(".tag").textContent = name || pane.names[0];
+    const img = el.querySelector("img");
+    if (!name || !state.generation) {
+      if (img.dataset.shown) {
+        img.removeAttribute("src");
+        img.alt = "";
+        delete img.dataset.shown;
+      }
+    } else {
+      const key = name + ":" + state.generation;
+      if (img.dataset.shown !== key) {
+        img.src = "frames/" + encodeURIComponent(name) + ".png?g=" + state.generation;
+        img.alt = name;
+        img.dataset.shown = key;
+      }
     }
-    frameEl.style.display = "block";
-    waitingEl.hidden = true;
   }
+  waitingEl.hidden = Boolean(state.generation && frames.size);
+  applyFocus();
   draw(state.series || {});
 }
+
+stageEl.addEventListener("pointermove", (event) => {
+  if (pinned || hover || !armHover) return;
+  const id = paneAt(event);
+  if (!id) return;
+  hover = id;
+  applyFocus();
+});
+
+stageEl.addEventListener("pointerleave", () => {
+  armHover = true;
+  if (pinned || !hover) return;
+  hover = null;
+  applyFocus();
+});
+
+stageEl.addEventListener("click", (event) => {
+  if (pinned) {
+    pinned = null;
+    hover = null;
+    armHover = false;
+    applyFocus();
+    return;
+  }
+  const id = hover || paneAt(event);
+  if (!id) return;
+  pinned = id;
+  hover = null;
+  applyFocus();
+});
 
 function draw(series) {
   const names = Object.keys(series);
