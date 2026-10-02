@@ -5,6 +5,10 @@ variants in $WHOODEO_DATA/low. A step picks one film, then one variant, then
 as many center times as the batch size. Two time spans per variant are held
 out for validation.
 
+Training batches are decoded on one side thread into a queue of three CPU
+batches. The step copies a batch onto the device. Validation keeps its own
+clips and reads them on the main thread.
+
 The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
 before the first step. balance running keeps the weights as shares.
@@ -20,8 +24,10 @@ the same architecture and the same loss. Learning rates come from the file.
 import argparse
 import csv
 import os
+import queue
 import random
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -208,7 +214,7 @@ def make_batch_specs(rng, films, split, count):
     ]
 
 
-def batch_from_specs(films, specs, radius, device):
+def batch_from_specs(films, specs, radius):
     lows = []
     highs = []
     for film_index, variant_index, time_sec in specs:
@@ -216,7 +222,114 @@ def batch_from_specs(films, specs, radius, device):
         low, high = load_sample(film, film.variants[variant_index], time_sec, radius)
         lows.append(low)
         highs.append(high)
-    return torch.stack(lows).to(device), torch.stack(highs).to(device)
+    return torch.stack(lows), torch.stack(highs)
+
+
+def batch_on_device(films, specs, radius, device):
+    low, high = batch_from_specs(films, specs, radius)
+    return low.to(device), high.to(device)
+
+
+def close_films(films):
+    for film in films:
+        film.orig.close()
+        for variant in film.variants:
+            variant.low.close()
+
+
+_QUEUE_DEPTH = 3
+_QUEUE_POLL = 0.2
+
+
+@dataclass
+class PreparedBatch:
+    low: torch.Tensor
+    high: torch.Tensor
+    film_name: str
+    variant_name: str
+    width: int
+    height: int
+    box: tuple | None
+
+
+class BatchLoader:
+    """One thread of CPU training batches.
+
+    The thread opens its own clips and never moves tensors onto a device.
+    ``put`` times out so a full queue cannot block shutdown. ``get`` raises
+    an error from the thread instead of waiting on a dead loader.
+    """
+
+    def __init__(self, rng, orig_dir, low_dir, holdout, batch, radius, crop):
+        self._rng = rng
+        self._orig_dir = orig_dir
+        self._low_dir = low_dir
+        self._holdout = holdout
+        self._batch = batch
+        self._radius = radius
+        self._crop = crop
+        self._queue = queue.Queue(maxsize=_QUEUE_DEPTH)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="whoodeo-batch", daemon=False)
+
+    def start(self):
+        self._thread.start()
+
+    def get(self):
+        while True:
+            try:
+                item = self._queue.get(timeout=_QUEUE_POLL)
+            except queue.Empty:
+                if not self._thread.is_alive():
+                    raise RuntimeError("batch loader stopped")
+                continue
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    def close(self):
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join()
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=_QUEUE_POLL)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self):
+        films = None
+        try:
+            films = open_films(self._orig_dir, self._low_dir, self._holdout)
+            while not self._stop.is_set():
+                specs = make_batch_specs(self._rng, films, "train", self._batch)
+                film_index, variant_index, _time_sec = specs[0]
+                film = films[film_index]
+                variant = film.variants[variant_index]
+                low, high = batch_from_specs(films, specs, self._radius)
+                box = None
+                if self._crop is not None:
+                    box = sample_box(high, self._crop, self._rng)
+                prepared = PreparedBatch(
+                    low=low,
+                    high=high,
+                    film_name=film.name,
+                    variant_name=variant.name,
+                    width=variant.low.width,
+                    height=variant.low.height,
+                    box=box,
+                )
+                if not self._put(prepared):
+                    return
+        except BaseException as exc:
+            self._put(exc)
+        finally:
+            if films is not None:
+                close_films(films)
 
 
 CSV_COLUMNS = [
@@ -421,7 +534,7 @@ def measure_raw_means(model, films, specs, radius, batch_size, device, cfg, obje
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
-            low, high = batch_from_specs(films, chunk, radius, device)
+            low, high = batch_on_device(films, chunk, radius, device)
             pred = model(low)
             frames = len(chunk)
             if pixel is not None:
@@ -480,7 +593,7 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
-            low, high = batch_from_specs(films, chunk, radius, device)
+            low, high = batch_on_device(films, chunk, radius, device)
             pred = model(low)
             if image_dir is not None:
                 for offset in range(len(chunk)):
@@ -649,177 +762,185 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
     while len(val_specs) < cfg.val_count:
         need = min(cfg.batch, cfg.val_count - len(val_specs))
         val_specs.extend(make_batch_specs(rng, films, "val", need))
-    if resumed is not None:
-        objective.load_state_dict(saved_args["objective"])
-        print("loss scales from checkpoint", flush=True)
-    else:
-        layer_means, term_means = measure_raw_means(
-            model, films, val_specs, radius, cfg.batch, device, cfg, objective, discriminator,
-        )
-        objective.calibrate(layer_means, term_means)
-    describe_loss(cfg, objective)
-
-    live = open_live(live_bind, preview)
-    if live is not None:
-        push_loss_series(live, rows)
-    running = 0.0
-    running_pixel = 0.0
-    running_vgg = 0.0
-    running_gan = 0.0
-    running_d = 0.0
-    running_n = 0
-    has_pixel = cfg.term("pixel") is not None
-    has_vgg = cfg.term("vgg") is not None
-
-    def logged_parts(pixel, vgg, gan_value, d_value):
-        return (
-            pixel if has_pixel else None,
-            vgg if has_vgg else None,
-            gan_value if gan is not None else None,
-            d_value if gan is not None else None,
-        )
-
-    def log(step, train_loss, val_loss, train_parts, val_parts):
-        append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts)
-        push_loss_series(live, rows)
-        if val_loss is None:
-            return
-        message = f"step {step:06d}  val {val_loss:.6f}"
-        if val_parts is not None:
-            message += "  " + part_text(*val_parts)
-        print(message, flush=True)
-        if live is not None:
-            live.status(message)
-
-    def checkpoint():
-        save_checkpoint(
-            ckpt_path, step, model, optimizer, checkpoint_args(cfg, objective),
-            discriminator, disc_optimizer,
-        )
-
-    start_step = int(resumed["step"]) if resumed is not None else 0
-    step = start_step
-    steps_done = 0
-
-    def validate():
-        """Validation loss, images, and a checkpoint at the current step."""
-        loss, pixel, vgg, gan_value, d_value = evaluate(
-            model, films, val_specs, radius, cfg.batch, device,
-            cfg, objective, discriminator,
-            image_dir=out_dir / "val", step=step,
-        )
-        checkpoint()
-        return loss, logged_parts(pixel, vgg, gan_value, d_value)
-
+    loader = None
+    live = None
     try:
-        # Untrained residual is zero, so this is the 2× bilinear baseline.
-        if resumed is None:
-            val_loss, val_parts = validate()
-            log(step, None, val_loss, None, val_parts)
-        while cfg.steps is None or steps_done < cfg.steps:
-            step += 1
-            steps_done += 1
-            started = time.perf_counter()
-            specs = make_batch_specs(rng, films, "train", cfg.batch)
-            film_index, variant_index, _time_sec = specs[0]
-            batch_film = films[film_index]
-            batch_variant = batch_film.variants[variant_index]
-            low, high = batch_from_specs(films, specs, radius, device)
-            pred = model(low)
-            box = None
-            d_value = None
-            if gan is not None:
-                box = sample_box(high, gan.crop, rng)
-                d_loss = 0.5 * (
-                    gan_bce(discriminator(take(high, box)), True)
-                    + gan_bce(discriminator(take(pred.detach(), box)), False)
-                )
-                disc_optimizer.zero_grad(set_to_none=True)
-                d_loss.backward()
-                disc_optimizer.step()
-                d_value = d_loss.item()
-                for parameter in discriminator.parameters():
-                    parameter.requires_grad_(False)
-            raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
-            loss, weighted = objective.combine(raw)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            if discriminator is not None:
-                for parameter in discriminator.parameters():
-                    parameter.requires_grad_(True)
-            objective.observe(layer_raw, {name: value.detach() for name, value in raw.items()})
-            running += loss.item()
-            if has_pixel:
-                running_pixel += weighted["pixel"].item()
-            if has_vgg:
-                running_vgg += weighted["vgg"].item()
-            if gan is not None:
-                running_gan += weighted["gan"].item()
-            if d_value is not None:
-                running_d += d_value
-            running_n += 1
-            batch_parts = logged_parts(
-                weighted["pixel"].item() if has_pixel else None,
-                weighted["vgg"].item() if has_vgg else None,
-                weighted["gan"].item() if gan is not None else None,
-                d_value,
+        loader = BatchLoader(
+            rng,
+            root / "orig",
+            root / "low",
+            cfg.holdout,
+            cfg.batch,
+            radius,
+            None if gan is None else gan.crop,
+        )
+        loader.start()
+        if resumed is not None:
+            objective.load_state_dict(saved_args["objective"])
+            print("loss scales from checkpoint", flush=True)
+        else:
+            layer_means, term_means = measure_raw_means(
+                model, films, val_specs, radius, cfg.batch, device, cfg, objective, discriminator,
             )
-            line = (
-                f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
-                f"loss {loss.item():.6f}  {part_text(*batch_parts)}  "
-                f"{batch_variant.low.width}x{batch_variant.low.height}  "
-                f"{batch_variant.name}  {batch_film.name}"
-            )
-            print(line, flush=True)
+            objective.calibrate(layer_means, term_means)
+        describe_loss(cfg, objective)
 
+        live = open_live(live_bind, preview)
+        if live is not None:
+            push_loss_series(live, rows)
+        running = 0.0
+        running_pixel = 0.0
+        running_vgg = 0.0
+        running_gan = 0.0
+        running_d = 0.0
+        running_n = 0
+        has_pixel = cfg.term("pixel") is not None
+        has_vgg = cfg.term("vgg") is not None
+
+        def logged_parts(pixel, vgg, gan_value, d_value):
+            return (
+                pixel if has_pixel else None,
+                vgg if has_vgg else None,
+                gan_value if gan is not None else None,
+                d_value if gan is not None else None,
+            )
+
+        def log(step, train_loss, val_loss, train_parts, val_parts):
+            append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts)
+            push_loss_series(live, rows)
+            if val_loss is None:
+                return
+            message = f"step {step:06d}  val {val_loss:.6f}"
+            if val_parts is not None:
+                message += "  " + part_text(*val_parts)
+            print(message, flush=True)
             if live is not None:
-                center = radius * 3
-                live.status(line)
-                live.show({
-                    "low": rgb_image(low[0, center:center + 3]),
-                    "upscale": rgb_image(pred[0]),
-                    "master": rgb_image(high[0]),
-                })
+                live.status(message)
 
-            finished = cfg.steps is not None and steps_done == cfg.steps
-            do_log = step % cfg.log_every == 0 or finished
-            do_val = step % cfg.val_every == 0 or finished
-            if not (do_log or do_val):
-                continue
-            train_loss = None
-            train_parts = None
-            if do_log:
-                train_loss = running / running_n
-                train_parts = logged_parts(
-                    running_pixel / running_n if has_pixel else None,
-                    running_vgg / running_n if has_vgg else None,
-                    running_gan / running_n if gan is not None else None,
-                    running_d / running_n if gan is not None else None,
-                )
-                running = 0.0
-                running_pixel = 0.0
-                running_vgg = 0.0
-                running_gan = 0.0
-                running_d = 0.0
-                running_n = 0
-            val_loss = None
-            val_parts = None
-            if do_val:
+        def checkpoint():
+            save_checkpoint(
+                ckpt_path, step, model, optimizer, checkpoint_args(cfg, objective),
+                discriminator, disc_optimizer,
+            )
+
+        start_step = int(resumed["step"]) if resumed is not None else 0
+        step = start_step
+        steps_done = 0
+
+        def validate():
+            """Validation loss, images, and a checkpoint at the current step."""
+            loss, pixel, vgg, gan_value, d_value = evaluate(
+                model, films, val_specs, radius, cfg.batch, device,
+                cfg, objective, discriminator,
+                image_dir=out_dir / "val", step=step,
+            )
+            checkpoint()
+            return loss, logged_parts(pixel, vgg, gan_value, d_value)
+
+        try:
+            # Untrained residual is zero, so this is the 2× bilinear baseline.
+            if resumed is None:
                 val_loss, val_parts = validate()
-            log(step, train_loss, val_loss, train_parts, val_parts)
-    except KeyboardInterrupt:
-        checkpoint()
-        print(f"interrupted, saved {ckpt_path}", flush=True)
-        return
+                log(step, None, val_loss, None, val_parts)
+            while cfg.steps is None or steps_done < cfg.steps:
+                step += 1
+                steps_done += 1
+                started = time.perf_counter()
+                prepared = loader.get()
+                low = prepared.low.to(device)
+                high = prepared.high.to(device)
+                pred = model(low)
+                box = prepared.box
+                d_value = None
+                if gan is not None:
+                    d_loss = 0.5 * (
+                        gan_bce(discriminator(take(high, box)), True)
+                        + gan_bce(discriminator(take(pred.detach(), box)), False)
+                    )
+                    disc_optimizer.zero_grad(set_to_none=True)
+                    d_loss.backward()
+                    disc_optimizer.step()
+                    d_value = d_loss.item()
+                    for parameter in discriminator.parameters():
+                        parameter.requires_grad_(False)
+                raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
+                loss, weighted = objective.combine(raw)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                if discriminator is not None:
+                    for parameter in discriminator.parameters():
+                        parameter.requires_grad_(True)
+                objective.observe(layer_raw, {name: value.detach() for name, value in raw.items()})
+                running += loss.item()
+                if has_pixel:
+                    running_pixel += weighted["pixel"].item()
+                if has_vgg:
+                    running_vgg += weighted["vgg"].item()
+                if gan is not None:
+                    running_gan += weighted["gan"].item()
+                if d_value is not None:
+                    running_d += d_value
+                running_n += 1
+                batch_parts = logged_parts(
+                    weighted["pixel"].item() if has_pixel else None,
+                    weighted["vgg"].item() if has_vgg else None,
+                    weighted["gan"].item() if gan is not None else None,
+                    d_value,
+                )
+                line = (
+                    f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
+                    f"loss {loss.item():.6f}  {part_text(*batch_parts)}  "
+                    f"{prepared.width}x{prepared.height}  "
+                    f"{prepared.variant_name}  {prepared.film_name}"
+                )
+                print(line, flush=True)
+
+                if live is not None:
+                    center = radius * 3
+                    live.status(line)
+                    live.show({
+                        "low": rgb_image(low[0, center:center + 3]),
+                        "upscale": rgb_image(pred[0]),
+                        "master": rgb_image(high[0]),
+                    })
+
+                finished = cfg.steps is not None and steps_done == cfg.steps
+                do_log = step % cfg.log_every == 0 or finished
+                do_val = step % cfg.val_every == 0 or finished
+                if not (do_log or do_val):
+                    continue
+                train_loss = None
+                train_parts = None
+                if do_log:
+                    train_loss = running / running_n
+                    train_parts = logged_parts(
+                        running_pixel / running_n if has_pixel else None,
+                        running_vgg / running_n if has_vgg else None,
+                        running_gan / running_n if gan is not None else None,
+                        running_d / running_n if gan is not None else None,
+                    )
+                    running = 0.0
+                    running_pixel = 0.0
+                    running_vgg = 0.0
+                    running_gan = 0.0
+                    running_d = 0.0
+                    running_n = 0
+                val_loss = None
+                val_parts = None
+                if do_val:
+                    val_loss, val_parts = validate()
+                log(step, train_loss, val_loss, train_parts, val_parts)
+        except KeyboardInterrupt:
+            checkpoint()
+            print(f"interrupted, saved {ckpt_path}", flush=True)
+            return
     finally:
+        if loader is not None:
+            loader.close()
         if live is not None:
             live.close()
-
-    for film in films:
-        film.orig.close()
-        for variant in film.variants:
-            variant.low.close()
+        close_films(films)
     print(f"done  {csv_path}  {ckpt_path}", flush=True)
 
 
