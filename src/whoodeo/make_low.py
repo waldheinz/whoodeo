@@ -1,5 +1,10 @@
-"""Write half-resolution training pairs for videos in the orig folder.
+"""Write training videos.
 
+`whoodeo-make-low import` encodes a source into the orig folder. The master
+keeps the picture's aspect and lands near 1280x720 pixels. It is 10-bit
+4:4:4 HEVC with a short closed GOP, so training seeks stay cheap.
+
+The plain command writes half-resolution variants of videos already in orig.
 Variant directories live under the low root. Each one keeps the source
 filename. Codec, quantizer, and bitrate come from a JSON config: the short
 name is the directory, and the value is extra ffmpeg arguments.
@@ -17,6 +22,29 @@ from whoodeo.catalog import EnvPath, resolve_data
 CONFIG = Path(__file__).resolve().parent / "degrade.json"
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
+MASTER_PIXELS = 1280 * 720
+MASTER_PIX_FMT = "yuv444p10le"
+# No preset: x265 medium. CRF 12 is the quality knob. psy stays at x265's default.
+# bframes=0 keeps encode order equal to display order. It does not repair
+# timestamps: passthrough copies a duplicate source pts straight through.
+X265_PARAMS = (
+    "keyint=12:min-keyint=12:open-gop=0:repeat-headers=1:"
+    "scenecut=40:bframes=0:aq-mode=1:rc-lookahead=12:"
+    "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited:"
+    "log-level=error"
+)
+HDR_TRANSFER = {"smpte2084", "arib-std-b67"}
+HDR_PRIMARIES = {"bt2020"}
+HDR_MATRIX = {"bt2020nc", "bt2020c", "bt2020ncl"}
+INTERLACED = {"tt", "bb", "tb", "bt"}
+# ffprobe matrix name → colorspace filter `all`/`iall` value.
+MATRIX_ALL = {
+    "bt709": "bt709",
+    "smpte170m": "smpte170m",
+    "bt470bg": "bt470bg",
+    "bt470m": "bt470m",
+    "smpte240m": "smpte240m",
+}
 
 
 def load_config(path):
@@ -228,6 +256,351 @@ def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, 
     return True
 
 
+def probe_video(path):
+    text = run_probe([
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height,pix_fmt,sample_aspect_ratio,"
+        "field_order,color_space,color_transfer,color_primaries,color_range",
+        "-of", "json",
+        str(path),
+    ])
+    if not text:
+        raise RuntimeError(f"no video stream: {path}")
+    payload = json.loads(text)
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError(f"no video stream: {path}")
+    return streams[0]
+
+
+def stream_text(stream, key):
+    value = stream.get(key)
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text in {"N/A", "unknown", "unspecified", "none"}:
+        return ""
+    return text
+
+
+def sar_factors(sar):
+    if not sar:
+        return 1, 1
+    if ":" not in sar:
+        return None
+    num, den = sar.split(":", 1)
+    try:
+        num, den = int(num), int(den)
+    except ValueError:
+        return None
+    if num <= 0 or den <= 0:
+        return None
+    return num, den
+
+
+def snap4(value):
+    snapped = int(round(value / 4.0)) * 4
+    if snapped < 4:
+        return 4
+    return snapped
+
+
+def master_dimensions(width, height, sar):
+    """Square-pixel size near 1280x720, aspect kept, both sides a multiple of 4.
+
+    A picture that already has fewer pixels stays at its display size. The
+    multiple of 4 keeps the half-resolution low frame even.
+    """
+    factors = sar_factors(sar)
+    if factors is None:
+        return None
+    num, den = factors
+    disp_w = width * num / den
+    disp_h = float(height)
+    scale = 1.0
+    if disp_w * disp_h > MASTER_PIXELS:
+        scale = (MASTER_PIXELS / (disp_w * disp_h)) ** 0.5
+    return snap4(disp_w * scale), snap4(disp_h * scale)
+
+
+def input_matrix(color_space):
+    if not color_space:
+        return "bt709"
+    return MATRIX_ALL.get(color_space)
+
+
+def master_filter(width, height, matrix, color_range):
+    irange = "pc" if color_range in {"pc", "jpeg"} else "tv"
+    fast = "1" if matrix == "bt709" else "0"
+    # setpts numbers frames in display order. A source can name two pictures
+    # with one timestamp; passthrough would keep that, and mpeg4 then refuses it.
+    return (
+        "setpts=N/(FRAME_RATE*TB),"
+        f"colorspace=iall={matrix}:all=bt709:irange={irange}:range=tv:"
+        f"format=yuv444p12:dither=none:fast={fast},"
+        f"scale={width}:{height}:flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_inp:"
+        "sws_dither=none,setsar=1,format=yuv444p10le,"
+        "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+    )
+
+
+def _ratio(text):
+    if not text or "/" not in text:
+        return None
+    num, den = text.split("/", 1)
+    try:
+        num, den = int(num), int(den)
+    except ValueError:
+        return None
+    if num <= 0 or den <= 0:
+        return None
+    return num, den
+
+
+def video_timing(path):
+    text = run_probe([
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,time_base",
+        "-of", "json",
+        str(path),
+    ])
+    if not text:
+        raise RuntimeError(f"no video timing: {path}")
+    streams = json.loads(text).get("streams") or []
+    if not streams:
+        raise RuntimeError(f"no video timing: {path}")
+    rate = _ratio(str(streams[0].get("r_frame_rate") or ""))
+    base = _ratio(str(streams[0].get("time_base") or ""))
+    if rate is None or base is None:
+        raise RuntimeError(f"no frame rate: {path}")
+    return rate, base
+
+
+def packet_pts(path):
+    text = run_probe([
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts",
+        "-of", "csv=p=0",
+        str(path),
+    ])
+    if not text:
+        raise RuntimeError(f"no timestamps: {path}")
+    pts = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line == "N/A":
+            raise RuntimeError(f"missing timestamp: {path}")
+        pts.append(int(line))
+    if not pts:
+        raise RuntimeError(f"no timestamps: {path}")
+    return pts
+
+
+def frame_tick(pts, rate, base):
+    """Nearest frame index at this rate. base is the timestamp timebase."""
+    rate_num, rate_den = rate
+    tb_num, tb_den = base
+    return (pts * tb_num * rate_num + (tb_den * rate_den) // 2) // (tb_den * rate_den)
+
+
+def timestamp_problem(path):
+    """None when each next packet is a later frame tick.
+
+    mpeg4 turns the master timestamps into one tick per frame. Two packets on
+    the same tick fail the encode. Packet order is display order for these
+    masters because the import writes no B-frames.
+    """
+    rate, base = video_timing(path)
+    pts = packet_pts(path)
+    if any(b < a for a, b in zip(pts, pts[1:])):
+        return "timestamps go backwards"
+    last = None
+    for value in pts:
+        tick = frame_tick(value, rate, base)
+        if last is not None and tick <= last:
+            return "two frames share one timestamp"
+        last = tick
+    return None
+
+
+def restamp_timestamps(src, dst):
+    """Stream-copy src to dst on a constant frame-rate grid. Return an error or None.
+
+    setts numbers packets in file order. That matches display order while
+    timestamps never run backwards, which is true for a master without B-frames.
+    """
+    rate, base = video_timing(src)
+    pts = packet_pts(src)
+    if any(b < a for a, b in zip(pts, pts[1:])):
+        return "timestamps go backwards"
+    rate_num, rate_den = rate
+    tb_num, tb_den = base
+    expr = f"floor(N*{rate_den}*{tb_den}/({rate_num}*{tb_num})+0.5)"
+    dst.unlink(missing_ok=True)
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
+            "-i", str(src),
+            "-map", "0:v:0", "-an", "-c", "copy",
+            "-bsf:v", f"setts=pts={expr}:dts={expr}",
+            str(dst),
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        dst.unlink(missing_ok=True)
+        return "restamp failed"
+    if packets_of(dst) != len(pts):
+        dst.unlink(missing_ok=True)
+        return "restamp changed the frame count"
+    problem = timestamp_problem(dst)
+    if problem:
+        dst.unlink(missing_ok=True)
+        return problem
+    return None
+
+
+def master_problem(path, width, height, packets):
+    stream = probe_video(path)
+    if stream.get("codec_name") != "hevc":
+        return f"codec is {stream.get('codec_name')}"
+    if int(stream.get("width") or 0) != width or int(stream.get("height") or 0) != height:
+        return f"output is {stream.get('width')}x{stream.get('height')}, expected {width}x{height}"
+    if stream.get("pix_fmt") != MASTER_PIX_FMT:
+        return f"pixel format is {stream.get('pix_fmt')}, expected {MASTER_PIX_FMT}"
+    sar = stream_text(stream, "sample_aspect_ratio") or None
+    if not square_pixels(sar):
+        return f"sample aspect ratio {sar}"
+    tags = {
+        "color_space": "bt709",
+        "color_transfer": "bt709",
+        "color_primaries": "bt709",
+        "color_range": "tv",
+    }
+    for key, want in tags.items():
+        got = stream_text(stream, key)
+        if got != want:
+            return f"{key} is {got or 'unset'}, expected {want}"
+    out_packets = packets_of(path)
+    if out_packets != packets:
+        return f"{packets} input frames, {out_packets} output frames"
+    if has_audio(path):
+        return "output still has audio"
+    return timestamp_problem(path)
+
+
+def import_one(src, orig_dir, force):
+    """Encode src into orig. Return the new filename, or None on failure."""
+    label = src.name
+    if src.suffix.lower() not in VIDEO_EXTS:
+        print(f"skip {label}: train does not read this extension", file=sys.stderr)
+        return None
+    if not src.is_file():
+        print(f"no video: {src}", file=sys.stderr)
+        return None
+    if src.parent == orig_dir:
+        print(f"{src} is already in {orig_dir}", file=sys.stderr)
+        return None
+    out = orig_dir / f"{src.stem}.mkv"
+    if out.exists() and not force:
+        print(f"{out.name}: already in {orig_dir}", file=sys.stderr)
+        return None
+    try:
+        stream = probe_video(src)
+        in_packets = packets_of(src)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width < 2 or height < 2:
+        print(f"{label}: no video size", file=sys.stderr)
+        return None
+    field_order = stream_text(stream, "field_order")
+    if field_order in INTERLACED:
+        print(f"{label}: interlaced ({field_order})", file=sys.stderr)
+        return None
+    transfer = stream_text(stream, "color_transfer")
+    primaries = stream_text(stream, "color_primaries")
+    matrix_name = stream_text(stream, "color_space")
+    if transfer in HDR_TRANSFER or primaries in HDR_PRIMARIES or matrix_name in HDR_MATRIX:
+        print(f"{label}: HDR or wide-gamut source", file=sys.stderr)
+        return None
+    matrix = input_matrix(matrix_name)
+    if matrix is None:
+        print(f"{label}: unsupported color matrix {matrix_name}", file=sys.stderr)
+        return None
+    sar = stream_text(stream, "sample_aspect_ratio")
+    size = master_dimensions(width, height, sar)
+    if size is None:
+        print(f"{label}: bad sample aspect ratio {sar or 'unset'}", file=sys.stderr)
+        return None
+    out_w, out_h = size
+    tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
+    tmp.unlink(missing_ok=True)
+    print(
+        f"import {label}  {width}x{height} -> {out_w}x{out_h}  {MASTER_PIX_FMT} crf 12",
+        flush=True,
+    )
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        "-i", str(src),
+        "-map", "0:v:0", "-an",
+        "-vf", master_filter(out_w, out_h, matrix, stream_text(stream, "color_range")),
+        "-c:v", "libx265",
+        "-profile:v", "main444-10",
+        "-pix_fmt", MASTER_PIX_FMT,
+        "-crf", "12",
+        "-fps_mode", "passthrough",
+        "-x265-params", X265_PARAMS,
+        str(tmp),
+    ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: ffmpeg failed", file=sys.stderr)
+        return None
+    try:
+        problem = timestamp_problem(tmp)
+        if problem:
+            print(f"{label}: {problem}; restamping timestamps", flush=True)
+            stamped = tmp.with_name(f"{tmp.stem}.stamped{tmp.suffix}")
+            restamp_error = restamp_timestamps(tmp, stamped)
+            if restamp_error:
+                tmp.unlink(missing_ok=True)
+                stamped.unlink(missing_ok=True)
+                print(f"{label}: {restamp_error}", file=sys.stderr)
+                return None
+            stamped.replace(tmp)
+        problem = master_problem(tmp, out_w, out_h, in_packets)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
+    if problem:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: {problem}", file=sys.stderr)
+        return None
+    tmp.replace(out)
+    print(f"wrote {out}  {out_w}x{out_h}  {in_packets} frames", flush=True)
+    return out.name
+
+
+def degrade_files(orig_dir, low_dir, names, force):
+    scale, flags, pix_fmt, variants = load_config(CONFIG)
+    failed = False
+    for name in names:
+        src = orig_dir / name
+        for variant, ffmpeg_args in variants.items():
+            ok = encode_one(
+                src, low_dir, variant, ffmpeg_args,
+                scale, flags, pix_fmt, force, True,
+            )
+            failed = failed or not ok
+    return not failed
+
+
 def sources_from_args(orig_dir, names):
     if not names:
         found = sorted(
@@ -251,19 +624,66 @@ def sources_from_args(orig_dir, names):
     return sources, True
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="encode half-resolution variants of orig videos")
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="encode half-resolution variants of orig videos. "
+        "`whoodeo-make-low import` encodes a source into orig first",
+    )
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--variants", help="comma-separated variant names; default is all of them")
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: $WHOODEO_DATA/orig)")
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: $WHOODEO_DATA/low)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing low video")
     parser.add_argument("videos", nargs="*", help="filenames in orig; default encodes every missing partner")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def parse_import_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="whoodeo-make-low import",
+        description="encode sources into orig as 10-bit 4:4:4 HEVC masters",
+    )
+    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: $WHOODEO_DATA/orig)")
+    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="used with --degrade (default: $WHOODEO_DATA/low)")
+    parser.add_argument("-f", "--force", action="store_true", help="replace an existing master")
+    parser.add_argument("--degrade", action="store_true", help="also write the low variants of each new master")
+    parser.add_argument("videos", nargs="+", help="source videos to encode into orig")
+    return parser.parse_args(argv)
+
+
+def import_main(argv):
+    args = parse_import_args(argv)
+    args.orig = resolve_data(args.orig)
+    orig_dir = args.orig.expanduser().resolve()
+    orig_dir.mkdir(parents=True, exist_ok=True)
+    low_dir = None
+    if args.degrade:
+        args.low = resolve_data(args.low)
+        low_dir = args.low.expanduser().resolve()
+        low_dir.mkdir(parents=True, exist_ok=True)
+    failed = False
+    written = []
+    for name in args.videos:
+        src = Path(name).expanduser().resolve()
+        out_name = import_one(src, orig_dir, args.force)
+        if out_name is None:
+            failed = True
+            continue
+        written.append(out_name)
+    if args.degrade and written:
+        if not degrade_files(orig_dir, low_dir, written, args.force):
+            failed = True
+    if failed:
+        raise SystemExit(1)
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "import":
+        import_main(argv[1:])
+        return
+    args = parse_args(argv)
     args.orig = resolve_data(args.orig)
     args.low = resolve_data(args.low)
     scale, scale_flags, pix_fmt, variants = load_config(args.config)

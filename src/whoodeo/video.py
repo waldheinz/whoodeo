@@ -26,6 +26,23 @@ def png_bytes(rgb):
     return buffer.getvalue()
 
 
+def frame_tensor(frame):
+    """CHW float in 0..1.
+
+    8-bit frames stay on rgb24. Reading them as rgb48 shifts the values by
+    about one 8-bit step, and the existing masters are 8-bit. Wider frames
+    keep their steps: rgb48 holds a 10-bit code without rounding it to 8-bit.
+    """
+    bits = frame.format.components[0].bits
+    if bits is not None and bits > 8:
+        array = frame.to_ndarray(format="rgb48le")
+        scale = 65535.0
+    else:
+        array = frame.to_ndarray(format="rgb24")
+        scale = 255.0
+    return torch.from_numpy(array).permute(2, 0, 1).float() / scale
+
+
 def read_video_frames(video_path, start_sec=0):
     with av.open(video_path) as container:
         stream = container.streams.video[0]
@@ -34,9 +51,7 @@ def read_video_frames(video_path, start_sec=0):
         for frame in container.decode(stream):
             if start_sec > 0 and (frame.time is None or frame.time + 1e-3 < start_sec):
                 continue
-            array = frame.to_ndarray(format='rgb24')  # Shape: (height, width, 3)
-            tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 255.0
-            yield tensor
+            yield frame_tensor(frame)
 
 
 def write_video(generator, output_path, fps=30):

@@ -46,7 +46,7 @@ from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.objective import Objective, pixel_loss
-from whoodeo.video import png_bytes, rgb_image
+from whoodeo.video import frame_tensor, png_bytes, rgb_image
 
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 SCALE = 2
@@ -98,9 +98,7 @@ class Clip:
         for frame in self.container.decode(self.stream):
             if frame.time is None or frame.time + 1e-3 < start:
                 continue
-            array = frame.to_ndarray(format="rgb24")
-            tensor = torch.from_numpy(array).permute(2, 0, 1).float() / 255.0
-            frames.append(tensor)
+            frames.append(frame_tensor(frame))
             times.append(frame.time)
             if frame.time >= time_sec + pad and len(frames) >= radius * 2 + 1:
                 break

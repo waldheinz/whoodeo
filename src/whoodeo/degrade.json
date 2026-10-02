@@ -3,9 +3,9 @@
   "scale_flags": "bicubic",
   "pix_fmt": "yuv420p",
   "variants": {
+    "mpeg4-q08": "-c:v mpeg4 -q:v 8",
     "mpeg4-q12": "-c:v mpeg4 -q:v 12",
     "mpeg4-q16": "-c:v mpeg4 -q:v 16",
-    "mpeg4-q20": "-c:v mpeg4 -q:v 20",
     "x264-crf28": "-c:v libx264 -crf 28 -preset medium",
     "x264-500k": "-c:v libx264 -b:v 500k -preset medium"
   }
