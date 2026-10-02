@@ -6,8 +6,11 @@ integer search. `espcn` and `edsr` are the other architectures. The training
 config sets depth, width, and input frames.
 """
 
-from whoodeo.model import DeformESPCN, ESPCN, ModifiedESPCN, ShiftESPCN
-from whoodeo.model_edsr import EDSR
+from whoodeo.models.deform import DeformESPCN
+from whoodeo.models.edsr import EDSR
+from whoodeo.models.espcn import ESPCN
+from whoodeo.models.modified import ModifiedESPCN
+from whoodeo.models.shift import ShiftESPCN
 
 PRESETS = {
     "modified": {"blocks": 32, "channels": 64, "frames": None},

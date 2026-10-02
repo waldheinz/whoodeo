@@ -42,9 +42,9 @@ import matplotlib.pyplot as plt
 import torch
 from whoodeo.catalog import data_root
 from whoodeo.config import assert_resume_matches, load_config, shape_text
-from whoodeo.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.live import add_live_args, open_live
-from whoodeo.nets import build_model
+from whoodeo.models import build_model
+from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.objective import Objective, pixel_loss
 from whoodeo.video import png_bytes, rgb_image
 

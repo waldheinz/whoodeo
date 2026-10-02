@@ -1,9 +1,10 @@
-
-import torch.nn as nn
-import torch
 import math
 
-from whoodeo.model import bilinear_plus, zero_conv
+import torch
+import torch.nn as nn
+
+from whoodeo.models.common import bilinear_plus, zero_conv
+
 
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
     return nn.Conv2d(

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from whoodeo.nets import PRESETS
+from whoodeo.models import PRESETS
 
 VGG_LAYERS = {
     "relu1_1": 1,

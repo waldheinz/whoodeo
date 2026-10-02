@@ -17,7 +17,7 @@ import torch
 from tqdm import tqdm
 
 from whoodeo.live import add_live_args, open_live
-from whoodeo.nets import build_model
+from whoodeo.models import build_model
 from whoodeo.video import read_video_frames, rgb_image
 
 
