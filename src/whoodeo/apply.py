@@ -54,7 +54,13 @@ def load_checkpoint(path, device):
             raise SystemExit(f"checkpoint {path} has no blocks or channels")
         if isinstance(blocks, bool) or isinstance(channels, bool):
             raise SystemExit(f"checkpoint {path} has no blocks or channels")
-    model, label = build_model(arch, blocks, channels, in_frames)
+    model, label = build_model(
+        arch, blocks, channels, in_frames,
+        radius=saved.get("radius"),
+        stem=saved.get("stem"),
+        sharpness=saved.get("sharpness"),
+        reject=saved.get("reject"),
+    )
     model.load_state_dict(checkpoint["model"])
     model.eval().to(device)
     return model, label, in_frames, checkpoint.get("step"), path

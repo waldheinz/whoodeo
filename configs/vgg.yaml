@@ -1,9 +1,11 @@
 # Pixel L1 plus VGG, no discriminator.
 
-arch: modified
-blocks: 16
-channels: 128
-in_frames: 5
+model:
+  arch: modified
+  blocks: 16
+  channels: 128
+  in_frames: 5
+
 batch: 1
 lr: 2.0e-5
 holdout: 0.1

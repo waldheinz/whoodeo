@@ -17,8 +17,9 @@ A fresh run validates once at step 0, before any update. The residual is
 zero at init, so that pass is a 2× bilinear upscale.
 
 A gan term adds a U-Net discriminator. Its weights and Adam state are stored
-in the checkpoint. whoodeo-apply reads only the generator. Resuming requires
-the same architecture and the same loss. Learning rates come from the file.
+in the checkpoint. whoodeo-apply reads only the generator. --resume continues
+from a checkpoint of the same architecture and the same loss. Learning rates
+come from the file.
 """
 
 import argparse
@@ -481,6 +482,10 @@ def checkpoint_args(cfg, objective):
         "blocks": cfg.blocks,
         "channels": cfg.channels,
         "in_frames": cfg.in_frames,
+        "radius": cfg.radius,
+        "stem": cfg.stem,
+        "sharpness": cfg.sharpness,
+        "reject": cfg.reject,
         "batch": cfg.batch,
         "lr": cfg.lr,
         "disc_lr": None if gan is None else gan.disc_lr,
@@ -665,7 +670,7 @@ def push_loss_series(live, rows):
             live.series(name, xs, ys)
 
 
-def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
+def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
     rng = random.Random(cfg.seed)
     torch.manual_seed(cfg.seed)
     radius = cfg.in_frames // 2
@@ -675,8 +680,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
     resumed = None
     resume_path = None
     saved_args = {}
-    if cfg.resume is not None:
-        resume_path = cfg.resume if cfg.resume.is_file() else cfg.resume / "model.pt"
+    if resume is not None:
+        resume_path = Path(resume).expanduser()
+        if not resume_path.is_file():
+            resume_path = resume_path / "model.pt"
         if not resume_path.is_file():
             raise SystemExit(f"no checkpoint: {resume_path}")
         resumed = torch.load(resume_path, map_location="cpu", weights_only=False)
@@ -725,7 +732,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
     limit = "until Ctrl-C" if cfg.steps is None else str(cfg.steps)
     print(f"run {out_dir}  steps {limit}", flush=True)
 
-    model, label = build_model(cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames)
+    model, label = build_model(
+        cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames,
+        radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
+    )
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     print(label, flush=True)
@@ -947,9 +957,20 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765"):
 def main():
     parser = argparse.ArgumentParser(description="train on random paired video frames")
     parser.add_argument("config", type=Path, help="training recipe")
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="continue from this checkpoint (model.pt or the run directory)",
+    )
     add_live_args(parser)
     args = parser.parse_args()
-    train(load_config(args.config), preview=not args.no_preview, live_bind=args.live_bind)
+    train(
+        load_config(args.config),
+        preview=not args.no_preview,
+        live_bind=args.live_bind,
+        resume=args.resume,
+    )
 
 
 if __name__ == "__main__":

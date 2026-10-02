@@ -66,12 +66,18 @@ class TrainConfig:
     seed: int
     steps: int | None
     out: Path | None
-    resume: Path | None
     balance: str
     terms: tuple[Term, ...]
+    radius: int | None = None
+    stem: int | None = None
+    sharpness: float | None = None
+    reject: bool | None = None
 
     def arch_key(self):
-        return (self.arch, self.blocks, self.channels, self.in_frames)
+        key = (self.arch, self.blocks, self.channels, self.in_frames)
+        if self.arch == "shift":
+            return key + (self.radius, self.stem, self.sharpness, self.reject)
+        return key
 
     def loss_recipe(self):
         return {"balance": self.balance, "terms": [term.as_dict() for term in self.terms]}
@@ -83,10 +89,17 @@ class TrainConfig:
         return None
 
 
-def shape_text(arch, blocks, channels, in_frames):
+def shape_text(arch, blocks, channels, in_frames, radius=None, stem=None, sharpness=None, reject=None):
     if blocks is None:
-        return f"{arch} in_frames {in_frames}"
-    return f"{arch} {blocks}x{channels} in_frames {in_frames}"
+        text = f"{arch} in_frames {in_frames}"
+    else:
+        text = f"{arch} {blocks}x{channels} in_frames {in_frames}"
+    if arch == "shift":
+        text += (
+            f" radius {radius} stem {stem} "
+            f"sharpness {sharpness:g} reject {str(reject).lower()}"
+        )
+    return text
 
 
 def assert_resume_matches(cfg, saved, checkpoint):
@@ -97,6 +110,13 @@ def assert_resume_matches(cfg, saved, checkpoint):
         if key not in saved:
             raise SystemExit(f"checkpoint {checkpoint} has no {key}")
     saved_key = (saved["arch"], saved["blocks"], saved["channels"], saved["in_frames"])
+    if saved["arch"] == "shift":
+        for key in ("radius", "stem", "sharpness", "reject"):
+            if key not in saved:
+                raise SystemExit(f"checkpoint {checkpoint} has no {key}")
+        saved_key = saved_key + (
+            saved["radius"], saved["stem"], float(saved["sharpness"]), saved["reject"],
+        )
     if saved_key != cfg.arch_key():
         found = shape_text(*saved_key)
         wanted = shape_text(*cfg.arch_key())
@@ -117,23 +137,7 @@ def load_config(path):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch = _take_choice(data, "arch", where, PRESETS)
-    preset = PRESETS[arch]
-    in_frames = _take_int(data, "in_frames", where, positive=True)
-    if in_frames % 2 != 1:
-        raise SystemExit(f"{where}: in_frames must be odd")
-    fixed = preset["frames"]
-    if fixed is not None and in_frames != fixed:
-        raise SystemExit(f"{where}: {arch} takes {fixed} input frame, not {in_frames}")
-    if arch == "espcn":
-        if "blocks" in data or "channels" in data:
-            raise SystemExit(f"{where}: espcn has a fixed size")
-        blocks = None
-        channels = None
-    else:
-        blocks = _take_int(data, "blocks", where, positive=True)
-        channels = _take_int(data, "channels", where, positive=True)
-
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject = _take_model(data, where)
     batch = _take_int(data, "batch", where, positive=True)
     lr = _take_float(data, "lr", where, positive=True)
     holdout = _take_float(data, "holdout", where, positive=True)
@@ -145,7 +149,6 @@ def load_config(path):
     seed = _take_int(data, "seed", where, default=0)
     steps = _take_int(data, "steps", where, positive=True, default=None)
     out = _take_path(data, "out", where)
-    resume = _take_path(data, "resume", where)
     balance, terms = _take_loss(data, where)
     _reject_unknown(data, where)
     return TrainConfig(
@@ -163,10 +166,57 @@ def load_config(path):
         seed=seed,
         steps=steps,
         out=out,
-        resume=resume,
         balance=balance,
         terms=tuple(terms),
+        radius=radius,
+        stem=stem,
+        sharpness=sharpness,
+        reject=reject,
     )
+
+
+def _take_model(data, where):
+    if "model" not in data:
+        raise SystemExit(f"{where}: missing model")
+    model = data.pop("model")
+    if not isinstance(model, dict):
+        raise SystemExit(f"{where}: model must be a mapping")
+    label = f"{where}: model"
+    arch = _take_choice(model, "arch", label, PRESETS)
+    preset = PRESETS[arch]
+    in_frames = _take_int(model, "in_frames", label, positive=True)
+    if arch == "espcn":
+        if "blocks" in model or "channels" in model:
+            raise SystemExit(f"{label}: espcn has a fixed size")
+        blocks = None
+        channels = None
+    else:
+        blocks = _take_int(model, "blocks", label, positive=True)
+        channels = _take_int(model, "channels", label, positive=True)
+    radius, stem, sharpness, reject = _take_shift(model, arch, label)
+    _reject_unknown(model, label)
+    if in_frames % 2 != 1:
+        raise SystemExit(f"{label}: in_frames must be odd")
+    fixed = preset["frames"]
+    if fixed is not None and in_frames != fixed:
+        raise SystemExit(f"{label}: {arch} takes {fixed} input frame, not {in_frames}")
+    if arch == "shift" and in_frames < 3:
+        raise SystemExit(f"{label}: shift needs at least 3 input frames")
+    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject
+
+
+def _take_shift(data, arch, where):
+    if arch != "shift":
+        return None, None, None, None
+    radius = _take_int(data, "radius", where)
+    if radius < 0 or radius > 16:
+        raise SystemExit(f"{where}: radius must be from 0 to 16")
+    stem = _take_int(data, "stem", where)
+    if stem < 0:
+        raise SystemExit(f"{where}: stem must be zero or positive")
+    sharpness = _take_float(data, "sharpness", where, positive=True)
+    reject = _take_bool(data, "reject", where)
+    return radius, stem, sharpness, reject
 
 
 def _take_loss(data, where):
@@ -249,6 +299,13 @@ def _take_int(data, key, where, positive=False, default=...):
         raise SystemExit(f"{where}: {key} must be an integer")
     if positive and value <= 0:
         raise SystemExit(f"{where}: {key} must be positive")
+    return value
+
+
+def _take_bool(data, key, where):
+    value = _pop_value(data, key, where, ...)
+    if not isinstance(value, bool):
+        raise SystemExit(f"{where}: {key} must be true or false")
     return value
 
 

@@ -1,9 +1,11 @@
 # Pixel MSE only, on a small network.
 
-arch: modified
-blocks: 8
-channels: 64
-in_frames: 5
+model:
+  arch: modified
+  blocks: 8
+  channels: 64
+  in_frames: 5
+
 batch: 1
 lr: 2.0e-5
 holdout: 0.1
