@@ -484,6 +484,7 @@ def checkpoint_args(cfg, objective):
         "stem": cfg.stem,
         "sharpness": cfg.sharpness,
         "reject": cfg.reject,
+        "levels": cfg.levels,
         "batch": cfg.batch,
         "lr": cfg.lr,
         "disc_lr": None if gan is None else gan.disc_lr,
@@ -733,6 +734,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
     model, label = build_model(
         cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames,
         radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
+        levels=cfg.levels,
     )
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -873,6 +875,9 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
                         parameter.requires_grad_(False)
                 raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
                 loss, weighted = objective.combine(raw)
+                align_loss = getattr(model, "align_loss", None)
+                if align_loss is not None:
+                    loss = loss + align_loss
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()

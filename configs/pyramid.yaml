@@ -1,0 +1,31 @@
+# Coarse correlation, then a small correction at the finer scales. The
+# correction starts at zero, so an untrained model is the bilinear enlargement
+# of the middle frame. Pixel L1 holds the level, VGG pulls the edges. No GAN:
+# two films are not enough for a discriminator. balance start freezes the
+# scales on the validation frames.
+
+model:
+  arch: pyramid
+  blocks: 16
+  channels: 128
+  in_frames: 3
+  levels: 3
+  stem: 2
+  radius: 4
+
+batch: 2
+lr: 1.0e-4
+holdout: 0.1
+log_every: 10
+val_every: 500
+val_count: 16
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 0.70
+      kind: l1
+    - name: vgg
+      weight: 0.30
+      layers: [relu2_2, relu3_4]

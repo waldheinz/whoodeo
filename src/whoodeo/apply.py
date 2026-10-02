@@ -60,6 +60,7 @@ def load_checkpoint(path, device):
         stem=saved.get("stem"),
         sharpness=saved.get("sharpness"),
         reject=saved.get("reject"),
+        levels=saved.get("levels"),
     )
     model.load_state_dict(checkpoint["model"])
     model.eval().to(device)

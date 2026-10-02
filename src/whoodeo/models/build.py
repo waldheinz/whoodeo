@@ -2,25 +2,31 @@
 
 `modified` is a residual ESPCN. `deform` keeps that stack and aligns the
 neighbor frames with a deformable 3x3. `shift` aligns them with a dense
-integer search. `espcn` and `edsr` are the other architectures. The training
-config sets depth, width, and input frames.
+integer search. `pyramid` aligns them with a coarse-to-fine flow. `espcn`
+and `edsr` are the other architectures. The training config sets depth,
+width, and input frames.
 """
 
 from whoodeo.models.deform import DeformESPCN
 from whoodeo.models.edsr import EDSR
 from whoodeo.models.espcn import ESPCN
 from whoodeo.models.modified import ModifiedESPCN
+from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
 
 PRESETS = {
     "modified": {"blocks": 32, "channels": 64, "frames": None},
     "deform": {"blocks": 32, "channels": 64, "frames": None},
     "shift": {"blocks": 8, "channels": 64, "frames": None},
+    "pyramid": {"blocks": 8, "channels": 64, "frames": None},
     "espcn": {"blocks": None, "channels": None, "frames": 1},
     "edsr": {"blocks": 32, "channels": 256, "frames": 1},
 }
 
-def build_model(arch, blocks=None, channels=None, in_frames=5, *, radius=None, stem=None, sharpness=None, reject=None):
+def build_model(
+    arch, blocks=None, channels=None, in_frames=5, *,
+    radius=None, stem=None, sharpness=None, reject=None, levels=None,
+):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
         raise SystemExit(f"unknown arch {arch}. choices: {known}")
@@ -46,6 +52,9 @@ def build_model(arch, blocks=None, channels=None, in_frames=5, *, radius=None, s
     elif arch == "shift":
         _check_shift(radius, stem, sharpness, reject)
         model = ShiftESPCN(width, depth, in_frames, radius, stem, sharpness, reject)
+    elif arch == "pyramid":
+        _check_pyramid(levels, stem, radius)
+        model = PyramidESPCN(width, depth, in_frames, levels, stem, radius)
     else:
         model = EDSR({
             "n_resblocks": depth,
@@ -61,6 +70,11 @@ def build_model(arch, blocks=None, channels=None, in_frames=5, *, radius=None, s
             f"shift {depth}x{width} in_frames {in_frames} "
             f"radius {radius} stem {stem} sharpness {sharpness:g} "
             f"reject {str(reject).lower()} parameters {count}"
+        )
+    elif arch == "pyramid":
+        label = (
+            f"pyramid {depth}x{width} in_frames {in_frames} "
+            f"levels {levels} stem {stem} radius {radius} parameters {count}"
         )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"
@@ -78,3 +92,14 @@ def _check_shift(radius, stem, sharpness, reject):
         raise SystemExit("sharpness must be a positive number")
     if not isinstance(reject, bool):
         raise SystemExit("reject must be true or false")
+
+
+def _check_pyramid(levels, stem, radius):
+    if levels is None or stem is None or radius is None:
+        raise SystemExit("arch pyramid needs levels, stem, and radius")
+    if isinstance(levels, bool) or not isinstance(levels, int) or levels < 1 or levels > 6:
+        raise SystemExit("levels must be an integer from 1 to 6")
+    if isinstance(stem, bool) or not isinstance(stem, int) or stem < 0:
+        raise SystemExit("stem must be an integer >= 0")
+    if isinstance(radius, bool) or not isinstance(radius, int) or radius < 0 or radius > 8:
+        raise SystemExit("radius must be an integer from 0 to 8")

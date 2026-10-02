@@ -72,11 +72,14 @@ class TrainConfig:
     stem: int | None = None
     sharpness: float | None = None
     reject: bool | None = None
+    levels: int | None = None
 
     def arch_key(self):
         key = (self.arch, self.blocks, self.channels, self.in_frames)
         if self.arch == "shift":
             return key + (self.radius, self.stem, self.sharpness, self.reject)
+        if self.arch == "pyramid":
+            return key + (self.levels, self.stem, self.radius)
         return key
 
     def loss_recipe(self):
@@ -89,16 +92,20 @@ class TrainConfig:
         return None
 
 
-def shape_text(arch, blocks, channels, in_frames, radius=None, stem=None, sharpness=None, reject=None):
+def shape_text(arch, blocks, channels, in_frames, *extra):
     if blocks is None:
         text = f"{arch} in_frames {in_frames}"
     else:
         text = f"{arch} {blocks}x{channels} in_frames {in_frames}"
     if arch == "shift":
+        radius, stem, sharpness, reject = extra
         text += (
             f" radius {radius} stem {stem} "
             f"sharpness {sharpness:g} reject {str(reject).lower()}"
         )
+    elif arch == "pyramid":
+        levels, stem, radius = extra
+        text += f" levels {levels} stem {stem} radius {radius}"
     return text
 
 
@@ -117,6 +124,11 @@ def assert_resume_matches(cfg, saved, checkpoint):
         saved_key = saved_key + (
             saved["radius"], saved["stem"], float(saved["sharpness"]), saved["reject"],
         )
+    elif saved["arch"] == "pyramid":
+        for key in ("levels", "stem", "radius"):
+            if key not in saved:
+                raise SystemExit(f"checkpoint {checkpoint} has no {key}")
+        saved_key = saved_key + (saved["levels"], saved["stem"], saved["radius"])
     if saved_key != cfg.arch_key():
         found = shape_text(*saved_key)
         wanted = shape_text(*cfg.arch_key())
@@ -137,7 +149,7 @@ def load_config(path):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject = _take_model(data, where)
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels = _take_model(data, where)
     batch = _take_int(data, "batch", where, positive=True)
     lr = _take_float(data, "lr", where, positive=True)
     holdout = _take_float(data, "holdout", where, positive=True)
@@ -172,6 +184,7 @@ def load_config(path):
         stem=stem,
         sharpness=sharpness,
         reject=reject,
+        levels=levels,
     )
 
 
@@ -194,15 +207,18 @@ def _take_model(data, where):
         blocks = _take_int(model, "blocks", label, positive=True)
         channels = _take_int(model, "channels", label, positive=True)
     radius, stem, sharpness, reject = _take_shift(model, arch, label)
+    levels = None
+    if arch == "pyramid":
+        levels, stem, radius = _take_pyramid(model, label)
     _reject_unknown(model, label)
     if in_frames % 2 != 1:
         raise SystemExit(f"{label}: in_frames must be odd")
     fixed = preset["frames"]
     if fixed is not None and in_frames != fixed:
         raise SystemExit(f"{label}: {arch} takes {fixed} input frame, not {in_frames}")
-    if arch == "shift" and in_frames < 3:
-        raise SystemExit(f"{label}: shift needs at least 3 input frames")
-    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject
+    if arch in ("shift", "pyramid") and in_frames < 3:
+        raise SystemExit(f"{label}: {arch} needs at least 3 input frames")
+    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels
 
 
 def _take_shift(data, arch, where):
@@ -217,6 +233,19 @@ def _take_shift(data, arch, where):
     sharpness = _take_float(data, "sharpness", where, positive=True)
     reject = _take_bool(data, "reject", where)
     return radius, stem, sharpness, reject
+
+
+def _take_pyramid(data, where):
+    levels = _take_int(data, "levels", where, positive=True)
+    if levels > 6:
+        raise SystemExit(f"{where}: levels must be from 1 to 6")
+    stem = _take_int(data, "stem", where)
+    if stem < 0:
+        raise SystemExit(f"{where}: stem must be zero or positive")
+    radius = _take_int(data, "radius", where)
+    if radius < 0 or radius > 8:
+        raise SystemExit(f"{where}: radius must be from 0 to 8")
+    return levels, stem, radius
 
 
 def _take_loss(data, where):
