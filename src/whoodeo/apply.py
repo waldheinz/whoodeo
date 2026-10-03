@@ -1,8 +1,12 @@
 """Reconstruct a video with a generator written by train.
 
-model.pt holds the generator and its architecture. A run directory works
-too. An older model.pt that also holds the optimizer still loads; the
-optimizer is ignored.
+With one path, the video is reconstructed by runs/latest. With two paths,
+the first picks a checkpoint and the second is the video. A run directory
+opens its newest checkpoint. The reconstruction is written into the run
+directory as <stem>-recon-<step>.mkv.
+
+model.pt holds the generator and its architecture. An older model.pt that
+also holds the optimizer still loads; the optimizer is ignored.
 
 The network runs on each full frame. A 5-frame model sees the center frame
 plus two neighbors on either side, repeating the first or last frame at the
@@ -20,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from whoodeo.checkpoint import build_generator, load_generator
+from whoodeo.checkpoint import build_generator, latest_link, load_generator, reconstruction_path
 from whoodeo.live import add_live_args, open_live
 from whoodeo.video import read_video_frames, rgb_image
 
@@ -186,7 +190,7 @@ def apply(args):
     height = video_in.codec_context.height
     out = args.out
     if out is None:
-        out = checkpoint_path.parent / f"{args.input.stem}-recon.mkv"
+        out = reconstruction_path(checkpoint_path, step, args.input)
     out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"device {device}", flush=True)
@@ -264,14 +268,39 @@ def apply(args):
             live.close()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="reconstruct a video with a saved train model")
-    parser.add_argument("model", type=Path, help="model.pt from train, or the run directory")
-    parser.add_argument("input", type=Path, help="video to reconstruct")
-    parser.add_argument("--out", type=Path, default=None, help="mkv to write (default: next to the checkpoint)")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="reconstruct a video with a saved train model",
+        usage="%(prog)s [checkpoint] video",
+    )
+    parser.add_argument(
+        "model",
+        nargs="?",
+        type=Path,
+        help="checkpoint, run directory, model.pt, or train.pt (default: runs/latest)",
+    )
+    parser.add_argument("input", nargs="?", type=Path, help="video to reconstruct")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="mkv to write (default: <stem>-recon-<step>.mkv in the run directory)",
+    )
     parser.add_argument("--frames", type=int, default=0, help="stop after this many frames; 0 means the whole video")
     add_live_args(parser)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.input is None and args.model is not None:
+        args.input = args.model
+        args.model = None
+    if args.input is None:
+        parser.error("pass the video to reconstruct")
+    if args.model is None:
+        args.model = latest_link()
+        if not args.model.exists():
+            raise SystemExit(
+                f"no checkpoint at {args.model}. Pass a checkpoint on the command line."
+            )
+    return args
 
 
 def main():

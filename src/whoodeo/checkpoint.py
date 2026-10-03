@@ -1,5 +1,10 @@
 """Generator file and training state written by a run.
 
+Each save lands in checkpoints/<step>/, with model.pt and train.pt beside
+each other. A later step adds a directory. The same step may replace its
+own two files. latest inside the run points at the newest directory, and
+runs/latest points at the newest checkpoint written by any run.
+
 model.pt is the generator. It carries the architecture, the weights, and the
 step those weights were saved at. whoodeo-apply and a fine-tune read only
 this file.
@@ -8,11 +13,15 @@ train.pt is everything else the same run needs in order to continue: the
 step again, both optimizers, the discriminator, the loss recipe, and the
 loss scales. --resume reads it. A fine-tune does not.
 
-An older model.pt that still holds the optimizer in one file loads too. The
-next save of that run writes the two files.
+A run directory follows its latest link. A checkpoint directory, model.pt,
+or train.pt names one step exactly. An older run that still keeps model.pt
+directly in the run directory loads too. An older model.pt that still holds
+the optimizer in one file loads too. The next save of that run writes
+checkpoints/.
 """
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,13 +56,32 @@ class TrainState:
     disc_optimizer: dict | None
 
 
+def latest_link():
+    """Symlink that follows the newest checkpoint written from this directory."""
+    return Path.cwd() / "runs" / "latest"
+
+
+def run_directory(model_path):
+    """Run that owns this model.pt: config, loss, and validation live there."""
+    parent = Path(model_path).parent
+    if parent.name.isdigit() and parent.parent.name == "checkpoints":
+        return parent.parent.parent
+    return parent
+
+
 def save_run(
     directory, model, architecture, step, optimizer, loss, objective,
     discriminator=None, disc_optimizer=None,
 ):
-    """Write train.pt first, then model.pt. A crash keeps the previous model.pt."""
+    """Write checkpoints/<step>/ and point both latest links at it.
+
+    A new step is published by renaming its directory into place, so a crash
+    leaves the previous checkpoint alone. The same step replaces its own two
+    files, train.pt first. Returns the checkpoint directory.
+    """
     directory = Path(directory)
     step = int(step)
+    name = f"{step:06d}"
     train_payload = {
         "step": step,
         "optimizer": optimizer.state_dict(),
@@ -63,16 +91,38 @@ def save_run(
     if discriminator is not None:
         train_payload["discriminator"] = discriminator.state_dict()
         train_payload["disc_optimizer"] = disc_optimizer.state_dict()
-    _atomic_save(directory / "train.pt", train_payload)
-    _atomic_save(directory / "model.pt", {
+    model_payload = {
         "architecture": architecture,
         "state_dict": model.state_dict(),
         "step": step,
-    })
+    }
+    checkpoints = directory / "checkpoints"
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    partial = checkpoints / f".{name}.partial"
+    if partial.exists():
+        shutil.rmtree(partial)
+    partial.mkdir()
+    try:
+        _atomic_save(partial / "train.pt", train_payload)
+        _atomic_save(partial / "model.pt", model_payload)
+        dest = checkpoints / name
+        if dest.is_dir():
+            os.replace(partial / "train.pt", dest / "train.pt")
+            os.replace(partial / "model.pt", dest / "model.pt")
+            partial.rmdir()
+        else:
+            os.replace(partial, dest)
+    except BaseException:
+        if partial.exists():
+            shutil.rmtree(partial, ignore_errors=True)
+        raise
+    _retarget(directory / "latest", Path("checkpoints") / name)
+    _publish_runs_latest(dest)
+    return dest
 
 
 def load_generator(path):
-    """Generator weights from a model file or a run directory."""
+    """Generator weights from a model file, a checkpoint, or a run directory."""
     spec, _payload = _read_model(_model_file(path))
     return spec
 
@@ -80,7 +130,8 @@ def load_generator(path):
 def load_resume(path):
     """Generator plus the training state for --resume.
 
-    `path` may be a run directory, model.pt, or train.pt.
+    `path` may be a run directory, a checkpoint directory, model.pt, or train.pt.
+    A run directory opens its newest checkpoint.
     """
     model_path, train_path = _run_files(path)
     if not model_path.is_file():
@@ -95,6 +146,29 @@ def load_resume(path):
     raise SystemExit(
         f"no training state: {train_path}. Fine-tune this model with --model."
     )
+
+
+def continue_run(path):
+    """Run directory to keep writing into.
+
+    None means `path` is an older checkpoint than the one its run calls latest,
+    so the caller starts a new run and leaves the later checkpoints in place.
+    """
+    model_path, _train_path = _run_files(path)
+    root = run_directory(model_path)
+    current = _latest_checkpoint_dir(root)
+    if current is not None and current.resolve() != Path(model_path).parent.resolve():
+        return None
+    return root
+
+
+def reconstruction_path(model_path, step, video):
+    """Default apply output: <stem>-recon-<step>.mkv in the run directory."""
+    if step is None:
+        name = f"{Path(video).stem}-recon.mkv"
+    else:
+        name = f"{Path(video).stem}-recon-{int(step):06d}.mkv"
+    return run_directory(model_path) / name
 
 
 def build_generator(spec, device):
@@ -113,6 +187,75 @@ def build_generator(spec, device):
     return model, label, in_frames, spec.step, spec.path
 
 
+def _publish_runs_latest(checkpoint_dir):
+    runs = Path.cwd() / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    dest = checkpoint_dir.resolve()
+    try:
+        dest.relative_to(runs.resolve())
+        target = Path(os.path.relpath(dest, runs.resolve()))
+    except ValueError:
+        target = dest
+    _retarget(runs / "latest", target)
+
+
+def _retarget(link, target):
+    """Point `link` at `target`. The replacement itself is one rename."""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(link.name + ".tmp")
+    if temporary.is_symlink() or temporary.exists():
+        temporary.unlink()
+    temporary.symlink_to(target)
+    os.replace(temporary, link)
+
+
+def _latest_checkpoint_dir(run_dir):
+    """Newest checkpoint of one run, or the legacy model.pt in the run itself."""
+    run_dir = Path(run_dir)
+    link = run_dir / "latest"
+    if link.is_symlink():
+        raw = Path(os.readlink(link))
+        target = raw if raw.is_absolute() else run_dir / raw
+        target = target.resolve()
+        if (target / "model.pt").is_file():
+            return target
+    best = _highest_step(run_dir / "checkpoints")
+    if best is not None:
+        return best.resolve()
+    if (run_dir / "model.pt").is_file():
+        return run_dir.resolve()
+    return None
+
+
+def _highest_step(checkpoints):
+    if not checkpoints.is_dir():
+        return None
+    found = []
+    for child in checkpoints.iterdir():
+        if child.name.isdigit() and (child / "model.pt").is_file():
+            found.append((int(child.name), child))
+    if not found:
+        return None
+    found.sort()
+    return found[-1][1]
+
+
+def _checkpoint_dir(path):
+    """Directory that directly holds the model.pt `path` refers to.
+
+    A run directory follows latest. A checkpoint directory is itself.
+    """
+    if not path.is_dir():
+        return None
+    if (path / "latest").is_symlink() or (path / "checkpoints").is_dir():
+        found = _latest_checkpoint_dir(path)
+        if found is not None:
+            return found
+    if (path / "model.pt").is_file():
+        return path.resolve()
+    return None
+
+
 def _model_file(path):
     path = Path(path).expanduser()
     if path.is_file() and path.name == "train.pt":
@@ -121,7 +264,10 @@ def _model_file(path):
             raise SystemExit(f"{path} is training state, and {model_path} is missing")
         return model_path
     if path.is_dir():
-        path = path / "model.pt"
+        found = _checkpoint_dir(path)
+        if found is None:
+            raise SystemExit(f"no model: {path / 'model.pt'}")
+        return found / "model.pt"
     if not path.is_file():
         raise SystemExit(f"no model: {path}")
     return path
@@ -130,7 +276,10 @@ def _model_file(path):
 def _run_files(path):
     path = Path(path).expanduser()
     if path.is_dir():
-        return path / "model.pt", path / "train.pt"
+        found = _checkpoint_dir(path)
+        if found is None:
+            raise SystemExit(f"no model: {path / 'model.pt'}")
+        return found / "model.pt", found / "train.pt"
     if not path.is_file():
         if path.name == "train.pt":
             raise SystemExit(f"no training state: {path}")

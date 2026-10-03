@@ -17,15 +17,18 @@ A fresh run validates once at step 0, before any update. The residual is
 zero at init, so that pass is a 2× bilinear upscale. A fine-tune's step 0
 is the generator that was loaded.
 
-A gan term adds a U-Net discriminator. The run directory holds two files.
-model.pt is the generator and the architecture that builds it. whoodeo-apply
-and a fine-tune read only that file. train.pt is the step, the optimizers,
-the discriminator, the loss recipe, and the loss scales.
+A gan term adds a U-Net discriminator. Each checkpoint is a directory
+checkpoints/<step>/ holding two files. model.pt is the generator and the
+architecture that builds it. whoodeo-apply and a fine-tune read only that
+file. train.pt is the step, the optimizers, the discriminator, the loss
+recipe, and the loss scales. latest in the run points at the newest of
+those directories, and runs/latest follows the newest checkpoint written.
 
---resume continues a run: the same architecture, the same loss, the Adam
-state, and the loss scales. Learning rates come from the file. An older
-model.pt that still carries the optimizer loads the same way, and the next
-save splits it.
+--resume continues a run from its newest checkpoint: the same architecture,
+the same loss, the Adam state, and the loss scales. Learning rates come
+from the file. Resuming an older checkpoint starts a new run, so the later
+checkpoints stay where they are. An older model.pt that still carries the
+optimizer loads the same way, and the next save writes checkpoints/.
 
 --model fine-tunes that generator under the loss in the file. The optimizer
 and the discriminator start over, the loss scales are measured again, and
@@ -52,7 +55,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from whoodeo.catalog import data_root
-from whoodeo.checkpoint import load_generator, load_resume, save_run
+from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
 from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
@@ -654,14 +657,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
     out_dir = cfg.out
     if out_dir is None and train_state is not None:
-        out_dir = generator.path.parent
-    elif out_dir is None:
+        out_dir = continue_run(resume)
+    if out_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = Path.cwd() / "runs" / f"train-{stamp}"
     if (
         generator is not None
         and train_state is None
-        and out_dir.resolve() == generator.path.parent.resolve()
+        and run_directory(generator.path).resolve() == out_dir.resolve()
     ):
         raise SystemExit(
             f"fine-tune would overwrite {out_dir}. Leave out unset, or choose a new directory."
@@ -695,11 +698,11 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     if cfg.source.resolve() != copied.resolve():
         shutil.copyfile(cfg.source, copied)
     csv_path = out_dir / "loss.csv"
-    continuing = (
-        train_state is not None
-        and out_dir.resolve() == generator.path.parent.resolve()
-        and csv_path.is_file()
+    same_run = (
+        generator is not None
+        and out_dir.resolve() == run_directory(generator.path).resolve()
     )
+    continuing = train_state is not None and same_run and csv_path.is_file()
     rows = load_rows(csv_path) if continuing else []
     if not continuing:
         write_loss_csv(csv_path, [])
@@ -709,6 +712,8 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         if header != CSV_COLUMNS:
             write_loss_csv(csv_path, rows)
     limit = "until Ctrl-C" if cfg.steps is None else str(cfg.steps)
+    if train_state is not None and not same_run:
+        print(f"new run from {generator.path}", flush=True)
     print(f"run {out_dir}  steps {limit}", flush=True)
 
     model, label = build_model(
@@ -808,8 +813,11 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             if live is not None:
                 live.status(message)
 
+        saved_at = None
+
         def checkpoint():
-            save_run(
+            nonlocal saved_at
+            saved_at = save_run(
                 out_dir, model, architecture_dict(cfg), step, optimizer,
                 cfg.loss_recipe(), objective.state_dict(),
                 discriminator, disc_optimizer,
@@ -930,7 +938,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 log(step, train_loss, val_loss, train_parts, val_parts)
         except KeyboardInterrupt:
             checkpoint()
-            print(f"interrupted, saved {out_dir / 'model.pt'}", flush=True)
+            print(f"interrupted, saved {saved_at / 'model.pt'}", flush=True)
             return
     finally:
         if loader is not None:
@@ -938,7 +946,8 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         if live is not None:
             live.close()
         close_films(films)
-    print(f"done  {csv_path}  {out_dir / 'model.pt'}", flush=True)
+    shown = saved_at / "model.pt" if saved_at is not None else out_dir / "model.pt"
+    print(f"done  {csv_path}  {shown}", flush=True)
 
 
 def main():
@@ -949,7 +958,9 @@ def main():
         type=Path,
         default=None,
         help=(
-            "continue this run (directory, model.pt, or train.pt). "
+            "continue this run from its newest checkpoint "
+            "(directory, latest, a checkpoint, model.pt, or train.pt). "
+            "An older checkpoint starts a new run. "
             "Same network and loss; learning rates come from the file"
         ),
     )
@@ -958,7 +969,7 @@ def main():
         type=Path,
         default=None,
         help=(
-            "fine-tune this generator (model.pt or a run directory). "
+            "fine-tune this generator (a checkpoint, model.pt, or a run directory). "
             "New run and a new optimizer. The recipe may omit its model section"
         ),
     )
