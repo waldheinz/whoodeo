@@ -714,7 +714,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     model, label = build_model(
         cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames,
         radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
-        levels=cfg.levels,
+        levels=cfg.levels, bilinear=cfg.bilinear, codes=cfg.codes, patch=cfg.patch,
     )
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)

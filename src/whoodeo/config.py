@@ -73,11 +73,15 @@ class TrainConfig:
     sharpness: float | None = None
     reject: bool | None = None
     levels: int | None = None
+    bilinear: bool | None = None
+    codes: int | None = None
+    patch: int | None = None
 
     def arch_key(self):
         return model_key(
             self.arch, self.blocks, self.channels, self.in_frames,
             self.radius, self.stem, self.sharpness, self.reject, self.levels,
+            self.bilinear, self.codes, self.patch,
         )
 
     def loss_recipe(self):
@@ -104,15 +108,23 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
     elif arch == "pyramid":
         levels, stem, radius = extra
         text += f" levels {levels} stem {stem} radius {radius}"
+    elif arch == "vq":
+        codes, patch, bilinear = extra
+        text += f" codes {codes} patch {patch} bilinear {str(bilinear).lower()}"
     return text
 
 
-def model_key(arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels):
+def model_key(
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
+    bilinear, codes, patch,
+):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
         return key + (radius, stem, float(sharpness), reject)
     if arch == "pyramid":
         return key + (levels, stem, radius)
+    if arch == "vq":
+        return key + (codes, patch, bilinear)
     return key
 
 
@@ -132,6 +144,10 @@ def architecture_dict(cfg):
         item["levels"] = cfg.levels
         item["stem"] = cfg.stem
         item["radius"] = cfg.radius
+    elif cfg.arch == "vq":
+        item["bilinear"] = cfg.bilinear
+        item["codes"] = cfg.codes
+        item["patch"] = cfg.patch
     return item
 
 
@@ -158,7 +174,7 @@ def load_config(path, architecture=None, architecture_from=None):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels = _take_model(
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch = _take_model(
         data, where, architecture, architecture_from,
     )
     batch = _take_int(data, "batch", where, positive=True)
@@ -196,6 +212,9 @@ def load_config(path, architecture=None, architecture_from=None):
         sharpness=sharpness,
         reject=reject,
         levels=levels,
+        bilinear=bilinear,
+        codes=codes,
+        patch=patch,
     )
 
 
@@ -228,7 +247,10 @@ def parse_model(model, where):
     model = dict(model)
     arch = _take_choice(model, "arch", where, PRESETS)
     preset = PRESETS[arch]
-    in_frames = _take_int(model, "in_frames", where, positive=True)
+    if arch == "vq" and "in_frames" not in model:
+        in_frames = 1
+    else:
+        in_frames = _take_int(model, "in_frames", where, positive=True)
     if arch == "espcn":
         if "blocks" in model or "channels" in model:
             raise SystemExit(f"{where}: espcn has a fixed size")
@@ -241,6 +263,7 @@ def parse_model(model, where):
     levels = None
     if arch == "pyramid":
         levels, stem, radius = _take_pyramid(model, where)
+    bilinear, codes, patch = _take_vq(model, arch, where)
     _reject_unknown(model, where)
     if in_frames % 2 != 1:
         raise SystemExit(f"{where}: in_frames must be odd")
@@ -249,7 +272,27 @@ def parse_model(model, where):
         raise SystemExit(f"{where}: {arch} takes {fixed} input frame, not {in_frames}")
     if arch in ("shift", "pyramid") and in_frames < 3:
         raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
-    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels
+    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch
+
+
+def _take_vq(data, arch, where):
+    if arch != "vq":
+        foreign = [name for name in ("bilinear", "codes", "patch") if name in data]
+        if foreign:
+            names = ", ".join(foreign)
+            raise SystemExit(f"{where}: only vq uses {names}")
+        return None, None, None
+    if "bilinear" not in data:
+        bilinear = True
+    else:
+        bilinear = _take_bool(data, "bilinear", where)
+    codes = _take_int(data, "codes", where, positive=True, default=1024)
+    if codes > 65536:
+        raise SystemExit(f"{where}: codes must be from 1 to 65536")
+    patch = _take_int(data, "patch", where, positive=True, default=4)
+    if patch > 16:
+        raise SystemExit(f"{where}: patch must be from 1 to 16")
+    return bilinear, codes, patch
 
 
 def _take_shift(data, arch, where):

@@ -1,0 +1,26 @@
+# Codebook-heavy test. vq always reads the one frame at the sample time.
+# Four blocks choose among 16384 codes of length 128. The book holds more
+# values than the trunk. The bilinear base stays. Patch 4 is one code per
+# 4×4 low pixels.
+
+model:
+  arch: vq
+  blocks: 16
+  channels: 128
+  codes: 2048
+  patch: 4
+  bilinear: false
+
+batch: 2
+lr: 2.0e-5
+holdout: 0.1
+log_every: 10
+val_every: 500
+val_count: 32
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 1.00
+      kind: mse

@@ -2,9 +2,10 @@
 
 `modified` is a residual ESPCN. `deform` keeps that stack and aligns the
 neighbor frames with a deformable 3x3. `shift` aligns them with a dense
-integer search. `pyramid` aligns them with a coarse-to-fine flow. `espcn`
-and `edsr` are the other architectures. The training config sets depth,
-width, and input frames.
+integer search. `pyramid` aligns them with a coarse-to-fine flow. `vq`
+keeps the residual stack, reads one frame, and quantizes the correction.
+`espcn` and `edsr` are the other architectures. The training config sets
+depth, width, and input frames.
 """
 
 from whoodeo.models.deform import DeformESPCN
@@ -13,12 +14,14 @@ from whoodeo.models.espcn import ESPCN
 from whoodeo.models.modified import ModifiedESPCN
 from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
+from whoodeo.models.vq import CODES, PATCH, VQESPCN
 
 PRESETS = {
     "modified": {"blocks": 32, "channels": 64, "frames": None},
     "deform": {"blocks": 32, "channels": 64, "frames": None},
     "shift": {"blocks": 8, "channels": 64, "frames": None},
     "pyramid": {"blocks": 8, "channels": 64, "frames": None},
+    "vq": {"blocks": 8, "channels": 64, "frames": 1},
     "espcn": {"blocks": None, "channels": None, "frames": 1},
     "edsr": {"blocks": 32, "channels": 256, "frames": 1},
 }
@@ -26,6 +29,7 @@ PRESETS = {
 def build_model(
     arch, blocks=None, channels=None, in_frames=5, *,
     radius=None, stem=None, sharpness=None, reject=None, levels=None,
+    bilinear=None, codes=None, patch=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -55,6 +59,17 @@ def build_model(
     elif arch == "pyramid":
         _check_pyramid(levels, stem, radius)
         model = PyramidESPCN(width, depth, in_frames, levels, stem, radius)
+    elif arch == "vq":
+        if bilinear is None:
+            bilinear = True
+        if codes is None:
+            codes = CODES
+        if patch is None:
+            patch = PATCH
+        _check_vq(codes, patch, bilinear)
+        model = VQESPCN(
+            num_res_blocks=depth, num_filters=width, bilinear=bilinear, codes=codes, patch=patch,
+        )
     else:
         model = EDSR({
             "n_resblocks": depth,
@@ -76,9 +91,24 @@ def build_model(
             f"pyramid {depth}x{width} in_frames {in_frames} "
             f"levels {levels} stem {stem} radius {radius} parameters {count}"
         )
+    elif arch == "vq":
+        label = (
+            f"vq {depth}x{width} in_frames {in_frames} "
+            f"codes {codes} patch {patch} bilinear {str(bilinear).lower()} "
+            f"parameters {count}"
+        )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"
     return model, label
+
+
+def _check_vq(codes, patch, bilinear):
+    if isinstance(codes, bool) or not isinstance(codes, int) or codes < 1 or codes > 65536:
+        raise SystemExit("codes must be an integer from 1 to 65536")
+    if isinstance(patch, bool) or not isinstance(patch, int) or patch < 1 or patch > 16:
+        raise SystemExit("patch must be an integer from 1 to 16")
+    if not isinstance(bilinear, bool):
+        raise SystemExit("bilinear must be true or false")
 
 
 def _check_shift(radius, stem, sharpness, reject):
