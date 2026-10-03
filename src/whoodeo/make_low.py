@@ -1,8 +1,11 @@
 """Write training videos.
 
-`whoodeo-make-low import` encodes a source into the orig folder. The master
-keeps the picture's aspect and lands near 1280x720 pixels. It is 10-bit
-4:4:4 HEVC with a short closed GOP, so training seeks stay cheap.
+`whoodeo-make-low import` writes a source into the orig folder. A picture
+about Full HD or larger is encoded near 1280x720. That master keeps the
+picture's aspect and is 10-bit 4:4:4 HEVC with a short closed GOP, so
+training seeks stay cheap. A smaller picture is remuxed as it is: the video
+bitstream stays, and the audio is dropped. Low variants are written unless
+`--no-degrade` is set.
 
 The plain command writes half-resolution variants of videos already in orig.
 Variant directories live under the low root. Each one keeps the source
@@ -23,6 +26,7 @@ CONFIG = Path(__file__).resolve().parent / "degrade.json"
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
 MASTER_PIXELS = 1280 * 720
+FULLHD_PIXELS = 1920 * 1080
 MASTER_PIX_FMT = "yuv444p10le"
 # No preset: x265 medium. CRF 12 is the quality knob. psy stays at x265's default.
 # bframes=0 keeps encode order equal to display order. It does not repair
@@ -261,7 +265,8 @@ def probe_video(path):
         "-select_streams", "v:0",
         "-show_entries",
         "stream=codec_name,width,height,pix_fmt,sample_aspect_ratio,"
-        "field_order,color_space,color_transfer,color_primaries,color_range",
+        "field_order,color_space,color_transfer,color_primaries,color_range,"
+        "has_b_frames",
         "-of", "json",
         str(path),
     ])
@@ -297,6 +302,19 @@ def sar_factors(sar):
     if num <= 0 or den <= 0:
         return None
     return num, den
+
+
+def reaches_full_hd(width, height, sar):
+    """True when the display picture is about Full HD or larger.
+
+    None means the sample aspect ratio cannot be read, so the display size
+    is unknown.
+    """
+    factors = sar_factors(sar)
+    if factors is None:
+        return None
+    num, den = factors
+    return width * num * height >= FULLHD_PIXELS * den
 
 
 def snap4(value):
@@ -397,6 +415,33 @@ def packet_pts(path):
     return pts
 
 
+def packet_times(path):
+    """Presentation and decode timestamps for each video packet, in file order."""
+    text = run_probe([
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts,dts",
+        "-of", "csv=p=0",
+        str(path),
+    ])
+    if not text:
+        raise RuntimeError(f"no timestamps: {path}")
+    times = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        if len(parts) < 2 or parts[0] in {"", "N/A"}:
+            raise RuntimeError(f"missing timestamp: {path}")
+        # Matroska does not store the leading negative decode timestamps.
+        # Those packets come back without a DTS; a later hole is a broken file.
+        dts = None if parts[1] in {"", "N/A"} else int(parts[1])
+        times.append((int(parts[0]), dts))
+    if not times:
+        raise RuntimeError(f"no timestamps: {path}")
+    return times
+
+
 def frame_tick(pts, rate, base):
     """Nearest frame index at this rate. base is the timestamp timebase."""
     rate_num, rate_den = rate
@@ -461,6 +506,100 @@ def restamp_timestamps(src, dst):
     return None
 
 
+def time_order_problem(times, rate, base, delay):
+    """None when display ticks advance and packet DTS strictly increases.
+
+    PTS is checked in presentation order. A source with B-frames stores a
+    later picture before an earlier one, so packet PTS may step backwards
+    while the display time still advances. Matroska leaves the leading
+    decode timestamps empty, at most `delay` of them (the reorder delay).
+    """
+    last = None
+    for value in sorted(item[0] for item in times):
+        tick = frame_tick(value, rate, base)
+        if last is not None and tick <= last:
+            return "two frames share one timestamp"
+        last = tick
+    seen = False
+    leading = 0
+    prev = None
+    for _pts, dts in times:
+        if dts is None:
+            if seen or leading >= delay:
+                return "missing timestamp"
+            leading += 1
+            continue
+        seen = True
+        if prev is not None and dts <= prev:
+            return "dts does not increase"
+        prev = dts
+    return None
+
+
+def b_frame_delay(path):
+    """Reorder delay. Unknown or unreadable counts as B-frames, so no restamp."""
+    try:
+        delay = int(probe_video(path).get("has_b_frames") or 0)
+    except (TypeError, ValueError):
+        return 1
+    if delay < 0:
+        return 1
+    return delay
+
+
+def settle_remux_time(path, label):
+    """Accept path, or restamp it when packet order is display order.
+
+    setts numbers packets in file order. That is wrong once B-frames have
+    stored a later picture first, and it is wrong when PTS already runs
+    backwards. Those files are left untouched and rejected.
+    """
+    rate, base = video_timing(path)
+    times = packet_times(path)
+    delay = b_frame_delay(path)
+    err = time_order_problem(times, rate, base, delay)
+    if err is None:
+        return None
+    pts = [item[0] for item in times]
+    backwards = any(b < a for a, b in zip(pts, pts[1:]))
+    # setts follows file order. Only a colliding display clock with no
+    # B-frames and no backwards PTS can be renumbered that way.
+    if err != "two frames share one timestamp" or delay != 0 or backwards:
+        return err
+    print(f"{label}: {err}; restamping timestamps", flush=True)
+    stamped = path.with_name(f"{path.stem}.stamped{path.suffix}")
+    restamp_error = restamp_timestamps(path, stamped)
+    if restamp_error:
+        stamped.unlink(missing_ok=True)
+        return restamp_error
+    stamped.replace(path)
+    rate, base = video_timing(path)
+    return time_order_problem(packet_times(path), rate, base, b_frame_delay(path))
+
+
+def remux_problem(path, source, packets):
+    """None when the remux kept the picture and dropped the audio."""
+    stream = probe_video(path)
+    if stream.get("codec_name") != source.get("codec_name"):
+        return f"codec is {stream.get('codec_name')}"
+    width = int(source.get("width") or 0)
+    height = int(source.get("height") or 0)
+    if int(stream.get("width") or 0) != width or int(stream.get("height") or 0) != height:
+        return (
+            f"output is {stream.get('width')}x{stream.get('height')}, "
+            f"expected {width}x{height}"
+        )
+    pix = source.get("pix_fmt")
+    if stream.get("pix_fmt") != pix:
+        return f"pixel format is {stream.get('pix_fmt')}, expected {pix}"
+    out_packets = packets_of(path)
+    if out_packets != packets:
+        return f"{packets} input frames, {out_packets} output frames"
+    if has_audio(path):
+        return "output still has audio"
+    return None
+
+
 def master_problem(path, width, height, packets):
     stream = probe_video(path)
     if stream.get("codec_name") != "hevc":
@@ -490,48 +629,12 @@ def master_problem(path, width, height, packets):
     return timestamp_problem(path)
 
 
-def import_one(src, orig_dir, force):
-    """Encode src into orig. Return the new filename, or None on failure."""
-    label = src.name
-    if src.suffix.lower() not in VIDEO_EXTS:
-        print(f"skip {label}: train does not read this extension", file=sys.stderr)
-        return None
-    if not src.is_file():
-        print(f"no video: {src}", file=sys.stderr)
-        return None
-    if src.parent == orig_dir:
-        print(f"{src} is already in {orig_dir}", file=sys.stderr)
-        return None
-    out = orig_dir / f"{src.stem}.mkv"
-    if out.exists() and not force:
-        print(f"{out.name}: already in {orig_dir}", file=sys.stderr)
-        return None
-    try:
-        stream = probe_video(src)
-        in_packets = packets_of(src)
-    except (RuntimeError, json.JSONDecodeError) as exc:
-        print(f"{label}: {exc}", file=sys.stderr)
-        return None
-    width = int(stream.get("width") or 0)
-    height = int(stream.get("height") or 0)
-    if width < 2 or height < 2:
-        print(f"{label}: no video size", file=sys.stderr)
-        return None
-    field_order = stream_text(stream, "field_order")
-    if field_order in INTERLACED:
-        print(f"{label}: interlaced ({field_order})", file=sys.stderr)
-        return None
-    transfer = stream_text(stream, "color_transfer")
-    primaries = stream_text(stream, "color_primaries")
-    matrix_name = stream_text(stream, "color_space")
-    if transfer in HDR_TRANSFER or primaries in HDR_PRIMARIES or matrix_name in HDR_MATRIX:
-        print(f"{label}: HDR or wide-gamut source", file=sys.stderr)
-        return None
+def encode_master(src, label, out, stream, in_packets, width, height, sar, matrix_name):
+    """Encode src to a 10-bit 4:4:4 HEVC master near 1280x720."""
     matrix = input_matrix(matrix_name)
     if matrix is None:
         print(f"{label}: unsupported color matrix {matrix_name}", file=sys.stderr)
         return None
-    sar = stream_text(stream, "sample_aspect_ratio")
     size = master_dimensions(width, height, sar)
     if size is None:
         print(f"{label}: bad sample aspect ratio {sar or 'unset'}", file=sys.stderr)
@@ -587,6 +690,94 @@ def import_one(src, orig_dir, force):
     return out.name
 
 
+def remux_master(src, label, out, stream, in_packets, width, height):
+    """Copy the video bitstream into orig and drop the audio."""
+    tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
+    tmp.unlink(missing_ok=True)
+    print(f"import {label}  {width}x{height}  remux", flush=True)
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        "-i", str(src),
+        "-map", "0:v:0", "-an", "-c", "copy",
+        str(tmp),
+    ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: ffmpeg failed", file=sys.stderr)
+        return None
+    try:
+        problem = remux_problem(tmp, stream, in_packets)
+        if problem is None:
+            problem = settle_remux_time(tmp, label)
+            if problem is None:
+                problem = remux_problem(tmp, stream, in_packets)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
+    if problem:
+        tmp.unlink(missing_ok=True)
+        print(f"{label}: {problem}", file=sys.stderr)
+        return None
+    tmp.replace(out)
+    print(f"wrote {out}  {width}x{height}  {in_packets} frames", flush=True)
+    return out.name
+
+
+def import_one(src, orig_dir, force):
+    """Write src into orig. Return the new filename, or None on failure.
+
+    About Full HD and larger is encoded near 1280x720. A smaller picture is
+    remuxed without scaling or re-encoding.
+    """
+    label = src.name
+    if src.suffix.lower() not in VIDEO_EXTS:
+        print(f"skip {label}: train does not read this extension", file=sys.stderr)
+        return None
+    if not src.is_file():
+        print(f"no video: {src}", file=sys.stderr)
+        return None
+    if src.parent == orig_dir:
+        print(f"{src} is already in {orig_dir}", file=sys.stderr)
+        return None
+    out = orig_dir / f"{src.stem}.mkv"
+    if out.exists() and not force:
+        print(f"{out.name}: already in {orig_dir}", file=sys.stderr)
+        return None
+    try:
+        stream = probe_video(src)
+        in_packets = packets_of(src)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width < 2 or height < 2:
+        print(f"{label}: no video size", file=sys.stderr)
+        return None
+    field_order = stream_text(stream, "field_order")
+    if field_order in INTERLACED:
+        print(f"{label}: interlaced ({field_order})", file=sys.stderr)
+        return None
+    transfer = stream_text(stream, "color_transfer")
+    primaries = stream_text(stream, "color_primaries")
+    matrix_name = stream_text(stream, "color_space")
+    if transfer in HDR_TRANSFER or primaries in HDR_PRIMARIES or matrix_name in HDR_MATRIX:
+        print(f"{label}: HDR or wide-gamut source", file=sys.stderr)
+        return None
+    sar = stream_text(stream, "sample_aspect_ratio")
+    full_hd = reaches_full_hd(width, height, sar)
+    if full_hd is None and width * height >= FULLHD_PIXELS:
+        print(f"{label}: bad sample aspect ratio {sar or 'unset'}", file=sys.stderr)
+        return None
+    if full_hd:
+        return encode_master(
+            src, label, out, stream, in_packets, width, height, sar, matrix_name,
+        )
+    return remux_master(src, label, out, stream, in_packets, width, height)
+
+
 def degrade_files(orig_dir, low_dir, names, force):
     scale, flags, pix_fmt, variants = load_config(CONFIG)
     failed = False
@@ -627,7 +818,7 @@ def sources_from_args(orig_dir, names):
 def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="encode half-resolution variants of orig videos. "
-        "`whoodeo-make-low import` encodes a source into orig first",
+        "`whoodeo-make-low import` writes a source into orig first",
     )
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--variants", help="comma-separated variant names; default is all of them")
@@ -641,13 +832,15 @@ def parse_args(argv):
 def parse_import_args(argv):
     parser = argparse.ArgumentParser(
         prog="whoodeo-make-low import",
-        description="encode sources into orig as 10-bit 4:4:4 HEVC masters",
+        description="write sources into orig. About Full HD and larger become "
+        "10-bit 4:4:4 HEVC masters near 1280x720. Smaller sources are remuxed "
+        "without re-encoding. Low variants are written unless --no-degrade",
     )
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: $WHOODEO_DATA/orig)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="used with --degrade (default: $WHOODEO_DATA/low)")
+    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: $WHOODEO_DATA/low)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing master")
-    parser.add_argument("--degrade", action="store_true", help="also write the low variants of each new master")
-    parser.add_argument("videos", nargs="+", help="source videos to encode into orig")
+    parser.add_argument("--no-degrade", action="store_true", help="do not write the low variants of each new master")
+    parser.add_argument("videos", nargs="+", help="source videos to write into orig")
     return parser.parse_args(argv)
 
 
@@ -657,7 +850,7 @@ def import_main(argv):
     orig_dir = args.orig.expanduser().resolve()
     orig_dir.mkdir(parents=True, exist_ok=True)
     low_dir = None
-    if args.degrade:
+    if not args.no_degrade:
         args.low = resolve_data(args.low)
         low_dir = args.low.expanduser().resolve()
         low_dir.mkdir(parents=True, exist_ok=True)
@@ -670,7 +863,7 @@ def import_main(argv):
             failed = True
             continue
         written.append(out_name)
-    if args.degrade and written:
+    if not args.no_degrade and written:
         if not degrade_files(orig_dir, low_dir, written, args.force):
             failed = True
     if failed:
