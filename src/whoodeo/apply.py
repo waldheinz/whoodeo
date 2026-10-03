@@ -1,4 +1,8 @@
-"""Reconstruct a video with a checkpoint written by train.
+"""Reconstruct a video with a generator written by train.
+
+model.pt holds the generator and its architecture. A run directory works
+too. An older model.pt that also holds the optimizer still loads; the
+optimizer is ignored.
 
 The network runs on each full frame. A 5-frame model sees the center frame
 plus two neighbors on either side, repeating the first or last frame at the
@@ -16,8 +20,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from whoodeo.checkpoint import build_generator, load_generator
 from whoodeo.live import add_live_args, open_live
-from whoodeo.models import build_model
 from whoodeo.video import read_video_frames, rgb_image
 
 
@@ -30,41 +34,7 @@ def get_device():
 
 
 def load_checkpoint(path, device):
-    path = Path(path)
-    if path.is_dir():
-        path = path / "model.pt"
-    if not path.is_file():
-        raise SystemExit(f"no checkpoint: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    saved = checkpoint.get("args") or {}
-    missing = [key for key in ("arch", "in_frames") if key not in saved]
-    if missing:
-        raise SystemExit(f"checkpoint {path} has no {', '.join(missing)}")
-    arch = saved["arch"]
-    in_frames = saved["in_frames"]
-    if not isinstance(in_frames, int) or isinstance(in_frames, bool):
-        raise SystemExit(f"checkpoint {path} has no in_frames")
-    if arch == "espcn":
-        blocks = None
-        channels = None
-    else:
-        blocks = saved.get("blocks")
-        channels = saved.get("channels")
-        if not isinstance(blocks, int) or not isinstance(channels, int):
-            raise SystemExit(f"checkpoint {path} has no blocks or channels")
-        if isinstance(blocks, bool) or isinstance(channels, bool):
-            raise SystemExit(f"checkpoint {path} has no blocks or channels")
-    model, label = build_model(
-        arch, blocks, channels, in_frames,
-        radius=saved.get("radius"),
-        stem=saved.get("stem"),
-        sharpness=saved.get("sharpness"),
-        reject=saved.get("reject"),
-        levels=saved.get("levels"),
-    )
-    model.load_state_dict(checkpoint["model"])
-    model.eval().to(device)
-    return model, label, in_frames, checkpoint.get("step"), path
+    return build_generator(load_generator(path), device)
 
 
 def iter_reconstructions(model, frames, radius, device):

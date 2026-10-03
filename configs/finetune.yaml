@@ -1,0 +1,34 @@
+# Fine-tune a generator that is already trained.
+#
+# whoodeo-train configs/finetune.yaml --model runs/<run>
+#
+# The network is read from that model file, so there is no model: section.
+# A model: section is still allowed and then has to match the file. The
+# optimizer and the discriminator start over, and the result is a new run.
+# Step 0 is the loaded generator.
+#
+# Pixel L1 stays the anchor at a smaller share. relu4_4 asks for texture
+# that relu3_4 does not see. relu5_4 is left out. The discriminator starts
+# from scratch at a higher learning rate than the first run. If batch 2
+# runs out of memory, set batch to 1.
+
+batch: 2
+lr: 2.0e-5
+holdout: 0.1
+log_every: 10
+val_every: 500
+val_count: 32
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 0.40
+      kind: l1
+    - name: vgg
+      weight: 0.40
+      layers: [relu3_4, relu4_4]
+    - name: gan
+      weight: 0.20
+      crop: 384
+      disc_lr: 2.0e-4

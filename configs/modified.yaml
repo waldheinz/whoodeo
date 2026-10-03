@@ -27,5 +27,5 @@ loss:
       layers: [relu2_2, relu3_4]
     - name: gan
       weight: 0.20
-      crop: 256
+      crop: 384
       disc_lr: 1.0e-4

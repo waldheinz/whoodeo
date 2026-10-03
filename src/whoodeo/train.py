@@ -14,17 +14,28 @@ the magnitude. balance start freezes the scales on the validation frames
 before the first step. balance running keeps the weights as shares.
 
 A fresh run validates once at step 0, before any update. The residual is
-zero at init, so that pass is a 2× bilinear upscale.
+zero at init, so that pass is a 2× bilinear upscale. A fine-tune's step 0
+is the generator that was loaded.
 
-A gan term adds a U-Net discriminator. Its weights and Adam state are stored
-in the checkpoint. whoodeo-apply reads only the generator. --resume continues
-from a checkpoint of the same architecture and the same loss. Learning rates
-come from the file.
+A gan term adds a U-Net discriminator. The run directory holds two files.
+model.pt is the generator and the architecture that builds it. whoodeo-apply
+and a fine-tune read only that file. train.pt is the step, the optimizers,
+the discriminator, the loss recipe, and the loss scales.
+
+--resume continues a run: the same architecture, the same loss, the Adam
+state, and the loss scales. Learning rates come from the file. An older
+model.pt that still carries the optimizer loads the same way, and the next
+save splits it.
+
+--model fine-tunes that generator under the loss in the file. The optimizer
+and the discriminator start over, the loss scales are measured again, and
+the result is a new run. The recipe may omit the model: section; the
+architecture then comes from the model file. A model: section that is
+still present has to match the file.
 """
 
 import argparse
 import csv
-import os
 import queue
 import random
 import shutil
@@ -41,7 +52,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 from whoodeo.catalog import data_root
-from whoodeo.config import assert_resume_matches, load_config, shape_text
+from whoodeo.checkpoint import load_generator, load_resume, save_run
+from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
 from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
@@ -390,24 +402,6 @@ def write_loss_csv(csv_path, rows):
             writer.writerow([row[0], *(format_cell(value) for value in row[1:])])
 
 
-def save_checkpoint(path, step, model, optimizer, saved, discriminator=None, disc_optimizer=None):
-    payload = {
-        "step": step,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "args": saved,
-    }
-    if discriminator is not None:
-        payload["discriminator"] = discriminator.state_dict()
-        payload["disc_optimizer"] = disc_optimizer.state_dict()
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("wb") as handle:
-        torch.save(payload, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-
-
 def move_optimizer(optimizer, device):
     for state in optimizer.state.values():
         for key, value in state.items():
@@ -471,26 +465,6 @@ def part_text(pixel, vgg, gan, d_loss):
     if d_loss is not None:
         parts.append(f"d {d_loss:.4f}")
     return "  ".join(parts)
-
-
-def checkpoint_args(cfg, objective):
-    gan = cfg.term("gan")
-    return {
-        "arch": cfg.arch,
-        "blocks": cfg.blocks,
-        "channels": cfg.channels,
-        "in_frames": cfg.in_frames,
-        "radius": cfg.radius,
-        "stem": cfg.stem,
-        "sharpness": cfg.sharpness,
-        "reject": cfg.reject,
-        "levels": cfg.levels,
-        "batch": cfg.batch,
-        "lr": cfg.lr,
-        "disc_lr": None if gan is None else gan.disc_lr,
-        "loss": cfg.loss_recipe(),
-        "objective": objective.state_dict(),
-    }
 
 
 def describe_loss(cfg, objective):
@@ -645,17 +619,17 @@ def apply_learning_rate(optimizer, lr):
         group["lr"] = lr
 
 
+# The live page draws these as two charts, train and validation. Discriminator
+# loss stays in the csv; on the chart its scale flattens the other lines.
 _LOSS_SERIES = (
     ("train", 1),
     ("val", 2),
     ("pixel", 3),
     ("vgg", 4),
     ("gan", 5),
-    ("d", 6),
     ("val pixel", 7),
     ("val vgg", 8),
     ("val gan", 9),
-    ("val d", 10),
 )
 
 
@@ -669,30 +643,43 @@ def push_loss_series(live, rows):
             live.series(name, xs, ys)
 
 
-def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
+def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
+    if resume is not None and finetune is not None:
+        raise SystemExit("pass either --resume or --model")
+    generator = finetune
+    train_state = None
+    if resume is not None:
+        generator, train_state = load_resume(resume)
+        assert_resume_matches(cfg, generator.architecture, train_state.loss, generator.path)
+
+    out_dir = cfg.out
+    if out_dir is None and train_state is not None:
+        out_dir = generator.path.parent
+    elif out_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = Path.cwd() / "runs" / f"train-{stamp}"
+    if (
+        generator is not None
+        and train_state is None
+        and out_dir.resolve() == generator.path.parent.resolve()
+    ):
+        raise SystemExit(
+            f"fine-tune would overwrite {out_dir}. Leave out unset, or choose a new directory."
+        )
+
     rng = random.Random(cfg.seed)
     torch.manual_seed(cfg.seed)
     radius = cfg.in_frames // 2
     device = get_device()
     root = data_root()
 
-    resumed = None
-    resume_path = None
-    saved_args = {}
-    if resume is not None:
-        resume_path = Path(resume).expanduser()
-        if not resume_path.is_file():
-            resume_path = resume_path / "model.pt"
-        if not resume_path.is_file():
-            raise SystemExit(f"no checkpoint: {resume_path}")
-        resumed = torch.load(resume_path, map_location="cpu", weights_only=False)
-        saved_args = resumed.get("args") or {}
-        assert_resume_matches(cfg, saved_args, resume_path)
-
     films = open_films(root / "orig", root / "low", cfg.holdout)
     print(f"device {device}", flush=True)
     print(f"config {cfg.source}", flush=True)
     print(f"network {shape_text(*cfg.arch_key())}", flush=True)
+    if generator is not None and train_state is None:
+        shown = "unknown" if generator.step is None else str(generator.step)
+        print(f"fine-tune {generator.path}  loaded step {shown}", flush=True)
     for film in films:
         for variant in film.variants:
             spans = ", ".join(f"{start:.1f}-{end:.1f}s" for start, end in variant.holdouts)
@@ -703,21 +690,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
                 flush=True,
             )
 
-    out_dir = cfg.out
-    if out_dir is None and resume_path is not None:
-        out_dir = resume_path.parent
-    elif out_dir is None:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_dir = Path.cwd() / "runs" / f"train-{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     copied = out_dir / "config.yaml"
     if cfg.source.resolve() != copied.resolve():
         shutil.copyfile(cfg.source, copied)
     csv_path = out_dir / "loss.csv"
-    ckpt_path = out_dir / "model.pt"
     continuing = (
-        resume_path is not None
-        and out_dir.resolve() == resume_path.parent.resolve()
+        train_state is not None
+        and out_dir.resolve() == generator.path.parent.resolve()
         and csv_path.is_file()
     )
     rows = load_rows(csv_path) if continuing else []
@@ -739,12 +719,13 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     print(label, flush=True)
-    if resumed is not None:
-        model.load_state_dict(resumed["model"])
-        optimizer.load_state_dict(resumed["optimizer"])
+    if generator is not None:
+        model.load_state_dict(generator.state_dict)
+    if train_state is not None:
+        optimizer.load_state_dict(train_state.optimizer)
         move_optimizer(optimizer, device)
         apply_learning_rate(optimizer, cfg.lr)
-        print(f"resume step {int(resumed['step'])}", flush=True)
+        print(f"resume step {train_state.step}", flush=True)
 
     gan = cfg.term("gan")
     discriminator = None
@@ -753,11 +734,11 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
         discriminator = UNetDiscriminatorSN().train().to(device)
         disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=gan.disc_lr)
         count = sum(parameter.numel() for parameter in discriminator.parameters())
-        if resumed is not None:
-            if "discriminator" not in resumed or "disc_optimizer" not in resumed:
-                raise SystemExit(f"checkpoint {resume_path} has no discriminator")
-            discriminator.load_state_dict(resumed["discriminator"])
-            disc_optimizer.load_state_dict(resumed["disc_optimizer"])
+        if train_state is not None:
+            if train_state.discriminator is None or train_state.disc_optimizer is None:
+                raise SystemExit(f"{train_state.path} has no discriminator")
+            discriminator.load_state_dict(train_state.discriminator)
+            disc_optimizer.load_state_dict(train_state.disc_optimizer)
             move_optimizer(disc_optimizer, device)
             apply_learning_rate(disc_optimizer, gan.disc_lr)
             print("loaded discriminator", flush=True)
@@ -785,8 +766,8 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
             None if gan is None else gan.crop,
         )
         loader.start()
-        if resumed is not None:
-            objective.load_state_dict(saved_args["objective"])
+        if train_state is not None:
+            objective.load_state_dict(train_state.objective)
             print("loss scales from checkpoint", flush=True)
         else:
             layer_means, term_means = measure_raw_means(
@@ -828,12 +809,13 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
                 live.status(message)
 
         def checkpoint():
-            save_checkpoint(
-                ckpt_path, step, model, optimizer, checkpoint_args(cfg, objective),
+            save_run(
+                out_dir, model, architecture_dict(cfg), step, optimizer,
+                cfg.loss_recipe(), objective.state_dict(),
                 discriminator, disc_optimizer,
             )
 
-        start_step = int(resumed["step"]) if resumed is not None else 0
+        start_step = train_state.step if train_state is not None else 0
         step = start_step
         steps_done = 0
 
@@ -848,8 +830,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
             return loss, logged_parts(pixel, vgg, gan_value, d_value)
 
         try:
-            # Untrained residual is zero, so this is the 2× bilinear baseline.
-            if resumed is None:
+            # A new run validates before any update. An untrained residual is
+            # zero, so that pass is the bilinear upscale. A fine-tune's step 0
+            # is the generator that was loaded.
+            if train_state is None:
                 val_loss, val_parts = validate()
                 log(step, None, val_loss, None, val_parts)
             while cfg.steps is None or steps_done < cfg.steps:
@@ -946,7 +930,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
                 log(step, train_loss, val_loss, train_parts, val_parts)
         except KeyboardInterrupt:
             checkpoint()
-            print(f"interrupted, saved {ckpt_path}", flush=True)
+            print(f"interrupted, saved {out_dir / 'model.pt'}", flush=True)
             return
     finally:
         if loader is not None:
@@ -954,7 +938,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None):
         if live is not None:
             live.close()
         close_films(films)
-    print(f"done  {csv_path}  {ckpt_path}", flush=True)
+    print(f"done  {csv_path}  {out_dir / 'model.pt'}", flush=True)
 
 
 def main():
@@ -964,15 +948,37 @@ def main():
         "--resume",
         type=Path,
         default=None,
-        help="continue from this checkpoint (model.pt or the run directory)",
+        help=(
+            "continue this run (directory, model.pt, or train.pt). "
+            "Same network and loss; learning rates come from the file"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help=(
+            "fine-tune this generator (model.pt or a run directory). "
+            "New run and a new optimizer. The recipe may omit its model section"
+        ),
     )
     add_live_args(parser)
     args = parser.parse_args()
+    if args.resume is not None and args.model is not None:
+        raise SystemExit("pass either --resume or --model")
+    finetune = None
+    architecture = None
+    architecture_from = None
+    if args.model is not None:
+        finetune = load_generator(args.model)
+        architecture = finetune.architecture
+        architecture_from = finetune.path
     train(
-        load_config(args.config),
+        load_config(args.config, architecture, architecture_from),
         preview=not args.no_preview,
         live_bind=args.live_bind,
         resume=args.resume,
+        finetune=finetune,
     )
 
 

@@ -75,12 +75,10 @@ class TrainConfig:
     levels: int | None = None
 
     def arch_key(self):
-        key = (self.arch, self.blocks, self.channels, self.in_frames)
-        if self.arch == "shift":
-            return key + (self.radius, self.stem, self.sharpness, self.reject)
-        if self.arch == "pyramid":
-            return key + (self.levels, self.stem, self.radius)
-        return key
+        return model_key(
+            self.arch, self.blocks, self.channels, self.in_frames,
+            self.radius, self.stem, self.sharpness, self.reject, self.levels,
+        )
 
     def loss_recipe(self):
         return {"balance": self.balance, "terms": [term.as_dict() for term in self.terms]}
@@ -109,35 +107,46 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
     return text
 
 
-def assert_resume_matches(cfg, saved, checkpoint):
+def model_key(arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels):
+    key = (arch, blocks, channels, in_frames)
+    if arch == "shift":
+        return key + (radius, stem, float(sharpness), reject)
+    if arch == "pyramid":
+        return key + (levels, stem, radius)
+    return key
+
+
+def architecture_dict(cfg):
+    """The model mapping stored next to the generator weights."""
+    item = {"arch": cfg.arch, "in_frames": cfg.in_frames}
+    if cfg.blocks is not None:
+        item["blocks"] = cfg.blocks
+    if cfg.channels is not None:
+        item["channels"] = cfg.channels
+    if cfg.arch == "shift":
+        item["radius"] = cfg.radius
+        item["stem"] = cfg.stem
+        item["sharpness"] = cfg.sharpness
+        item["reject"] = cfg.reject
+    elif cfg.arch == "pyramid":
+        item["levels"] = cfg.levels
+        item["stem"] = cfg.stem
+        item["radius"] = cfg.radius
+    return item
+
+
+def assert_resume_matches(cfg, architecture, loss, checkpoint):
     """The checkpoint must be the same network and the same loss. Learning rates may change."""
-    if not isinstance(saved, dict) or "arch" not in saved or "loss" not in saved or "objective" not in saved:
-        raise SystemExit(f"checkpoint {checkpoint} has no training recipe")
-    for key in ("blocks", "channels", "in_frames"):
-        if key not in saved:
-            raise SystemExit(f"checkpoint {checkpoint} has no {key}")
-    saved_key = (saved["arch"], saved["blocks"], saved["channels"], saved["in_frames"])
-    if saved["arch"] == "shift":
-        for key in ("radius", "stem", "sharpness", "reject"):
-            if key not in saved:
-                raise SystemExit(f"checkpoint {checkpoint} has no {key}")
-        saved_key = saved_key + (
-            saved["radius"], saved["stem"], float(saved["sharpness"]), saved["reject"],
-        )
-    elif saved["arch"] == "pyramid":
-        for key in ("levels", "stem", "radius"):
-            if key not in saved:
-                raise SystemExit(f"checkpoint {checkpoint} has no {key}")
-        saved_key = saved_key + (saved["levels"], saved["stem"], saved["radius"])
+    saved_key = model_key(*parse_model(architecture, f"{checkpoint}: architecture"))
     if saved_key != cfg.arch_key():
         found = shape_text(*saved_key)
         wanted = shape_text(*cfg.arch_key())
         raise SystemExit(f"checkpoint architecture is {found}, config asks for {wanted}")
-    if saved["loss"] != cfg.loss_recipe():
+    if loss != cfg.loss_recipe():
         raise SystemExit(f"checkpoint loss does not match {cfg.source}")
 
 
-def load_config(path):
+def load_config(path, architecture=None, architecture_from=None):
     path = Path(path)
     if not path.is_file():
         raise SystemExit(f"no config: {path}")
@@ -149,7 +158,9 @@ def load_config(path):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels = _take_model(data, where)
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels = _take_model(
+        data, where, architecture, architecture_from,
+    )
     batch = _take_int(data, "batch", where, positive=True)
     lr = _take_float(data, "lr", where, positive=True)
     holdout = _take_float(data, "holdout", where, positive=True)
@@ -188,36 +199,56 @@ def load_config(path):
     )
 
 
-def _take_model(data, where):
-    if "model" not in data:
-        raise SystemExit(f"{where}: missing model")
-    model = data.pop("model")
+def _take_model(data, where, architecture, architecture_from):
+    source = str(architecture_from) if architecture_from is not None else "model file"
+    if "model" in data:
+        raw = data.pop("model")
+        if not isinstance(raw, dict):
+            raise SystemExit(f"{where}: model must be a mapping")
+        chosen = parse_model(raw, f"{where}: model")
+        if architecture is not None:
+            from_file = parse_model(architecture, f"{source}: architecture")
+            if model_key(*from_file) != model_key(*chosen):
+                raise SystemExit(
+                    f"{where}: model is {shape_text(*model_key(*chosen))}, "
+                    f"{source} is {shape_text(*model_key(*from_file))}"
+                )
+        return chosen
+    if architecture is None:
+        raise SystemExit(
+            f"{where}: missing model. Add a model: section, or pass --model to fine-tune."
+        )
+    return parse_model(architecture, f"{source}: architecture")
+
+
+def parse_model(model, where):
+    """Read one model mapping. `where` is the location named in errors."""
     if not isinstance(model, dict):
-        raise SystemExit(f"{where}: model must be a mapping")
-    label = f"{where}: model"
-    arch = _take_choice(model, "arch", label, PRESETS)
+        raise SystemExit(f"{where} must be a mapping")
+    model = dict(model)
+    arch = _take_choice(model, "arch", where, PRESETS)
     preset = PRESETS[arch]
-    in_frames = _take_int(model, "in_frames", label, positive=True)
+    in_frames = _take_int(model, "in_frames", where, positive=True)
     if arch == "espcn":
         if "blocks" in model or "channels" in model:
-            raise SystemExit(f"{label}: espcn has a fixed size")
+            raise SystemExit(f"{where}: espcn has a fixed size")
         blocks = None
         channels = None
     else:
-        blocks = _take_int(model, "blocks", label, positive=True)
-        channels = _take_int(model, "channels", label, positive=True)
-    radius, stem, sharpness, reject = _take_shift(model, arch, label)
+        blocks = _take_int(model, "blocks", where, positive=True)
+        channels = _take_int(model, "channels", where, positive=True)
+    radius, stem, sharpness, reject = _take_shift(model, arch, where)
     levels = None
     if arch == "pyramid":
-        levels, stem, radius = _take_pyramid(model, label)
-    _reject_unknown(model, label)
+        levels, stem, radius = _take_pyramid(model, where)
+    _reject_unknown(model, where)
     if in_frames % 2 != 1:
-        raise SystemExit(f"{label}: in_frames must be odd")
+        raise SystemExit(f"{where}: in_frames must be odd")
     fixed = preset["frames"]
     if fixed is not None and in_frames != fixed:
-        raise SystemExit(f"{label}: {arch} takes {fixed} input frame, not {in_frames}")
+        raise SystemExit(f"{where}: {arch} takes {fixed} input frame, not {in_frames}")
     if arch in ("shift", "pyramid") and in_frames < 3:
-        raise SystemExit(f"{label}: {arch} needs at least 3 input frames")
+        raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
     return arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels
 
 
