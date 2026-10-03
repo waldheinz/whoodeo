@@ -822,8 +822,8 @@ def parse_args(argv):
     )
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--variants", help="comma-separated variant names; default is all of them")
-    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: $WHOODEO_DATA/orig)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: $WHOODEO_DATA/low)")
+    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
+    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing low video")
     parser.add_argument("videos", nargs="*", help="filenames in orig; default encodes every missing partner")
     return parser.parse_args(argv)
@@ -836,8 +836,8 @@ def parse_import_args(argv):
         "10-bit 4:4:4 HEVC masters near 1280x720. Smaller sources are remuxed "
         "without re-encoding. Low variants are written unless --no-degrade",
     )
-    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: $WHOODEO_DATA/orig)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: $WHOODEO_DATA/low)")
+    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
+    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: %(default)s)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing master")
     parser.add_argument("--no-degrade", action="store_true", help="do not write the low variants of each new master")
     parser.add_argument("videos", nargs="+", help="source videos to write into orig")

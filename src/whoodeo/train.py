@@ -1,7 +1,7 @@
 """Train on random full frames from paired videos.
 
-The recipe is a YAML file. Masters live in $WHOODEO_DATA/orig and degraded
-variants in $WHOODEO_DATA/low. A step picks one film, then one variant, then
+The recipe is a YAML file. Masters live in the data directory's orig/ and
+degraded variants in its low/. A step picks one film, then one variant, then
 as many center times as the batch size. Two time spans per variant are held
 out for validation.
 
@@ -22,7 +22,8 @@ checkpoints/<step>/ holding two files. model.pt is the generator and the
 architecture that builds it. whoodeo-apply and a fine-tune read only that
 file. train.pt is the step, the optimizers, the discriminator, the loss
 recipe, and the loss scales. latest in the run points at the newest of
-those directories, and runs/latest follows the newest checkpoint written.
+those directories, and latest in the runs directory follows the newest
+checkpoint written.
 
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss, the Adam state, and the loss scales. Learning rates come
@@ -54,7 +55,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
-from whoodeo.catalog import data_root
+from whoodeo.catalog import data_root, runs_root
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
 from whoodeo.live import add_live_args, open_live
@@ -660,7 +661,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         out_dir = continue_run(resume)
     if out_dir is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        out_dir = Path.cwd() / "runs" / f"train-{stamp}"
+        out_dir = runs_root() / f"train-{stamp}"
     if (
         generator is not None
         and train_state is None

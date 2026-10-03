@@ -3,7 +3,7 @@
 Each save lands in checkpoints/<step>/, with model.pt and train.pt beside
 each other. A later step adds a directory. The same step may replace its
 own two files. latest inside the run points at the newest directory, and
-runs/latest points at the newest checkpoint written by any run.
+latest in the runs directory points at the newest checkpoint written by any run.
 
 model.pt is the generator. It carries the architecture, the weights, and the
 step those weights were saved at. whoodeo-apply and a fine-tune read only
@@ -27,6 +27,7 @@ from pathlib import Path
 
 import torch
 
+from whoodeo.catalog import runs_root
 from whoodeo.config import parse_model
 from whoodeo.models import build_model
 
@@ -57,8 +58,8 @@ class TrainState:
 
 
 def latest_link():
-    """Symlink that follows the newest checkpoint written from this directory."""
-    return Path.cwd() / "runs" / "latest"
+    """Symlink that follows the newest checkpoint in the runs directory."""
+    return runs_root() / "latest"
 
 
 def run_directory(model_path):
@@ -188,7 +189,7 @@ def build_generator(spec, device):
 
 
 def _publish_runs_latest(checkpoint_dir):
-    runs = Path.cwd() / "runs"
+    runs = runs_root()
     runs.mkdir(parents=True, exist_ok=True)
     dest = checkpoint_dir.resolve()
     try:

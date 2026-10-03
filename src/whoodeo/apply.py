@@ -1,9 +1,9 @@
 """Reconstruct a video with a generator written by train.
 
-With one path, the video is reconstructed by runs/latest. With two paths,
-the first picks a checkpoint and the second is the video. A run directory
-opens its newest checkpoint. The reconstruction is written into the run
-directory as <stem>-recon-<step>.mkv.
+With one path, the video is reconstructed by latest in the runs directory.
+With two paths, the first picks a checkpoint and the second is the video.
+A run directory opens its newest checkpoint. The reconstruction is written
+into the run directory as <stem>-recon-<step>.mkv.
 
 model.pt holds the generator and its architecture. An older model.pt that
 also holds the optimizer still loads; the optimizer is ignored.
@@ -277,7 +277,7 @@ def parse_args(argv=None):
         "model",
         nargs="?",
         type=Path,
-        help="checkpoint, run directory, model.pt, or train.pt (default: runs/latest)",
+        help="checkpoint, run directory, model.pt, or train.pt (default: latest in the runs directory)",
     )
     parser.add_argument("input", nargs="?", type=Path, help="video to reconstruct")
     parser.add_argument(
