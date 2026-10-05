@@ -9,7 +9,6 @@ model:
 batch: 1
 lr: 2.0e-5
 holdout: 0.1
-log_every: 50
 val_every: 500
 val_count: 32
 seed: 0

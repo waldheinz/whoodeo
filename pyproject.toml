@@ -5,10 +5,10 @@ description = "Train a video super-resolution model and reconstruct a video with
 requires-python = ">=3.14"
 dependencies = [
     "av",
-    "matplotlib",
     "numpy",
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
+    "tensorboard",
     "torch",
     "torchvision",
     "tqdm",
@@ -18,6 +18,7 @@ dependencies = [
 whoodeo-train = "whoodeo.train:main"
 whoodeo-apply = "whoodeo.apply:main"
 whoodeo-make-low = "whoodeo.make_low:main"
+whoodeo-board = "whoodeo.board:main"
 
 [build-system]
 requires = ["hatchling"]

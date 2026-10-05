@@ -91,17 +91,6 @@
       pointer-events: none;
     }
     #waiting[hidden] { display: none; }
-    #chart { margin-top: 16px; }
-    #legend { display: flex; flex-wrap: wrap; gap: 12px 16px; margin: 0 0 4px; }
-    .plot-title {
-      margin: 12px 0 2px;
-      color: #9a9a9a;
-      font-size: 12px;
-    }
-    canvas.plot { width: 100%; height: 210px; display: block; }
-    .plot-block[hidden] { display: none; }
-    .key { display: inline-flex; align-items: center; gap: 6px; }
-    .swatch { width: 12px; height: 12px; border-radius: 2px; }
   </style>
 </head>
 <body>
@@ -122,34 +111,8 @@
     </div>
     <p id="waiting">waiting for a frame</p>
   </div>
-  <section id="chart" hidden>
-    <div id="legend"></div>
-    <div class="plot-block" id="block-train">
-      <p class="plot-title">train</p>
-      <canvas id="plot-train" class="plot"></canvas>
-    </div>
-    <div class="plot-block" id="block-val">
-      <p class="plot-title">val</p>
-      <canvas id="plot-val" class="plot"></canvas>
-    </div>
-    <div class="plot-block" id="block-other" hidden>
-      <p class="plot-title">other</p>
-      <canvas id="plot-other" class="plot"></canvas>
-    </div>
-  </section>
 </main>
 <script>
-const EXTRA_COLORS = ["#9ec1e6", "#e3a15a", "#8fd0d0", "#e7a8a0", "#c5c8c6"];
-const ROLES = [
-  { label: "loss", color: "#e8e8e8" },
-  { label: "pixel", color: "#8dca9e" },
-  { label: "vgg", color: "#d2a4de" },
-  { label: "gan", color: "#e6d38a" },
-];
-const CHARTS = [
-  { id: "train", names: ["train", "pixel", "vgg", "gan"], markers: false },
-  { id: "val", names: ["val", "val pixel", "val vgg", "val gan"], markers: true },
-];
 const PANES = [
   { id: "low", names: ["low"] },
   { id: "upscale", names: ["upscale", "recon"] },
@@ -158,14 +121,11 @@ const PANES = [
 const statusEl = document.getElementById("status");
 const stageEl = document.getElementById("stage");
 const waitingEl = document.getElementById("waiting");
-const chartEl = document.getElementById("chart");
-const legendEl = document.getElementById("legend");
 const paneEls = new Map([...stageEl.querySelectorAll(".pane")].map((el) => [el.dataset.pane, el]));
 let pinned = null;
 let hover = null;
 let armHover = true;
-let legendKey = "";
-let last = { status: "", generation: 0, frames: [], series: {} };
+let last = { status: "", generation: 0, frames: [] };
 
 function paneAt(event) {
   for (const el of paneEls.values()) {
@@ -213,7 +173,6 @@ function render() {
   }
   waitingEl.hidden = Boolean(state.generation && frames.size);
   applyFocus();
-  draw(state.series || {});
 }
 
 stageEl.addEventListener("pointermove", (event) => {
@@ -246,142 +205,6 @@ stageEl.addEventListener("click", (event) => {
   applyFocus();
 });
 
-function usable(points) {
-  return (points || []).filter((point) => point[1] > 0);
-}
-
-function chartLines(series) {
-  const known = new Set(CHARTS.flatMap((chart) => chart.names));
-  const blocks = CHARTS.map((chart) => ({
-    id: chart.id,
-    markers: chart.markers,
-    lines: chart.names.map((name, index) => ({
-      label: ROLES[index].label,
-      color: ROLES[index].color,
-      points: usable(series[name]),
-    })).filter((line) => line.points.length),
-  }));
-  const extras = Object.keys(series).filter((name) => !known.has(name)).map((name, index) => ({
-    label: name,
-    color: EXTRA_COLORS[index % EXTRA_COLORS.length],
-    points: usable(series[name]),
-  })).filter((line) => line.points.length);
-  blocks.push({ id: "other", markers: false, lines: extras });
-  return blocks;
-}
-
-function draw(series) {
-  const blocks = chartLines(series);
-  const shown = blocks.filter((block) => block.lines.length);
-  chartEl.hidden = shown.length === 0;
-  const legend = [];
-  const seen = new Set();
-  for (const block of shown) {
-    for (const line of block.lines) {
-      if (seen.has(line.label)) continue;
-      seen.add(line.label);
-      legend.push(line);
-    }
-  }
-  const nextLegend = legend.map((line) => line.label + ":" + line.color).join("\0");
-  if (nextLegend !== legendKey) {
-    legendKey = nextLegend;
-    legendEl.replaceChildren(...legend.map((line) => {
-      const item = document.createElement("span");
-      item.className = "key";
-      const swatch = document.createElement("span");
-      swatch.className = "swatch";
-      swatch.style.background = line.color;
-      item.append(swatch, document.createTextNode(line.label));
-      return item;
-    }));
-  }
-  let x0 = Infinity;
-  let x1 = -Infinity;
-  for (const block of shown) {
-    for (const line of block.lines) {
-      for (const point of line.points) {
-        x0 = Math.min(x0, point[0]);
-        x1 = Math.max(x1, point[0]);
-      }
-    }
-  }
-  if (x0 === x1) { x0 -= 1; x1 += 1; }
-  for (const block of blocks) {
-    const host = document.getElementById("block-" + block.id);
-    host.hidden = block.lines.length === 0;
-    if (!block.lines.length) continue;
-    drawChart(document.getElementById("plot-" + block.id), block, x0, x1);
-  }
-}
-
-function drawChart(canvas, block, x0, x1) {
-  const dpr = window.devicePixelRatio || 1;
-  const width = canvas.clientWidth || 600;
-  const height = canvas.clientHeight || 210;
-  if (width < 40 || height < 40) return;
-  canvas.width = Math.round(width * dpr);
-  canvas.height = Math.round(height * dpr);
-  const g = canvas.getContext("2d");
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.clearRect(0, 0, width, height);
-  const pad = { left: 64, right: 16, top: 12, bottom: 28 };
-  const plotW = width - pad.left - pad.right;
-  const plotH = height - pad.top - pad.bottom;
-  if (plotW < 10 || plotH < 10) return;
-  let y0 = Infinity;
-  let y1 = -Infinity;
-  for (const line of block.lines) {
-    for (const point of line.points) {
-      y0 = Math.min(y0, point[1]);
-      y1 = Math.max(y1, point[1]);
-    }
-  }
-  if (y0 === y1) { y0 *= 0.8; y1 *= 1.25; }
-  const log0 = Math.log(y0);
-  const log1 = Math.log(y1);
-  const xOf = (x) => pad.left + (x - x0) / (x1 - x0) * plotW;
-  const yOf = (y) => pad.top + (1 - (Math.log(y) - log0) / (log1 - log0)) * plotH;
-  g.strokeStyle = "#2e2e2e";
-  g.fillStyle = "#9a9a9a";
-  g.font = "12px system-ui, sans-serif";
-  g.textAlign = "right";
-  g.textBaseline = "middle";
-  for (let tick = 0; tick < 4; tick += 1) {
-    const y = y0 * Math.exp((log1 - log0) * tick / 3);
-    const py = yOf(y);
-    g.beginPath();
-    g.moveTo(pad.left, py);
-    g.lineTo(width - pad.right, py);
-    g.stroke();
-    g.fillText(y.toPrecision(3), pad.left - 8, py);
-  }
-  g.textAlign = "center";
-  g.textBaseline = "top";
-  g.fillText(String(Math.round(x0)), pad.left, height - pad.bottom + 8);
-  g.fillText(String(Math.round(x1)), width - pad.right, height - pad.bottom + 8);
-  for (const line of block.lines) {
-    g.strokeStyle = line.color;
-    g.lineWidth = line.label === "loss" ? 1.8 : 1.4;
-    g.lineJoin = "round";
-    g.beginPath();
-    line.points.forEach((point, i) => {
-      const px = xOf(point[0]);
-      const py = yOf(point[1]);
-      if (i === 0) g.moveTo(px, py);
-      else g.lineTo(px, py);
-    });
-    g.stroke();
-    if (!block.markers && line.points.length > 1) continue;
-    g.fillStyle = line.color;
-    for (const point of line.points) {
-      g.beginPath();
-      g.arc(xOf(point[0]), yOf(point[1]), 2.5, 0, Math.PI * 2);
-      g.fill();
-    }
-  }
-}
-
 async function tick() {
   try {
     const response = await fetch("state.json", { cache: "no-store" });
@@ -395,7 +218,6 @@ async function tick() {
 
 tick();
 setInterval(tick, 500);
-window.addEventListener("resize", () => draw(last.series || {}));
 </script>
 </body>
 </html>

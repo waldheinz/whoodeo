@@ -5,27 +5,19 @@
 
 model:
   arch: modified
-  blocks: 32
-  channels: 256
-  in_frames: 3
+  blocks: 16
+  channels: 64
+  in_frames: 1
 
-batch: 2
-lr: 2.0e-5
+batch: 4
+lr: 2.0e-4
 holdout: 0.1
-log_every: 10
-val_every: 500
+val_every: 1000
 val_count: 32
 seed: 0
 loss:
   balance: start
   terms:
     - name: pixel
-      weight: 0.60
+      weight: 1.00
       kind: l1
-    - name: vgg
-      weight: 0.20
-      layers: [relu2_2, relu3_4]
-    - name: gan
-      weight: 0.20
-      crop: 384
-      disc_lr: 1.0e-4

@@ -60,7 +60,6 @@ class TrainConfig:
     batch: int
     lr: float
     holdout: float
-    log_every: int
     val_every: int
     val_count: int
     seed: int
@@ -182,7 +181,6 @@ def load_config(path, architecture=None, architecture_from=None):
     holdout = _take_float(data, "holdout", where, positive=True)
     if holdout >= 1:
         raise SystemExit(f"{where}: holdout must be below 1")
-    log_every = _take_int(data, "log_every", where, positive=True)
     val_every = _take_int(data, "val_every", where, positive=True)
     val_count = _take_int(data, "val_count", where, positive=True)
     seed = _take_int(data, "seed", where, default=0)
@@ -199,7 +197,6 @@ def load_config(path, architecture=None, architecture_from=None):
         batch=batch,
         lr=lr,
         holdout=holdout,
-        log_every=log_every,
         val_every=val_every,
         val_count=val_count,
         seed=seed,

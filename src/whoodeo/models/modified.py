@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-from whoodeo.models.common import ResidualBlock, bilinear_plus, zero_conv
+from whoodeo.models.common import ResidualBlock, bilinear_plus
 
 
 class ModifiedESPCN(nn.Module):
@@ -24,7 +24,6 @@ class ModifiedESPCN(nn.Module):
         # Predicts the 2× correction, packed for the pixel shuffle.
         self.final_conv = nn.Conv2d(num_filters, 3 * (scale_factor ** 2), kernel_size=3, padding=1)
         self.pixel_shuffle = nn.PixelShuffle(scale_factor)
-        zero_conv(self.final_conv)
 
     def forward(self, x):
         residual = F.relu(self.initial_conv(x))

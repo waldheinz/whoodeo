@@ -1,4 +1,4 @@
-"""A local web page with the latest frames and any chart series the caller pushes.
+"""A local web page with the latest frames.
 
 The page is served from this process. ``show`` copies the newest images and
 returns; a background thread encodes PNG with Pillow. Closing the browser
@@ -19,7 +19,6 @@ from whoodeo.video import png_bytes
 
 _PAGE = (Path(__file__).with_name("live.html")).read_bytes()
 _COPY_INTERVAL = 0.2
-_PLOT_LIMIT = 2000
 _NAME = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -80,7 +79,6 @@ class Live:
         self._stop = threading.Event()
         self._pending = None
         self._pngs = {}
-        self._series = {}
         self._status = ""
         self._generation = 0
         self._next_copy = 0.0
@@ -137,19 +135,6 @@ class Live:
             self._pending = copied
         self._wake.set()
 
-    def series(self, name, xs, ys):
-        """Replace one chart series. An empty series removes it."""
-        if not isinstance(name, str) or not name:
-            raise ValueError("series name must be a non-empty string")
-        if len(xs) != len(ys):
-            raise ValueError(f"series {name} has {len(xs)} x values and {len(ys)} y values")
-        points = [(float(x), float(y)) for x, y in zip(xs, ys)]
-        with self._lock:
-            if points:
-                self._series[name] = points
-            else:
-                self._series.pop(name, None)
-
     def status(self, text):
         """One line of text above the image."""
         with self._lock:
@@ -187,12 +172,10 @@ class Live:
 
     def _state(self):
         with self._lock:
-            series = {name: _downsample(points) for name, points in self._series.items()}
             return {
                 "status": self._status,
                 "generation": self._generation,
                 "frames": list(self._pngs),
-                "series": series,
             }
 
     def _encode_loop(self):
@@ -222,17 +205,6 @@ def _url_host(host):
     if ":" in host:
         return f"[{host}]"
     return host
-
-
-def _downsample(points):
-    count = len(points)
-    if count <= _PLOT_LIMIT:
-        chosen = points
-    else:
-        # Keep the shape of a long run without sending every point twice a second.
-        stride = (count - 1) / (_PLOT_LIMIT - 1)
-        chosen = [points[min(count - 1, round(index * stride))] for index in range(_PLOT_LIMIT)]
-    return [[x, y] for x, y in chosen]
 
 
 def _send(handler, code, body, content_type):

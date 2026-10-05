@@ -13,9 +13,10 @@ The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
 before the first step. balance running keeps the weights as shares.
 
-A fresh run validates once at step 0, before any update. The residual is
-zero at init, so that pass is a 2× bilinear upscale. A fine-tune's step 0
-is the generator that was loaded.
+A fresh run validates once at step 0, before any update. Where the last
+layer starts at zero, that pass is the bilinear upscale. Modified leaves
+that layer at the default initialization, so step 0 already includes a
+correction. A fine-tune's step 0 is the generator that was loaded.
 
 A gan term adds a U-Net discriminator. Each checkpoint is a directory
 checkpoints/<step>/ holding two files. model.pt is the generator and the
@@ -23,7 +24,8 @@ architecture that builds it. whoodeo-apply and a fine-tune read only that
 file. train.pt is the step, the optimizers, the discriminator, the loss
 recipe, and the loss scales. latest in the run points at the newest of
 those directories, and latest in the runs directory follows the newest
-checkpoint written.
+checkpoint written. The run directory also gets a TensorBoard event file
+for the training and validation losses. whoodeo-board serves every run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss, the Adam state, and the loss scales. Learning rates come
@@ -39,7 +41,6 @@ still present has to match the file.
 """
 
 import argparse
-import csv
 import queue
 import random
 import shutil
@@ -50,11 +51,8 @@ from datetime import datetime
 from pathlib import Path
 
 import av
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
@@ -347,63 +345,23 @@ class BatchLoader:
                 close_films(films)
 
 
-CSV_COLUMNS = [
-    "step", "train_loss", "val_loss",
-    "train_pixel", "train_vgg", "train_gan", "train_d",
-    "val_pixel", "val_vgg", "val_gan", "val_d",
-]
+def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts):
+    """One TensorBoard point per value that this step actually has."""
+    def emit(tag, value):
+        if value is not None:
+            writer.add_scalar(tag, value, step)
 
-
-def write_plot(rows, path):
-    train_steps = [row[0] for row in rows if row[1] is not None]
-    train_loss = [row[1] for row in rows if row[1] is not None]
-    val_steps = [row[0] for row in rows if row[2] is not None]
-    val_loss = [row[2] for row in rows if row[2] is not None]
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    if train_steps:
-        ax.plot(train_steps, train_loss, color="#1f4e79", linewidth=1.5, label="train")
-    if val_steps:
-        ax.plot(val_steps, val_loss, color="#c45911", marker="o", linewidth=1.2, label="val")
-    ax.set_xlabel("step")
-    ax.set_ylabel("loss")
-    ax.set_yscale("log")
-    ax.grid(True, which="both", axis="y", linewidth=0.4, alpha=0.4)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-
-
-def format_cell(value):
-    return "" if value is None else f"{value:.8f}"
-
-
-def parts_or_blank(parts):
-    if parts is None:
-        return (None, None, None, None)
-    return parts
-
-
-def append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts):
-    train_mse, train_vgg, train_gan, train_d = parts_or_blank(train_parts)
-    val_mse, val_vgg, val_gan, val_d = parts_or_blank(val_parts)
-    row = (
-        step, train_loss, val_loss,
-        train_mse, train_vgg, train_gan, train_d,
-        val_mse, val_vgg, val_gan, val_d,
-    )
-    rows.append(row)
-    with csv_path.open("a", newline="") as handle:
-        csv.writer(handle).writerow([step, *(format_cell(value) for value in row[1:])])
-    write_plot(rows, csv_path.with_name("loss.png"))
-
-
-def write_loss_csv(csv_path, rows):
-    with csv_path.open("w", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(CSV_COLUMNS)
-        for row in rows:
-            writer.writerow([row[0], *(format_cell(value) for value in row[1:])])
+    emit("loss/train", train_loss)
+    emit("loss/val", val_loss)
+    for prefix, parts in (("train", train_parts), ("val", val_parts)):
+        if parts is None:
+            continue
+        pixel, vgg, gan, d_loss = parts
+        emit(f"{prefix}/pixel", pixel)
+        emit(f"{prefix}/vgg", vgg)
+        emit(f"{prefix}/gan", gan)
+        emit(f"{prefix}/d", d_loss)
+    writer.flush()
 
 
 def move_optimizer(optimizer, device):
@@ -411,30 +369,6 @@ def move_optimizer(optimizer, device):
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device)
-
-
-def load_rows(csv_path):
-    rows = []
-    with csv_path.open(newline="") as handle:
-        for record in csv.DictReader(handle):
-            def cell(name):
-                text = record.get(name) or ""
-                return float(text) if text else None
-
-            rows.append((
-                int(record["step"]),
-                cell("train_loss"),
-                cell("val_loss"),
-                cell("train_pixel"),
-                cell("train_vgg"),
-                cell("train_gan"),
-                cell("train_d"),
-                cell("val_pixel"),
-                cell("val_vgg"),
-                cell("val_gan"),
-                cell("val_d"),
-            ))
-    return rows
 
 
 def sample_box(image, size, rng):
@@ -623,30 +557,6 @@ def apply_learning_rate(optimizer, lr):
         group["lr"] = lr
 
 
-# The live page draws these as two charts, train and validation. Discriminator
-# loss stays in the csv; on the chart its scale flattens the other lines.
-_LOSS_SERIES = (
-    ("train", 1),
-    ("val", 2),
-    ("pixel", 3),
-    ("vgg", 4),
-    ("gan", 5),
-    ("val pixel", 7),
-    ("val vgg", 8),
-    ("val gan", 9),
-)
-
-
-def push_loss_series(live, rows):
-    if live is None:
-        return
-    for name, index in _LOSS_SERIES:
-        xs = [row[0] for row in rows if row[index] is not None]
-        ys = [row[index] for row in rows if row[index] is not None]
-        if xs:
-            live.series(name, xs, ys)
-
-
 def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
     if resume is not None and finetune is not None:
         raise SystemExit("pass either --resume or --model")
@@ -698,20 +608,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     copied = out_dir / "config.yaml"
     if cfg.source.resolve() != copied.resolve():
         shutil.copyfile(cfg.source, copied)
-    csv_path = out_dir / "loss.csv"
     same_run = (
         generator is not None
         and out_dir.resolve() == run_directory(generator.path).resolve()
     )
-    continuing = train_state is not None and same_run and csv_path.is_file()
-    rows = load_rows(csv_path) if continuing else []
-    if not continuing:
-        write_loss_csv(csv_path, [])
-    else:
-        with csv_path.open(newline="") as handle:
-            header = next(csv.reader(handle), [])
-        if header != CSV_COLUMNS:
-            write_loss_csv(csv_path, rows)
     limit = "until Ctrl-C" if cfg.steps is None else str(cfg.steps)
     if train_state is not None and not same_run:
         print(f"new run from {generator.path}", flush=True)
@@ -761,6 +661,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         val_specs.extend(make_batch_specs(rng, films, "val", need))
     loader = None
     live = None
+    writer = None
     try:
         loader = BatchLoader(
             rng,
@@ -783,14 +684,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         describe_loss(cfg, objective)
 
         live = open_live(live_bind, preview)
-        if live is not None:
-            push_loss_series(live, rows)
-        running = 0.0
-        running_pixel = 0.0
-        running_vgg = 0.0
-        running_gan = 0.0
-        running_d = 0.0
-        running_n = 0
+        writer = SummaryWriter(log_dir=out_dir)
         has_pixel = cfg.term("pixel") is not None
         has_vgg = cfg.term("vgg") is not None
 
@@ -803,8 +697,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             )
 
         def log(step, train_loss, val_loss, train_parts, val_parts):
-            append_row(csv_path, rows, step, train_loss, val_loss, train_parts, val_parts)
-            push_loss_series(live, rows)
+            write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts)
             if val_loss is None:
                 return
             message = f"step {step:06d}  val {val_loss:.6f}"
@@ -839,9 +732,8 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             return loss, logged_parts(pixel, vgg, gan_value, d_value)
 
         try:
-            # A new run validates before any update. An untrained residual is
-            # zero, so that pass is the bilinear upscale. A fine-tune's step 0
-            # is the generator that was loaded.
+            # A new run validates before any update. A fine-tune's step 0 is
+            # the generator that was loaded.
             if train_state is None:
                 val_loss, val_parts = validate()
                 log(step, None, val_loss, None, val_parts)
@@ -878,16 +770,6 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                     for parameter in discriminator.parameters():
                         parameter.requires_grad_(True)
                 objective.observe(layer_raw, {name: value.detach() for name, value in raw.items()})
-                running += loss.item()
-                if has_pixel:
-                    running_pixel += weighted["pixel"].item()
-                if has_vgg:
-                    running_vgg += weighted["vgg"].item()
-                if gan is not None:
-                    running_gan += weighted["gan"].item()
-                if d_value is not None:
-                    running_d += d_value
-                running_n += 1
                 batch_parts = logged_parts(
                     weighted["pixel"].item() if has_pixel else None,
                     weighted["vgg"].item() if has_vgg else None,
@@ -912,43 +794,25 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                     })
 
                 finished = cfg.steps is not None and steps_done == cfg.steps
-                do_log = step % cfg.log_every == 0 or finished
-                do_val = step % cfg.val_every == 0 or finished
-                if not (do_log or do_val):
-                    continue
-                train_loss = None
-                train_parts = None
-                if do_log:
-                    train_loss = running / running_n
-                    train_parts = logged_parts(
-                        running_pixel / running_n if has_pixel else None,
-                        running_vgg / running_n if has_vgg else None,
-                        running_gan / running_n if gan is not None else None,
-                        running_d / running_n if gan is not None else None,
-                    )
-                    running = 0.0
-                    running_pixel = 0.0
-                    running_vgg = 0.0
-                    running_gan = 0.0
-                    running_d = 0.0
-                    running_n = 0
                 val_loss = None
                 val_parts = None
-                if do_val:
+                if step % cfg.val_every == 0 or finished:
                     val_loss, val_parts = validate()
-                log(step, train_loss, val_loss, train_parts, val_parts)
+                log(step, loss.item(), val_loss, batch_parts, val_parts)
         except KeyboardInterrupt:
             checkpoint()
             print(f"interrupted, saved {saved_at / 'model.pt'}", flush=True)
             return
     finally:
+        if writer is not None:
+            writer.close()
         if loader is not None:
             loader.close()
         if live is not None:
             live.close()
         close_films(films)
     shown = saved_at / "model.pt" if saved_at is not None else out_dir / "model.pt"
-    print(f"done  {csv_path}  {shown}", flush=True)
+    print(f"done  {shown}", flush=True)
 
 
 def main():
