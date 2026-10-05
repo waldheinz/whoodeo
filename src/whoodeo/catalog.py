@@ -7,6 +7,9 @@ file or a missing key uses the XDG directory for that kind of file: films
 under $XDG_DATA_HOME/whoodeo, runs under $XDG_STATE_HOME/whoodeo. An empty
 or relative value in those variables is ignored, and the spec default
 under the home directory is used instead.
+
+whoodeo/degrade.yaml in that same config directory replaces the degrade
+recipe shipped with the package. The file may be absent.
 """
 
 import os
@@ -37,6 +40,11 @@ class EnvPath:
 def config_path():
     """User config file. It may be absent."""
     return _xdg_home("XDG_CONFIG_HOME", ".config") / "whoodeo" / "config.yaml"
+
+
+def degrade_path():
+    """User degrade recipe beside config.yaml. The file may be absent."""
+    return config_path().parent / "degrade.yaml"
 
 
 def data_root():

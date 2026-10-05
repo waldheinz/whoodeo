@@ -32,5 +32,5 @@ build-backend = "hatchling.build"
 packages = ["src/whoodeo"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"src/whoodeo/degrade.json" = "whoodeo/degrade.json"
+"src/whoodeo/degrade.yaml" = "whoodeo/degrade.yaml"
 "src/whoodeo/live.html" = "whoodeo/live.html"

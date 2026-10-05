@@ -9,8 +9,10 @@ bitstream stays, and the audio is dropped. Low variants are written unless
 
 The plain command writes half-resolution variants of videos already in orig.
 Variant directories live under the low root. Each one keeps the source
-filename. Codec, quantizer, and bitrate come from a JSON config: the short
-name is the directory, and the value is extra ffmpeg arguments.
+filename. Codec, quantizer, and bitrate come from a YAML recipe: the short
+name is the directory, and the value is extra ffmpeg arguments. A
+degrade.yaml beside the user config replaces the recipe shipped with the
+package.
 """
 
 import argparse
@@ -20,9 +22,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from whoodeo.catalog import EnvPath, resolve_data
+import yaml
 
-CONFIG = Path(__file__).resolve().parent / "degrade.json"
+from whoodeo.catalog import EnvPath, degrade_path, resolve_data
+
+CONFIG = Path(__file__).resolve().parent / "degrade.yaml"
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
 MASTER_PIXELS = 1280 * 720
@@ -51,12 +55,39 @@ MATRIX_ALL = {
 }
 
 
+def recipe_path():
+    """User recipe if that path exists, otherwise the shipped file."""
+    user = degrade_path()
+    if user.exists():
+        return user
+    return CONFIG
+
+
+def active_config():
+    """Recipe to load. A user path that is not a file is an error."""
+    path = recipe_path()
+    if path == CONFIG or path.is_file():
+        return path
+    raise SystemExit(f"{path}: expected a file")
+
+
+class _RecipeDefault:
+    """Omitted `--config`. Help prints the recipe that would be used.
+
+    argparse expands this while building the parser, before it knows
+    whether `--config` was passed, so this must not reject the user path.
+    """
+
+    def __str__(self):
+        return str(recipe_path())
+
+
 def load_config(path):
     try:
-        config = json.loads(path.read_text())
+        config = yaml.safe_load(path.read_text())
     except FileNotFoundError:
         raise SystemExit(f"no config: {path}")
-    except json.JSONDecodeError as exc:
+    except yaml.YAMLError as exc:
         raise SystemExit(f"{path}: {exc}")
     if not isinstance(config, dict):
         raise SystemExit(f"{path}: expected an object")
@@ -779,7 +810,7 @@ def import_one(src, orig_dir, force):
 
 
 def degrade_files(orig_dir, low_dir, names, force):
-    scale, flags, pix_fmt, variants = load_config(CONFIG)
+    scale, flags, pix_fmt, variants = load_config(active_config())
     failed = False
     for name in names:
         src = orig_dir / name
@@ -820,7 +851,12 @@ def parse_args(argv):
         description="encode half-resolution variants of orig videos. "
         "`whoodeo-make-low import` writes a source into orig first",
     )
-    parser.add_argument("--config", type=Path, default=CONFIG)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=_RecipeDefault(),
+        help="degrade recipe (default: %(default)s)",
+    )
     parser.add_argument("--variants", help="comma-separated variant names; default is all of them")
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
@@ -879,7 +915,8 @@ def main(argv=None):
     args = parse_args(argv)
     args.orig = resolve_data(args.orig)
     args.low = resolve_data(args.low)
-    scale, scale_flags, pix_fmt, variants = load_config(args.config)
+    recipe = args.config if isinstance(args.config, Path) else active_config()
+    scale, scale_flags, pix_fmt, variants = load_config(recipe)
     selected = select_variants(variants, args.variants)
     orig_dir = args.orig.expanduser().resolve()
     low_dir = args.low.expanduser().resolve()
