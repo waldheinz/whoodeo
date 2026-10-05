@@ -63,3 +63,19 @@ A moved neighbor can still be dropped, pixel by pixel. The gate compares the dir
 ## The mix
 
 The middle features and the gated neighbors are stacked and mixed back down to `channels` by one 3×3 convolution. The weights that read a neighbor start at zero, so an untrained model does not use the neighbors. The trunk then runs for `blocks` residual blocks, and the last layer turns that into the 2× correction. That layer starts at zero, so the picture starts as the bilinear enlargement.
+
+# The SwinIR models
+
+`arch: swinir`, `arch: swinir_light`, and `arch: swinir_real` read the low-resolution frame and predict the 2× picture. The three names share one trunk. `configs/swinir.yaml` is the classical recipe and says how to switch to the other two.
+
+The trunk is a stack of residual Swin Transformer blocks. Attention looks at an 8×8 window, and every other layer shifts that window. A side that is not a multiple of 8 is padded by reflection, and that extra strip is cut off the output.
+
+`blocks` is how many of those residual blocks there are. Each one contains six Swin layers. `channels` is the width of the features inside them. It has to be divisible by 6, so each of the six attention heads gets an equal share.
+
+`swinir` is the classical head: a convolution to 64 channels, a pixel shuffle, and a 3×3 back to RGB. The recipe uses 6 blocks and 180 channels.
+
+`swinir_light` is the small head: one convolution straight into the pixel shuffle. It is meant to be run as 4 blocks and 60 channels.
+
+`swinir_real` keeps the classical trunk and enlarges with a nearest-neighbor step followed by convolutions.
+
+The last convolution keeps PyTorch's ordinary initialization. Before the trunk runs, the DIV2K mean is subtracted, and that mean is added back onto the picture the network predicts.

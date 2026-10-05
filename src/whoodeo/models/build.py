@@ -4,8 +4,9 @@
 neighbor frames with a deformable 3x3. `shift` aligns them with a dense
 integer search. `pyramid` aligns them with a coarse-to-fine flow. `vq`
 keeps the residual stack, reads one frame, and quantizes the correction.
-`espcn` and `edsr` are the other architectures. The training config sets
-depth, width, and input frames.
+`espcn` and `edsr` are the other architectures. `swinir`, `swinir_light`,
+and `swinir_real` are SwinIR at 2x: one shared trunk, three reconstruction
+heads. The training config sets depth, width, and input frames.
 """
 
 from whoodeo.models.deform import DeformESPCN
@@ -14,7 +15,17 @@ from whoodeo.models.espcn import ESPCN
 from whoodeo.models.modified import ModifiedESPCN
 from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
+from whoodeo.models.swinir import SwinIR
 from whoodeo.models.vq import CODES, PATCH, VQESPCN
+
+# Six Swin layers per residual block, six heads. Channels must divide by the heads.
+_SWINIR_LAYERS = 6
+_SWINIR_HEADS = 6
+_SWINIR_UPSAMPLER = {
+    "swinir": "pixelshuffle",
+    "swinir_light": "pixelshuffledirect",
+    "swinir_real": "nearest+conv",
+}
 
 PRESETS = {
     "modified": {"blocks": 32, "channels": 64, "frames": None},
@@ -24,6 +35,9 @@ PRESETS = {
     "vq": {"blocks": 8, "channels": 64, "frames": 1},
     "espcn": {"blocks": None, "channels": None, "frames": 1},
     "edsr": {"blocks": 32, "channels": 256, "frames": 1},
+    "swinir": {"blocks": 6, "channels": 180, "frames": 1},
+    "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
+    "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
 }
 
 def build_model(
@@ -69,6 +83,15 @@ def build_model(
         _check_vq(codes, patch, bilinear)
         model = VQESPCN(
             num_res_blocks=depth, num_filters=width, bilinear=bilinear, codes=codes, patch=patch,
+        )
+    elif arch in _SWINIR_UPSAMPLER:
+        if width % _SWINIR_HEADS != 0:
+            raise SystemExit(f"{arch} channels must be divisible by {_SWINIR_HEADS}")
+        model = SwinIR(
+            embed_dim=width,
+            depths=[_SWINIR_LAYERS] * depth,
+            num_heads=[_SWINIR_HEADS] * depth,
+            upsampler=_SWINIR_UPSAMPLER[arch],
         )
     else:
         model = EDSR({

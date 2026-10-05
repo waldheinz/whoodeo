@@ -244,7 +244,7 @@ def parse_model(model, where):
     model = dict(model)
     arch = _take_choice(model, "arch", where, PRESETS)
     preset = PRESETS[arch]
-    if arch == "vq" and "in_frames" not in model:
+    if arch in ("vq", "swinir", "swinir_light", "swinir_real") and "in_frames" not in model:
         in_frames = 1
     else:
         in_frames = _take_int(model, "in_frames", where, positive=True)

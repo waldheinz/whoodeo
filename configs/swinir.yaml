@@ -1,0 +1,32 @@
+# Full-frame 2x training. The first term anchors the loss magnitude.
+# balance: start freezes the scales on the validation frames.
+# balance: running keeps the weights as shares (EMA 0.99).
+# Optional keys, omitted here: steps, out.
+#
+# arch: swinir is classical SwinIR. The trunk is 6 residual blocks at
+# 180 channels, then a pixel shuffle and a 3x3 back to RGB. Each residual
+# block holds six Swin layers. channels must be divisible by 6.
+#
+# arch: swinir_light is the small net. Set blocks: 4, channels: 60, and
+# batch: 4. One convolution goes straight into the pixel shuffle.
+#
+# arch: swinir_real keeps this trunk and this batch. It enlarges with one
+# nearest-neighbor step followed by convolutions.
+
+model:
+  arch: swinir_light
+  blocks: 4 # 6
+  channels: 60 # 180
+
+batch: 1
+lr: 2.0e-4
+holdout: 0.1
+val_every: 1000
+val_count: 16
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 1.00
+      kind: l1
