@@ -75,12 +75,13 @@ class TrainConfig:
     bilinear: bool | None = None
     codes: int | None = None
     patch: int | None = None
+    res_scale: float | None = None
 
     def arch_key(self):
         return model_key(
             self.arch, self.blocks, self.channels, self.in_frames,
             self.radius, self.stem, self.sharpness, self.reject, self.levels,
-            self.bilinear, self.codes, self.patch,
+            self.bilinear, self.codes, self.patch, self.res_scale,
         )
 
     def loss_recipe(self):
@@ -110,12 +111,15 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
     elif arch == "vq":
         codes, patch, bilinear = extra
         text += f" codes {codes} patch {patch} bilinear {str(bilinear).lower()}"
+    elif arch == "edsr":
+        res_scale, = extra
+        text += f" res_scale {res_scale:g}"
     return text
 
 
 def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-    bilinear, codes, patch,
+    bilinear, codes, patch, res_scale,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -124,6 +128,8 @@ def model_key(
         return key + (levels, stem, radius)
     if arch == "vq":
         return key + (codes, patch, bilinear)
+    if arch == "edsr":
+        return key + (float(res_scale),)
     return key
 
 
@@ -147,6 +153,8 @@ def architecture_dict(cfg):
         item["bilinear"] = cfg.bilinear
         item["codes"] = cfg.codes
         item["patch"] = cfg.patch
+    elif cfg.arch == "edsr":
+        item["res_scale"] = cfg.res_scale
     return item
 
 
@@ -173,7 +181,7 @@ def load_config(path, architecture=None, architecture_from=None):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch = _take_model(
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale = _take_model(
         data, where, architecture, architecture_from,
     )
     batch = _take_int(data, "batch", where, positive=True)
@@ -212,6 +220,7 @@ def load_config(path, architecture=None, architecture_from=None):
         bilinear=bilinear,
         codes=codes,
         patch=patch,
+        res_scale=res_scale,
     )
 
 
@@ -244,7 +253,7 @@ def parse_model(model, where):
     model = dict(model)
     arch = _take_choice(model, "arch", where, PRESETS)
     preset = PRESETS[arch]
-    if arch in ("vq", "swinir", "swinir_light", "swinir_real") and "in_frames" not in model:
+    if arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
         in_frames = 1
     else:
         in_frames = _take_int(model, "in_frames", where, positive=True)
@@ -261,6 +270,7 @@ def parse_model(model, where):
     if arch == "pyramid":
         levels, stem, radius = _take_pyramid(model, where)
     bilinear, codes, patch = _take_vq(model, arch, where)
+    res_scale = _take_edsr(model, arch, where)
     _reject_unknown(model, where)
     if in_frames % 2 != 1:
         raise SystemExit(f"{where}: in_frames must be odd")
@@ -269,7 +279,18 @@ def parse_model(model, where):
         raise SystemExit(f"{where}: {arch} takes {fixed} input frame, not {in_frames}")
     if arch in ("shift", "pyramid") and in_frames < 3:
         raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
-    return arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch
+    return (
+        arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
+        bilinear, codes, patch, res_scale,
+    )
+
+
+def _take_edsr(data, arch, where):
+    if arch != "edsr":
+        if "res_scale" in data:
+            raise SystemExit(f"{where}: only edsr uses res_scale")
+        return None
+    return _take_float(data, "res_scale", where, positive=True)
 
 
 def _take_vq(data, arch, where):

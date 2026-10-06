@@ -1,0 +1,42 @@
+# EDSR predicts the 2x picture. The DIV2K mean is subtracted first and
+# added back at the end. res_scale multiplies the residual inside each
+# block. Lim et al. (CVPRW 2017) train with L1 and without batch norm.
+#
+# Single-scale models from the paper, which this arch can build:
+# baseline: blocks 16, channels 64, res_scale 1. Residual scaling is
+# left off because the blocks are 64 wide. The paper lists about 1.5M
+# parameters; this 2x net is 1.37M.
+# EDSR: blocks 32, channels 256, res_scale 0.1. The 0.1 scale is what
+# keeps that width trainable. The paper lists 43M parameters; this 2x
+# net is 40.7M. x2 is trained from scratch. x3 and x4 start from it.
+#
+# The other two models in the paper are multi-scale (MDSR), a shared
+# trunk with its own head and upsampler per scale. This arch does not
+# build them. Multi-scale baseline: 16 blocks, 64 channels, 3.2M.
+# MDSR: 80 blocks, 64 channels, no residual scaling, 8.0M.
+#
+# Nothing smaller than the single-scale baseline was released. A quick
+# test keeps res_scale at 1 and lowers blocks and channels, for example
+# 8 and 32.
+
+model:
+  arch: edsr
+  blocks: 32
+  channels: 256
+  res_scale: 0.1
+
+batch: 4
+lr: 2.0e-4
+holdout: 0.1
+val_every: 500
+val_count: 32
+seed: 42
+loss:
+  balance: running
+  terms:
+    - name: pixel
+      weight: 0.7
+      kind: l1
+    - name: vgg
+      weight: 0.3
+      layers: [relu3_4, relu4_4]

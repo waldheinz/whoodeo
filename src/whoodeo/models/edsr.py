@@ -1,25 +1,21 @@
+"""EDSR at 2×, as in Lim et al. and sanghyun-son/EDSR-PyTorch.
+
+The network predicts the picture. The DIV2K mean is subtracted first and
+added back at the end. whoodeo frames are already in 0..1, so the mean shift
+uses rgb_range 1. The official loader keeps 8-bit values in 0..255 and uses
+rgb_range 255; the subtraction is the same.
+"""
+
 import math
 
 import torch
 import torch.nn as nn
-
-from whoodeo.models.common import bilinear_plus, zero_conv
 
 
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
     return nn.Conv2d(
         in_channels, out_channels, kernel_size,
         padding=(kernel_size//2), bias=bias)
-
-default_args = {
-    'n_resblocks': 32,
-    'n_feats': 256,
-    'res_scale': 0.1,
-    'scale': 2,
-    'rgb_range': 1,
-    'n_colors': 3,
-    'res_scale': 0.1
-}
 
 class MeanShift(nn.Conv2d):
     def __init__(
@@ -90,24 +86,25 @@ class ResBlock(nn.Module):
 
 
 class EDSR(nn.Module):
-    def __init__(self, args=default_args, conv=default_conv):
+    def __init__(self, n_resblocks, n_feats, res_scale, conv=default_conv):
         super(EDSR, self).__init__()
 
-        n_resblocks = args['n_resblocks']
-        n_feats = args['n_feats']
         kernel_size = 3
-        scale = args['scale']
+        scale = 2
+        rgb_range = 1
+        n_colors = 3
         act = nn.ReLU(True)
 
-        self.sub_mean = MeanShift(args['rgb_range'])
+        self.sub_mean = MeanShift(rgb_range)
+        self.add_mean = MeanShift(rgb_range, sign=1)
 
         # define head module
-        m_head = [conv(args['n_colors'], n_feats, kernel_size)]
+        m_head = [conv(n_colors, n_feats, kernel_size)]
 
         # define body module
         m_body = [
             ResBlock(
-                conv, n_feats, kernel_size, act=act, res_scale=args['res_scale']
+                conv, n_feats, kernel_size, act=act, res_scale=res_scale
             ) for _ in range(n_resblocks)
         ]
         m_body.append(conv(n_feats, n_feats, kernel_size))
@@ -115,24 +112,24 @@ class EDSR(nn.Module):
         # define tail module
         m_tail = [
             Upsampler(conv, scale, n_feats, act=False),
-            conv(n_feats, args['n_colors'], kernel_size)
+            conv(n_feats, n_colors, kernel_size)
         ]
 
         self.head = nn.Sequential(*m_head)
         self.body = nn.Sequential(*m_body)
         self.tail = nn.Sequential(*m_tail)
-        zero_conv(self.tail[-1])
 
     def forward(self, x):
-        low = x
-        y = self.sub_mean(x)
-        y = self.head(y)
+        x = self.sub_mean(x)
+        x = self.head(x)
 
-        res = self.body(y)
-        res += y
+        res = self.body(x)
+        res += x
 
-        correction = self.tail(res)
-        return bilinear_plus(low, correction, 1)
+        x = self.tail(res)
+        x = self.add_mean(x)
+
+        return x
 
     def load_state_dict(self, state_dict, strict=True):
         own_state = self.state_dict()

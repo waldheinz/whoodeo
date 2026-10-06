@@ -43,7 +43,7 @@ PRESETS = {
 def build_model(
     arch, blocks=None, channels=None, in_frames=5, *,
     radius=None, stem=None, sharpness=None, reject=None, levels=None,
-    bilinear=None, codes=None, patch=None,
+    bilinear=None, codes=None, patch=None, res_scale=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -94,14 +94,8 @@ def build_model(
             upsampler=_SWINIR_UPSAMPLER[arch],
         )
     else:
-        model = EDSR({
-            "n_resblocks": depth,
-            "n_feats": width,
-            "res_scale": 0.1,
-            "scale": 2,
-            "rgb_range": 1,
-            "n_colors": 3,
-        })
+        _check_edsr(res_scale)
+        model = EDSR(depth, width, float(res_scale))
     count = sum(p.numel() for p in model.parameters())
     if arch == "shift":
         label = (
@@ -120,9 +114,21 @@ def build_model(
             f"codes {codes} patch {patch} bilinear {str(bilinear).lower()} "
             f"parameters {count}"
         )
+    elif arch == "edsr":
+        label = (
+            f"edsr {depth}x{width} res_scale {float(res_scale):g} "
+            f"in_frames {in_frames} parameters {count}"
+        )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"
     return model, label
+
+
+def _check_edsr(res_scale):
+    if res_scale is None:
+        raise SystemExit("arch edsr needs res_scale")
+    if isinstance(res_scale, bool) or not isinstance(res_scale, (int, float)) or float(res_scale) <= 0:
+        raise SystemExit("res_scale must be a positive number")
 
 
 def _check_vq(codes, patch, bilinear):
