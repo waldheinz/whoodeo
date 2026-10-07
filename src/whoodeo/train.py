@@ -25,8 +25,11 @@ architecture that builds it. whoodeo-apply and a fine-tune read only that
 file. train.pt is the step, the optimizers, the discriminator, the loss
 recipe, and the loss scales. latest in the run points at the newest of
 those directories, and latest in the runs directory follows the newest
-checkpoint written. The run directory also gets a TensorBoard event file
-for the training and validation losses. whoodeo-board serves every run.
+checkpoint written. The run directory also gets a TensorBoard event file for the losses.
+The vote model adds neighbor/weight, neighbor/grad, and neighbor/vote
+on each step, and neighbor/image when validation runs. weight and grad
+cover every kernel in the shared vote.
+whoodeo-board serves every run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss, the Adam state, and the loss scales. Learning rates come
@@ -375,7 +378,7 @@ class BatchLoader:
                 close_films(films)
 
 
-def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts):
+def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image):
     """One TensorBoard point per value that this step actually has."""
     def emit(tag, value):
         if value is not None:
@@ -391,6 +394,11 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts):
         emit(f"{prefix}/vgg", vgg)
         emit(f"{prefix}/gan", gan)
         emit(f"{prefix}/d", d_loss)
+    if usage is not None:
+        emit("neighbor/weight", usage.get("weight"))
+        emit("neighbor/vote", usage.get("vote"))
+        emit("neighbor/grad", usage.get("grad"))
+    emit("neighbor/image", neighbor_image)
     writer.flush()
 
 
@@ -516,10 +524,28 @@ def save_val_images(directory, step, index, low, pred, high, width):
     (folder / f"upscale-{step:06d}.png").write_bytes(png_bytes(rgb_image(pred)))
 
 
+def neighbor_image_effect(model, low, pred):
+    """Mean absolute change when both neighbors are replaced by the middle frame.
+
+    The bias of the vote is present in both forwards, so this is the part that
+    comes from the frames actually differing. None for a model without a vote.
+    """
+    if not hasattr(model, "neighbor_usage"):
+        return None
+    count = model.in_frames
+    mid = count // 2
+    center = low[:, mid * 3:(mid + 1) * 3]
+    flat = center.repeat(1, count, 1, 1)
+    alt = model(flat)
+    return (pred - alt).abs().mean().item()
+
+
 def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, discriminator, image_dir=None, step=None):
     """Mean of the weighted objective. The GAN part uses the center crop.
 
     With image_dir set, each sample is written under image_dir/<index>/.
+    The last return is the neighbor image effect, or None when the model
+    has no vote.
     """
     model.eval()
     disc_training = discriminator is not None and discriminator.training
@@ -530,7 +556,9 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
     vgg_acc = 0.0
     gan_acc = 0.0
     d_acc = 0.0
+    image_acc = 0.0
     saw_d = False
+    saw_image = False
     count = 0
     saved = 0
     width = max(2, len(str(max(len(specs) - 1, 0))))
@@ -541,6 +569,10 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
             chunk = specs[start:start + batch_size]
             low, high = batch_on_device(films, chunk, radius, device)
             pred = model(low)
+            effect = neighbor_image_effect(model, low, pred)
+            if effect is not None:
+                image_acc += effect * len(chunk)
+                saw_image = True
             if image_dir is not None:
                 for offset in range(len(chunk)):
                     save_val_images(
@@ -579,7 +611,8 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
     vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
     gan_mean = gan_acc / count if gan is not None else None
     d_mean = d_acc / count if saw_d else None
-    return loss_acc / count, pixel_mean, vgg_mean, gan_mean, d_mean
+    image_mean = image_acc / count if saw_image else None
+    return loss_acc / count, pixel_mean, vgg_mean, gan_mean, d_mean, image_mean
 
 
 def apply_learning_rate(optimizer, lr):
@@ -649,7 +682,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames,
         radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
         levels=cfg.levels, bilinear=cfg.bilinear, codes=cfg.codes, patch=cfg.patch,
-        res_scale=cfg.res_scale,
+        res_scale=cfg.res_scale, vote=cfg.vote,
     )
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -726,13 +759,21 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 d_value if gan is not None else None,
             )
 
-        def log(step, train_loss, val_loss, train_parts, val_parts):
-            write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts)
+        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image):
+            write_scalars(
+                writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image,
+            )
             if val_loss is None:
                 return
             message = f"step {step:06d}  val {val_loss:.6f}"
             if val_parts is not None:
                 message += "  " + part_text(*val_parts)
+            if neighbor_image is not None:
+                message += f"  neighbors {neighbor_image:.6f}"
+            if usage is not None:
+                message += f"  vote {usage['vote']:.4f}  weight {usage['weight']:.5f}"
+                if usage.get("grad") is not None:
+                    message += f"  grad {usage['grad']:.4f}"
             print(message, flush=True)
             if live is not None:
                 live.status(message)
@@ -753,20 +794,20 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
         def validate():
             """Validation loss, images, and a checkpoint at the current step."""
-            loss, pixel, vgg, gan_value, d_value = evaluate(
+            loss, pixel, vgg, gan_value, d_value, neighbor_image = evaluate(
                 model, films, val_specs, radius, cfg.batch, device,
                 cfg, objective, discriminator,
                 image_dir=out_dir / "val", step=step,
             )
             checkpoint()
-            return loss, logged_parts(pixel, vgg, gan_value, d_value)
+            return loss, logged_parts(pixel, vgg, gan_value, d_value), neighbor_image
 
         try:
             # A new run validates before any update. A fine-tune's step 0 is
             # the generator that was loaded.
             if train_state is None:
-                val_loss, val_parts = validate()
-                log(step, None, val_loss, None, val_parts)
+                val_loss, val_parts, neighbor_image = validate()
+                log(step, None, val_loss, None, val_parts, None, neighbor_image)
             while cfg.steps is None or steps_done < cfg.steps:
                 step += 1
                 steps_done += 1
@@ -795,6 +836,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                     loss = loss + align_loss
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
+                usage = model.neighbor_usage() if hasattr(model, "neighbor_usage") else None
                 optimizer.step()
                 if discriminator is not None:
                     for parameter in discriminator.parameters():
@@ -826,9 +868,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 finished = cfg.steps is not None and steps_done == cfg.steps
                 val_loss = None
                 val_parts = None
+                neighbor_image = None
                 if step % cfg.val_every == 0 or finished:
-                    val_loss, val_parts = validate()
-                log(step, loss.item(), val_loss, batch_parts, val_parts)
+                    val_loss, val_parts, neighbor_image = validate()
+                log(step, loss.item(), val_loss, batch_parts, val_parts, usage, neighbor_image)
         except KeyboardInterrupt:
             checkpoint()
             print(f"interrupted, saved {saved_at / 'model.pt'}", flush=True)

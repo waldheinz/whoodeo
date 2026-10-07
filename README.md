@@ -64,6 +64,20 @@ A moved neighbor can still be dropped, pixel by pixel. The gate compares the dir
 
 The middle features and the gated neighbors are stacked and mixed back down to `channels` by one 3×3 convolution. The weights that read a neighbor start at zero, so an untrained model does not use the neighbors. The trunk then runs for `blocks` residual blocks, and the last layer turns that into the 2× correction. That layer starts at zero, so the picture starts as the bilinear enlargement.
 
+# The vote model
+
+`arch: vote` is a 2× upscaler derived from EDSR. It reads the frame before, the frame being reconstructed, and the frame after, and predicts the middle frame. There is no `in_frames` key. The count is three.
+
+The stem runs on each frame alone, and every frame uses the same weights. It is one 3×3 convolution from the 3 RGB values to `channels`, followed by `stem` residual blocks. `stem: 0` is only the convolution. `stem: 2` is the convolution plus two residual blocks.
+
+The vote sits on the difference between a neighbor and the middle. The same weights are used for the previous frame and the next frame. The path is one 3×3 convolution, a ReLU, `vote` residual blocks, and a closing 3×3 convolution. The raw difference is not added back on, so the decision cannot stay linear. The two results are added onto the middle features. `vote: 0` is the convolution, the ReLU, and the closing convolution.
+
+`blocks` is the trunk after the vote: that many residual blocks, then one convolution. The long skip adds the middle stem output back on after the trunk, so a neighbor reaches the picture only through the trunk. `res_scale` multiplies the residual inside each block, in the stem, in the vote, and in the trunk, the same way it does in EDSR. The mean subtracted at the input and added at the output is the DIV2K mean, and the tail is the EDSR 2× upsampler.
+
+`configs/vote.yaml` is a worked example. The loss and the x264 pair filter match the EDSR baseline recipe. `blocks` there is the trunk only, not the stem and not the vote.
+
+While a vote run trains, TensorBoard records four neighbor numbers. `neighbor/weight` is the mean absolute value of the kernels in the shared vote. `neighbor/vote` is the mean absolute vote with the resting output removed, divided by the mean absolute middle features, measured on the training batch. The resting output is what the vote produces from a zero difference, and it does not depend on the neighbors. `neighbor/grad` is the mean absolute gradient of those kernels divided by the same quantity on the first convolution, so a value near zero means the loss is not asking the vote to change. `neighbor/image` is written when validation runs. It is the mean absolute change in the picture when both neighbors are replaced by a copy of the middle frame.
+
 # The SwinIR models
 
 `arch: swinir`, `arch: swinir_light`, and `arch: swinir_real` read the low-resolution frame and predict the 2× picture. The three names share one trunk. `configs/swinir.yaml` is the classical recipe and says how to switch to the other two.

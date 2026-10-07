@@ -70,6 +70,7 @@ class TrainConfig:
     terms: tuple[Term, ...]
     radius: int | None = None
     stem: int | None = None
+    vote: int | None = None
     sharpness: float | None = None
     reject: bool | None = None
     levels: int | None = None
@@ -83,7 +84,7 @@ class TrainConfig:
         return model_key(
             self.arch, self.blocks, self.channels, self.in_frames,
             self.radius, self.stem, self.sharpness, self.reject, self.levels,
-            self.bilinear, self.codes, self.patch, self.res_scale,
+            self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
         )
 
     def loss_recipe(self):
@@ -116,12 +117,18 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
     elif arch == "edsr":
         res_scale, = extra
         text += f" res_scale {res_scale:g}"
+    elif arch == "vote":
+        stem, vote, res_scale = extra
+        text = (
+            f"vote {blocks}x{channels} stem {stem} vote {vote} "
+            f"res_scale {res_scale:g}"
+        )
     return text
 
 
 def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-    bilinear, codes, patch, res_scale,
+    bilinear, codes, patch, res_scale, vote,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -132,12 +139,16 @@ def model_key(
         return key + (codes, patch, bilinear)
     if arch == "edsr":
         return key + (float(res_scale),)
+    if arch == "vote":
+        return key + (stem, vote, float(res_scale))
     return key
 
 
 def architecture_dict(cfg):
     """The model mapping stored next to the generator weights."""
-    item = {"arch": cfg.arch, "in_frames": cfg.in_frames}
+    item = {"arch": cfg.arch}
+    if cfg.arch != "vote":
+        item["in_frames"] = cfg.in_frames
     if cfg.blocks is not None:
         item["blocks"] = cfg.blocks
     if cfg.channels is not None:
@@ -156,6 +167,10 @@ def architecture_dict(cfg):
         item["codes"] = cfg.codes
         item["patch"] = cfg.patch
     elif cfg.arch == "edsr":
+        item["res_scale"] = cfg.res_scale
+    elif cfg.arch == "vote":
+        item["stem"] = cfg.stem
+        item["vote"] = cfg.vote
         item["res_scale"] = cfg.res_scale
     return item
 
@@ -183,7 +198,7 @@ def load_config(path, architecture=None, architecture_from=None):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale = _take_model(
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale, vote = _take_model(
         data, where, architecture, architecture_from,
     )
     batch = _take_int(data, "batch", where, positive=True)
@@ -224,6 +239,7 @@ def load_config(path, architecture=None, architecture_from=None):
         codes=codes,
         patch=patch,
         res_scale=res_scale,
+        vote=vote,
         variants=variants,
     )
 
@@ -257,7 +273,14 @@ def parse_model(model, where):
     model = dict(model)
     arch = _take_choice(model, "arch", where, PRESETS)
     preset = PRESETS[arch]
-    if arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
+    if arch == "vote":
+        if "in_frames" in model:
+            raise SystemExit(
+                f"{where}: vote reads the previous, middle, and next frame "
+                "and does not take in_frames"
+            )
+        in_frames = 3
+    elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
         in_frames = 1
     else:
         in_frames = _take_int(model, "in_frames", where, positive=True)
@@ -274,7 +297,15 @@ def parse_model(model, where):
     if arch == "pyramid":
         levels, stem, radius = _take_pyramid(model, where)
     bilinear, codes, patch = _take_vq(model, arch, where)
-    res_scale = _take_edsr(model, arch, where)
+    vote = None
+    if arch == "vote":
+        stem = _take_int(model, "stem", where)
+        if stem < 0:
+            raise SystemExit(f"{where}: stem must be zero or positive")
+        vote = _take_int(model, "vote", where)
+        if vote < 0:
+            raise SystemExit(f"{where}: vote must be zero or positive")
+    res_scale = _take_res_scale(model, arch, where)
     _reject_unknown(model, where)
     if in_frames % 2 != 1:
         raise SystemExit(f"{where}: in_frames must be odd")
@@ -285,14 +316,14 @@ def parse_model(model, where):
         raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale,
+        bilinear, codes, patch, res_scale, vote,
     )
 
 
-def _take_edsr(data, arch, where):
-    if arch != "edsr":
+def _take_res_scale(data, arch, where):
+    if arch not in ("edsr", "vote"):
         if "res_scale" in data:
-            raise SystemExit(f"{where}: only edsr uses res_scale")
+            raise SystemExit(f"{where}: only edsr and vote use res_scale")
         return None
     return _take_float(data, "res_scale", where, positive=True)
 

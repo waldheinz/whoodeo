@@ -1,0 +1,62 @@
+# Three low-res frames, the 2x picture of the middle one. The stem runs
+# on each frame with the same weights. The difference of each neighbor
+# from the middle goes through one shared vote: a convolution, a ReLU,
+# `vote` residual blocks, and a closing convolution. The raw difference
+# is not added back, so the decision cannot stay linear. The two results
+# are added to the middle features. The trunk runs on that sum. The long
+# skip adds the middle stem output, so the neighbors reach the picture
+# only through the trunk. The frame count is three. There is no
+# in_frames key.
+#
+# This file is 5.32M parameters, 20.3 MiB. The trunk holds 62%, the vote
+# 21%, the stem 8%, the 2x tail 9%. channels squares the file. blocks,
+# stem, and vote grow it in a straight line, 0.86 MiB per block at 112
+# channels.
+#
+# channels is the width of every feature. The windows do not move.
+# 96 is 14.9 MiB, 112 is 20.3 MiB, 128 is 26.5 MiB. res_scale stays 1 at
+# these widths. EDSR uses 0.1 only at 256 channels, where that scale is
+# what keeps the residual trainable.
+#
+# vote is the depth of the shared decision. It runs twice, once on each
+# neighbor. vote 0 is the opening convolution, the ReLU, and the closing
+# convolution. Each added block widens the comparison by 4 input pixels.
+# vote 4 compares a 31x31 neighborhood, radius 15.
+#
+# blocks is the trunk after the vote: that many residual blocks, then
+# one convolution. One more block adds 4 input pixels to the output
+# window and does not widen the comparison. At blocks 14 and vote 4 the
+# output sees 92 input pixels: 46 to one side of the low-res pixel under
+# it, 45 to the other. The last 3x3 sits on the doubled picture, so the
+# window is one pixel off center.
+#
+# stem is the residual blocks before the vote. The forward runs it three
+# times, once per frame. One more stem block also widens the comparison
+# by 4 input pixels. stem 2 is already inside the 31x31 above.
+#
+# Same data and loss as the x264 EDSR run.
+
+model:
+  arch: vote
+  blocks: 14
+  channels: 112
+  stem: 2
+  vote: 4
+  res_scale: 1.0
+
+batch: 2
+lr: 1.0e-4
+holdout: 0.1
+val_every: 1000
+val_count: 32
+seed: 42
+variants: "^x264-"
+loss:
+  balance: running
+  terms:
+    - name: pixel
+      weight: 0.7
+      kind: l1
+    - name: vgg
+      weight: 0.3
+      layers: [relu3_4, relu4_4]

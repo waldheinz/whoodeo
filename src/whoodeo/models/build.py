@@ -4,9 +4,10 @@
 neighbor frames with a deformable 3x3. `shift` aligns them with a dense
 integer search. `pyramid` aligns them with a coarse-to-fine flow. `vq`
 keeps the residual stack, reads one frame, and quantizes the correction.
-`espcn` and `edsr` are the other architectures. `swinir`, `swinir_light`,
-and `swinir_real` are SwinIR at 2x: one shared trunk, three reconstruction
-heads. The training config sets depth, width, and input frames.
+`espcn` and `edsr` are the other architectures. `vote` is an EDSR trunk
+that adds a shared vote from the previous and next frame. `swinir`,
+`swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
+reconstruction heads. The training config sets depth, width, and input frames.
 """
 
 from whoodeo.models.deform import DeformESPCN
@@ -16,6 +17,7 @@ from whoodeo.models.modified import ModifiedESPCN
 from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
 from whoodeo.models.swinir import SwinIR
+from whoodeo.models.vote import VoteEDSR
 from whoodeo.models.vq import CODES, PATCH, VQESPCN
 
 # Six Swin layers per residual block, six heads. Channels must divide by the heads.
@@ -35,6 +37,7 @@ PRESETS = {
     "vq": {"blocks": 8, "channels": 64, "frames": 1},
     "espcn": {"blocks": None, "channels": None, "frames": 1},
     "edsr": {"blocks": 32, "channels": 256, "frames": 1},
+    "vote": {"blocks": 14, "channels": 64, "frames": 3},
     "swinir": {"blocks": 6, "channels": 180, "frames": 1},
     "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
     "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
@@ -43,7 +46,7 @@ PRESETS = {
 def build_model(
     arch, blocks=None, channels=None, in_frames=5, *,
     radius=None, stem=None, sharpness=None, reject=None, levels=None,
-    bilinear=None, codes=None, patch=None, res_scale=None,
+    bilinear=None, codes=None, patch=None, res_scale=None, vote=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -93,6 +96,9 @@ def build_model(
             num_heads=[_SWINIR_HEADS] * depth,
             upsampler=_SWINIR_UPSAMPLER[arch],
         )
+    elif arch == "vote":
+        _check_vote(stem, vote, res_scale)
+        model = VoteEDSR(depth, width, float(res_scale), stem, vote)
     else:
         _check_edsr(res_scale)
         model = EDSR(depth, width, float(res_scale))
@@ -119,6 +125,11 @@ def build_model(
             f"edsr {depth}x{width} res_scale {float(res_scale):g} "
             f"in_frames {in_frames} parameters {count}"
         )
+    elif arch == "vote":
+        label = (
+            f"vote {depth}x{width} stem {stem} vote {vote} "
+            f"res_scale {float(res_scale):g} parameters {count}"
+        )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"
     return model, label
@@ -129,6 +140,17 @@ def _check_edsr(res_scale):
         raise SystemExit("arch edsr needs res_scale")
     if isinstance(res_scale, bool) or not isinstance(res_scale, (int, float)) or float(res_scale) <= 0:
         raise SystemExit("res_scale must be a positive number")
+
+
+def _check_vote(stem, vote, res_scale):
+    if res_scale is None:
+        raise SystemExit("arch vote needs res_scale")
+    if isinstance(res_scale, bool) or not isinstance(res_scale, (int, float)) or float(res_scale) <= 0:
+        raise SystemExit("res_scale must be a positive number")
+    if isinstance(stem, bool) or not isinstance(stem, int) or stem < 0:
+        raise SystemExit("arch vote needs stem, an integer >= 0")
+    if isinstance(vote, bool) or not isinstance(vote, int) or vote < 0:
+        raise SystemExit("arch vote needs vote, an integer >= 0")
 
 
 def _check_vq(codes, patch, bilinear):
