@@ -3,10 +3,12 @@
 The recipe is a YAML file. Masters live in the data directory's orig/ and
 degraded variants in its low/. An optional variants regex is searched against
 each path relative to low/, such as x264-crf28/film.mkv. Without it, every
-pair is used. A step picks one film, then one variant per sample. The draw
-is without replacement when the film has at least as many variants as the
-batch, and with replacement when it has fewer. Two time spans per variant
-are held out for validation.
+pair is used. A step draws one film to pick a resolution, then fills the
+batch with films of that resolution. The draw is without replacement when
+that resolution has at least as many films as the batch, and with replacement
+when it has fewer, so a lone size still fills whole batches. Each film draws
+one variant per sample it received, with the same rule. Two time spans per
+variant are held out for validation.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. The step copies a batch onto the device. Validation keeps its own
@@ -247,28 +249,56 @@ def load_sample(film, variant, time_sec, radius):
     return stacked, hr
 
 
-def make_batch_specs(rng, films, split, count):
-    """count times from one film, so the batch shares a size.
+def draw_indexes(rng, available, count):
+    """count indexes into a collection of `available` items.
 
-    Each sample draws its own variant. The draw is without replacement when
-    the film has at least count variants, and with replacement when it has
-    fewer.
+    The draw is without replacement when there are at least count items, and
+    with replacement when there are fewer.
     """
-    film_index = rng.randrange(len(films))
-    film = films[film_index]
-    available = len(film.variants)
     if count > available:
-        variant_indexes = rng.choices(range(available), k=count)
-    else:
-        variant_indexes = rng.sample(range(available), count)
-    return [
-        (
+        return rng.choices(range(available), k=count)
+    return rng.sample(range(available), count)
+
+
+def frame_size(film):
+    """Low resolution shared by every variant of this film."""
+    low = film.variants[0].low
+    return low.width, low.height
+
+
+def make_batch_specs(rng, films, split, count):
+    """count times that share a low resolution.
+
+    One uniform film picks the resolution. The samples are films of that
+    resolution, without replacement when the group has at least count films
+    and with replacement when it has fewer. A resolution with a single film
+    therefore fills the batch by itself and keeps its share of frames. Each
+    film draws one variant per sample it received, under the same rule.
+    """
+    anchor = rng.randrange(len(films))
+    size = frame_size(films[anchor])
+    group = [index for index, film in enumerate(films) if frame_size(film) == size]
+    film_indexes = [group[pick] for pick in draw_indexes(rng, len(group), count)]
+
+    slots = {}
+    for slot, film_index in enumerate(film_indexes):
+        slots.setdefault(film_index, []).append(slot)
+    variant_indexes = [None] * count
+    for film_index, positions in slots.items():
+        drawn = draw_indexes(rng, len(films[film_index].variants), len(positions))
+        for slot, variant_index in zip(positions, drawn):
+            variant_indexes[slot] = variant_index
+
+    specs = []
+    for slot, film_index in enumerate(film_indexes):
+        film = films[film_index]
+        variant_index = variant_indexes[slot]
+        specs.append((
             film_index,
             variant_index,
             sample_time(rng, film, film.variants[variant_index], split),
-        )
-        for variant_index in variant_indexes
-    ]
+        ))
+    return specs
 
 
 def batch_from_specs(films, specs, radius):
@@ -302,7 +332,6 @@ _QUEUE_POLL = 0.2
 class PreparedBatch:
     low: torch.Tensor
     high: torch.Tensor
-    film_name: str
     width: int
     height: int
     box: tuple | None
@@ -367,8 +396,7 @@ class BatchLoader:
             while not self._stop.is_set():
                 specs = make_batch_specs(self._rng, films, "train", self._batch)
                 film_index, variant_index, _time_sec = specs[0]
-                film = films[film_index]
-                variant = film.variants[variant_index]
+                variant = films[film_index].variants[variant_index]
                 low, high = batch_from_specs(films, specs, self._radius)
                 box = None
                 if self._crop is not None:
@@ -376,7 +404,6 @@ class BatchLoader:
                 prepared = PreparedBatch(
                     low=low,
                     high=high,
-                    film_name=film.name,
                     width=variant.low.width,
                     height=variant.low.height,
                     box=box,
@@ -863,8 +890,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 line = (
                     f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
                     f"loss {loss.item():.6f}  {part_text(*batch_parts)}  "
-                    f"{prepared.width}x{prepared.height}  "
-                    f"{prepared.film_name}"
+                    f"{prepared.width}x{prepared.height}"
                 )
                 print(line, flush=True)
 
