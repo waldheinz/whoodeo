@@ -1,5 +1,6 @@
 """Training recipe loaded from one YAML file."""
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,7 @@ class TrainConfig:
     codes: int | None = None
     patch: int | None = None
     res_scale: float | None = None
+    variants: str | None = None
 
     def arch_key(self):
         return model_key(
@@ -194,6 +196,7 @@ def load_config(path, architecture=None, architecture_from=None):
     seed = _take_int(data, "seed", where, default=0)
     steps = _take_int(data, "steps", where, positive=True, default=None)
     out = _take_path(data, "out", where)
+    variants = _take_variants(data, where)
     balance, terms = _take_loss(data, where)
     _reject_unknown(data, where)
     return TrainConfig(
@@ -221,6 +224,7 @@ def load_config(path, architecture=None, architecture_from=None):
         codes=codes,
         patch=patch,
         res_scale=res_scale,
+        variants=variants,
     )
 
 
@@ -439,6 +443,20 @@ def _take_float(data, key, where, positive=False, default=...):
     value = float(value)
     if positive and value <= 0:
         raise SystemExit(f"{where}: {key} must be positive")
+    return value
+
+
+def _take_variants(data, where):
+    """Optional regex matched against each path relative to low/."""
+    if "variants" not in data:
+        return None
+    value = data.pop("variants")
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{where}: variants must be a regex")
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise SystemExit(f"{where}: variants: {exc}") from exc
     return value
 
 

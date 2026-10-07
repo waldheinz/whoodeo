@@ -1,7 +1,7 @@
 # Full-frame 2x training. The first term anchors the loss magnitude.
 # balance: start freezes the scales on the validation frames.
 # balance: running keeps the weights as shares (EMA 0.99).
-# Optional keys, omitted here: steps, out.
+# Optional keys, omitted here: steps, out, variants.
 
 model:
   arch: modified

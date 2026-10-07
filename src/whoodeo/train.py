@@ -1,9 +1,10 @@
 """Train on random full frames from paired videos.
 
 The recipe is a YAML file. Masters live in the data directory's orig/ and
-degraded variants in its low/. A step picks one film, then one variant, then
-as many center times as the batch size. Two time spans per variant are held
-out for validation.
+degraded variants in its low/. An optional variants regex is searched against
+each path relative to low/, such as x264-crf28/film.mkv. Without it, every
+pair is used. A step picks one film, then one variant, then as many center
+times as the batch size. Two time spans per variant are held out for validation.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. The step copies a batch onto the device. Validation keeps its own
@@ -43,6 +44,7 @@ still present has to match the file.
 import argparse
 import queue
 import random
+import re
 import shutil
 import threading
 import time
@@ -141,12 +143,27 @@ class Film:
     variants: list = field(default_factory=list)
 
 
-def find_films(orig_dir, low_dir):
+@dataclass
+class FoundFilms:
+    """Pairs the scan already met. orig/ is not listed on its own."""
+
+    films: list
+    total: int
+    kept: int
+    problems: list
+
+
+def find_films(orig_dir, low_dir, variants=None):
+    """Video pairs under low/. `variants` is a regex on the path relative to low/."""
     if not orig_dir.is_dir():
         raise SystemExit(f"no orig folder: {orig_dir}")
     if not low_dir.is_dir():
         raise SystemExit(f"no low folder: {low_dir}")
+    pattern = re.compile(variants) if variants is not None else None
     found = {}
+    total = 0
+    kept = 0
+    problems = []
     variant_dirs = sorted(
         path for path in low_dir.iterdir()
         if path.is_dir() and not path.name.startswith(".")
@@ -155,28 +172,38 @@ def find_films(orig_dir, low_dir):
         for low_path in sorted(variant_dir.iterdir()):
             if low_path.suffix.lower() not in VIDEO_EXTS or not low_path.is_file():
                 continue
+            rel = low_path.relative_to(low_dir).as_posix()
             orig_path = orig_dir / low_path.name
             if not orig_path.is_file():
-                print(
-                    f"skip {variant_dir.name}/{low_path.name}: no match in {orig_dir}",
-                    flush=True,
-                )
+                problems.append(f"skip {rel}: no match in {orig_dir}")
                 continue
+            total += 1
+            if pattern is not None and pattern.search(rel) is None:
+                continue
+            kept += 1
             found.setdefault(low_path.name, (orig_path, []))
             found[low_path.name][1].append((variant_dir.name, low_path))
-    if not found:
-        raise SystemExit(f"no video pairs in {orig_dir} and {low_dir}")
     films = []
     for name in sorted(found):
-        orig_path, variants = found[name]
-        variants.sort(key=lambda item: item[0])
-        films.append((name, orig_path, variants))
-    return films
+        orig_path, variant_paths = found[name]
+        variant_paths.sort(key=lambda item: item[0])
+        films.append((name, orig_path, variant_paths))
+    return FoundFilms(films, total, kept, problems)
 
 
-def open_films(orig_dir, low_dir, holdout):
+def require_films(found, orig_dir, low_dir, variants):
+    if found.kept:
+        return
+    if variants:
+        raise SystemExit(
+            f"no pairs match {variants!r}: {found.kept} of {found.total}"
+        )
+    raise SystemExit(f"no video pairs in {orig_dir} and {low_dir}")
+
+
+def open_films(found, holdout):
     opened = []
-    for name, orig_path, variant_paths in find_films(orig_dir, low_dir):
+    for name, orig_path, variant_paths in found:
         orig = Clip(orig_path)
         variants = []
         for variant_name, low_path in variant_paths:
@@ -273,7 +300,7 @@ class BatchLoader:
     an error from the thread instead of waiting on a dead loader.
     """
 
-    def __init__(self, rng, orig_dir, low_dir, holdout, batch, radius, crop):
+    def __init__(self, rng, orig_dir, low_dir, holdout, batch, radius, crop, variants):
         self._rng = rng
         self._orig_dir = orig_dir
         self._low_dir = low_dir
@@ -281,6 +308,7 @@ class BatchLoader:
         self._batch = batch
         self._radius = radius
         self._crop = crop
+        self._variants = variants
         self._queue = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="whoodeo-batch", daemon=False)
@@ -317,7 +345,9 @@ class BatchLoader:
     def _run(self):
         films = None
         try:
-            films = open_films(self._orig_dir, self._low_dir, self._holdout)
+            found = find_films(self._orig_dir, self._low_dir, self._variants)
+            require_films(found, self._orig_dir, self._low_dir, self._variants)
+            films = open_films(found.films, self._holdout)
             while not self._stop.is_set():
                 specs = make_batch_specs(self._rng, films, "train", self._batch)
                 film_index, variant_index, _time_sec = specs[0]
@@ -587,22 +617,20 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     device = get_device()
     root = data_root()
 
-    films = open_films(root / "orig", root / "low", cfg.holdout)
+    orig_dir = root / "orig"
+    low_dir = root / "low"
+    found = find_films(orig_dir, low_dir, cfg.variants)
     print(f"device {device}", flush=True)
     print(f"config {cfg.source}", flush=True)
     print(f"network {shape_text(*cfg.arch_key())}", flush=True)
     if generator is not None and train_state is None:
         shown = "unknown" if generator.step is None else str(generator.step)
         print(f"fine-tune {generator.path}  loaded step {shown}", flush=True)
-    for film in films:
-        for variant in film.variants:
-            spans = ", ".join(f"{start:.1f}-{end:.1f}s" for start, end in variant.holdouts)
-            print(
-                f"pair {film.name}  {variant.name}  "
-                f"{variant.low.width}x{variant.low.height}  "
-                f"{variant.duration:.1f}s  holdout {spans}",
-                flush=True,
-            )
+    for problem in found.problems:
+        print(problem, flush=True)
+    require_films(found, orig_dir, low_dir, cfg.variants)
+    print(f"pairs {found.kept} of {found.total}", flush=True)
+    films = open_films(found.films, cfg.holdout)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     copied = out_dir / "config.yaml"
@@ -672,6 +700,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             cfg.batch,
             radius,
             None if gan is None else gan.crop,
+            cfg.variants,
         )
         loader.start()
         if train_state is not None:
