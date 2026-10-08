@@ -8,8 +8,8 @@ under $XDG_DATA_HOME/whoodeo, runs under $XDG_STATE_HOME/whoodeo. An empty
 or relative value in those variables is ignored, and the spec default
 under the home directory is used instead.
 
-whoodeo/degrade.yaml in that same config directory replaces the degrade
-recipe shipped with the package. The file may be absent.
+Rungs and the degrade recipe live in the data directory's catalog.json,
+not in this file.
 """
 
 import os
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-_KEYS = ("data", "runs")
+_PATH_KEYS = ("data", "runs")
 
 
 class EnvPath:
@@ -40,11 +40,6 @@ class EnvPath:
 def config_path():
     """User config file. It may be absent."""
     return _xdg_home("XDG_CONFIG_HOME", ".config") / "whoodeo" / "config.yaml"
-
-
-def degrade_path():
-    """User degrade recipe beside config.yaml. The file may be absent."""
-    return config_path().parent / "degrade.yaml"
 
 
 def data_root():
@@ -71,10 +66,11 @@ def resolve_data(path):
 
 def _configured(key):
     """Path written for `key`, or None when the file or the key is absent."""
-    return _read_config().get(key)
+    return _paths().get(key)
 
 
-def _read_config():
+def _document():
+    """The config mapping. Only data and runs are read."""
     path = config_path()
     if not path.exists():
         return {}
@@ -88,12 +84,18 @@ def _read_config():
         return {}
     if not isinstance(data, dict):
         raise SystemExit(f"{path}: expected a mapping")
-    unknown = [str(name) for name in data if name not in _KEYS]
+    unknown = [str(name) for name in data if name not in _PATH_KEYS]
     if unknown:
         names = ", ".join(sorted(unknown))
         raise SystemExit(f"{path}: unknown keys: {names}")
+    return data
+
+
+def _paths():
+    data = _document()
+    path = config_path()
     found = {}
-    for key in _KEYS:
+    for key in _PATH_KEYS:
         if key not in data:
             continue
         value = data[key]

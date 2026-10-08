@@ -1,3 +1,5 @@
+# Seed for a new catalog.json. An existing library reads its rungs and its
+# degrade list from that catalog.
 scale: 2
 scale_flags: bicubic
 pix_fmt: yuv420p

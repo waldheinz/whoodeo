@@ -1,18 +1,21 @@
 """Train on random full frames from paired videos.
 
 The recipe is a YAML file. Masters live in the data directory's orig/ and
-degraded variants in its low/. An optional variants regex is searched against
-each path relative to low/, such as x264-crf28/film.mkv. Without it, every
-pair is used. A step draws one film to pick a resolution, then fills the
-batch with films of that resolution. The draw is without replacement when
-that resolution has at least as many films as the batch, and with replacement
-when it has fewer, so a lone size still fills whole batches. Each film draws
-one variant per sample it received, with the same rule. Two time spans per
-variant are held out for validation.
+degraded variants in its low/. catalog.json beside those folders names the
+pairs, their sizes, and their durations. Training reads that file once at
+startup. An optional variants regex is searched against each path relative
+to low/, such as x264-crf28/film.720.mkv. Without it, every pair is used.
+A step draws one film to pick a resolution, then fills the batch with films
+of that resolution. The draw is without replacement when that resolution has
+at least as many films as the batch, and with replacement when it has fewer,
+so a lone size still fills whole batches. Each film draws one variant per
+sample it received, with the same rule. Two time spans per variant are held
+out for validation.
 
 Training batches are decoded on one side thread into a queue of three CPU
-batches. The step copies a batch onto the device. Validation keeps its own
-clips and reads them on the main thread.
+batches. A frame read opens the video and closes it before the next read.
+The step copies a batch onto the device. Validation reads the same way on
+the main thread.
 
 The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
@@ -63,6 +66,7 @@ import av
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
+from whoodeo.library import load_catalog, master_filename, titles_of
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
 from whoodeo.live import add_live_args, open_live
@@ -71,7 +75,6 @@ from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.objective import Objective, pixel_loss
 from whoodeo.video import frame_tensor, png_bytes, rgb_image
 
-VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 SCALE = 2
 
 
@@ -98,41 +101,50 @@ def in_ranges(time_sec, ranges):
 
 
 class Clip:
-    def __init__(self, path):
-        self.path = Path(path)
-        self.container = av.open(str(self.path))
-        self.stream = self.container.streams.video[0]
-        self.fps = float(self.stream.average_rate)
-        if not self.container.duration:
-            raise RuntimeError(f"no duration: {self.path}")
-        self.duration = self.container.duration / av.time_base
-        self.width = self.stream.codec_context.width
-        self.height = self.stream.codec_context.height
+    """A video named in the catalog. Nothing stays open between reads."""
 
-    def close(self):
-        self.container.close()
+    def __init__(self, path, width, height, duration):
+        self.path = Path(path)
+        self.width = width
+        self.height = height
+        self.duration = duration
 
     def frames_around(self, time_sec, radius):
-        pad = (radius + 1) / self.fps
-        start = max(0.0, time_sec - pad)
-        self.container.seek(int(start * av.time_base), backward=True, any_frame=False)
-        frames = []
-        times = []
-        for frame in self.container.decode(self.stream):
-            if frame.time is None or frame.time + 1e-3 < start:
-                continue
-            frames.append(frame_tensor(frame))
-            times.append(frame.time)
-            if frame.time >= time_sec + pad and len(frames) >= radius * 2 + 1:
-                break
-        if not frames:
-            raise RuntimeError(f"no frames near {time_sec:.3f}s in {self.path.name}")
-        center = min(range(len(times)), key=lambda i: abs(times[i] - time_sec))
-        picked = []
-        last = len(frames) - 1
-        for delta in range(-radius, radius + 1):
-            picked.append(frames[min(max(center + delta, 0), last)])
-        return picked
+        container = av.open(str(self.path))
+        try:
+            stream = container.streams.video[0]
+            width = stream.codec_context.width
+            height = stream.codec_context.height
+            if (width, height) != (self.width, self.height):
+                raise RuntimeError(
+                    f"{self.path.name} is {width}x{height}, "
+                    f"catalog says {self.width}x{self.height}"
+                )
+            if not stream.average_rate:
+                raise RuntimeError(f"no frame rate: {self.path}")
+            fps = float(stream.average_rate)
+            pad = (radius + 1) / fps
+            start = max(0.0, time_sec - pad)
+            container.seek(int(start * av.time_base), backward=True, any_frame=False)
+            frames = []
+            times = []
+            for frame in container.decode(stream):
+                if frame.time is None or frame.time + 1e-3 < start:
+                    continue
+                frames.append(frame_tensor(frame))
+                times.append(frame.time)
+                if frame.time >= time_sec + pad and len(frames) >= radius * 2 + 1:
+                    break
+            if not frames:
+                raise RuntimeError(f"no frames near {time_sec:.3f}s in {self.path.name}")
+            center = min(range(len(times)), key=lambda i: abs(times[i] - time_sec))
+            picked = []
+            last = len(frames) - 1
+            for delta in range(-radius, radius + 1):
+                picked.append(frames[min(max(center + delta, 0), last)])
+            return picked
+        finally:
+            container.close()
 
 
 @dataclass
@@ -152,7 +164,7 @@ class Film:
 
 @dataclass
 class FoundFilms:
-    """Pairs the scan already met. orig/ is not listed on its own."""
+    """Pairs named in the catalog. A master with no low is left out."""
 
     films: list
     total: int
@@ -160,75 +172,97 @@ class FoundFilms:
     problems: list
 
 
-def find_films(orig_dir, low_dir, variants=None):
-    """Video pairs under low/. `variants` is a regex on the path relative to low/."""
+def _number(record, key, label):
+    value = record.get(key) if isinstance(record, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SystemExit(f"{label}: missing {key}")
+    return value
+
+
+def load_films(root, holdout, variants=None):
+    """Pairs from catalog.json. No video is opened."""
+    orig_dir = root / "orig"
+    low_dir = root / "low"
     if not orig_dir.is_dir():
         raise SystemExit(f"no orig folder: {orig_dir}")
     if not low_dir.is_dir():
         raise SystemExit(f"no low folder: {low_dir}")
+    catalog = load_catalog(root)
+    titles = titles_of(catalog, root / "catalog.json")
     pattern = re.compile(variants) if variants is not None else None
-    found = {}
     total = 0
     kept = 0
     problems = []
-    variant_dirs = sorted(
-        path for path in low_dir.iterdir()
-        if path.is_dir() and not path.name.startswith(".")
-    )
-    for variant_dir in variant_dirs:
-        for low_path in sorted(variant_dir.iterdir()):
-            if low_path.suffix.lower() not in VIDEO_EXTS or not low_path.is_file():
+    ordered = []
+    for title in titles:
+        entry = titles[title]
+        masters = entry.get("masters") if isinstance(entry, dict) else None
+        if not isinstance(masters, dict):
+            problems.append(f"skip {title}: no masters")
+            continue
+        for rung, master in masters.items():
+            name = master_filename(title, rung)
+            orig_path = orig_dir / name
+            if not isinstance(master, dict):
+                problems.append(f"skip {name}: bad catalog entry")
                 continue
-            rel = low_path.relative_to(low_dir).as_posix()
-            orig_path = orig_dir / low_path.name
             if not orig_path.is_file():
-                problems.append(f"skip {rel}: no match in {orig_dir}")
+                problems.append(f"skip {name}: no master file")
                 continue
-            total += 1
-            if pattern is not None and pattern.search(rel) is None:
+            orig_w = int(_number(master, "width", name))
+            orig_h = int(_number(master, "height", name))
+            orig_duration = float(_number(master, "duration", name))
+            lows = master.get("low")
+            if not isinstance(lows, dict):
+                problems.append(f"skip {name}: no lows")
                 continue
-            kept += 1
-            found.setdefault(low_path.name, (orig_path, []))
-            found[low_path.name][1].append((variant_dir.name, low_path))
-    films = []
-    for name in sorted(found):
-        orig_path, variant_paths = found[name]
-        variant_paths.sort(key=lambda item: item[0])
-        films.append((name, orig_path, variant_paths))
+            variants_here = []
+            for variant_name in sorted(lows):
+                low = lows[variant_name]
+                rel = f"{variant_name}/{name}"
+                low_path = low_dir / variant_name / name
+                if not isinstance(low, dict) or not low_path.is_file():
+                    problems.append(f"skip {rel}: file missing")
+                    continue
+                total += 1
+                if pattern is not None and pattern.search(rel) is None:
+                    continue
+                low_w = int(_number(low, "width", rel))
+                low_h = int(_number(low, "height", rel))
+                if (orig_h, orig_w) != (low_h * SCALE, low_w * SCALE):
+                    raise SystemExit(
+                        f"{rel} is {low_w}x{low_h}, "
+                        f"orig is {orig_w}x{orig_h}, expected exactly {SCALE}x"
+                    )
+                kept += 1
+                duration = min(orig_duration, float(_number(low, "duration", rel)))
+                variants_here.append(Variant(
+                    name=variant_name,
+                    low=Clip(low_path, low_w, low_h, duration),
+                    duration=duration,
+                    holdouts=holdout_ranges(duration, holdout),
+                ))
+            if not variants_here:
+                continue
+            film = Film(
+                name=f"{title}.{rung}",
+                orig=Clip(orig_path, orig_w, orig_h, orig_duration),
+                variants=variants_here,
+            )
+            ordered.append((f"{title}.mkv", orig_w * orig_h, film))
+    ordered.sort(key=lambda item: (item[0], -item[1]))
+    films = [item[2] for item in ordered]
     return FoundFilms(films, total, kept, problems)
 
 
-def require_films(found, orig_dir, low_dir, variants):
+def require_films(found, root, variants):
     if found.kept:
         return
     if variants:
         raise SystemExit(
             f"no pairs match {variants!r}: {found.kept} of {found.total}"
         )
-    raise SystemExit(f"no video pairs in {orig_dir} and {low_dir}")
-
-
-def open_films(found, holdout):
-    opened = []
-    for name, orig_path, variant_paths in found:
-        orig = Clip(orig_path)
-        variants = []
-        for variant_name, low_path in variant_paths:
-            low = Clip(low_path)
-            if (orig.height, orig.width) != (low.height * SCALE, low.width * SCALE):
-                raise SystemExit(
-                    f"{variant_name}/{low_path.name} is {low.width}x{low.height}, "
-                    f"orig is {orig.width}x{orig.height}, expected exactly {SCALE}x"
-                )
-            duration = min(orig.duration, low.duration)
-            variants.append(Variant(
-                name=variant_name,
-                low=low,
-                duration=duration,
-                holdouts=holdout_ranges(duration, holdout),
-            ))
-        opened.append(Film(name=name, orig=orig, variants=variants))
-    return opened
+    raise SystemExit(f"no video pairs in {root / 'orig'} and {root / 'low'}")
 
 
 def sample_time(rng, film, variant, split):
@@ -317,13 +351,6 @@ def batch_on_device(films, specs, radius, device):
     return low.to(device), high.to(device)
 
 
-def close_films(films):
-    for film in films:
-        film.orig.close()
-        for variant in film.variants:
-            variant.low.close()
-
-
 _QUEUE_DEPTH = 3
 _QUEUE_POLL = 0.2
 
@@ -340,20 +367,18 @@ class PreparedBatch:
 class BatchLoader:
     """One thread of CPU training batches.
 
-    The thread opens its own clips and never moves tensors onto a device.
-    ``put`` times out so a full queue cannot block shutdown. ``get`` raises
-    an error from the thread instead of waiting on a dead loader.
+    Each frame read opens its video and closes it. The thread never moves
+    tensors onto a device. ``put`` times out so a full queue cannot block
+    shutdown. ``get`` raises an error from the thread instead of waiting
+    on a dead loader.
     """
 
-    def __init__(self, rng, orig_dir, low_dir, holdout, batch, radius, crop, variants):
+    def __init__(self, rng, films, batch, radius, crop):
         self._rng = rng
-        self._orig_dir = orig_dir
-        self._low_dir = low_dir
-        self._holdout = holdout
+        self._films = films
         self._batch = batch
         self._radius = radius
         self._crop = crop
-        self._variants = variants
         self._queue = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="whoodeo-batch", daemon=False)
@@ -388,11 +413,8 @@ class BatchLoader:
         return False
 
     def _run(self):
-        films = None
+        films = self._films
         try:
-            found = find_films(self._orig_dir, self._low_dir, self._variants)
-            require_films(found, self._orig_dir, self._low_dir, self._variants)
-            films = open_films(found.films, self._holdout)
             while not self._stop.is_set():
                 specs = make_batch_specs(self._rng, films, "train", self._batch)
                 film_index, variant_index, _time_sec = specs[0]
@@ -412,9 +434,6 @@ class BatchLoader:
                     return
         except BaseException as exc:
             self._put(exc)
-        finally:
-            if films is not None:
-                close_films(films)
 
 
 def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image):
@@ -689,9 +708,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     device = get_device()
     root = data_root()
 
-    orig_dir = root / "orig"
-    low_dir = root / "low"
-    found = find_films(orig_dir, low_dir, cfg.variants)
+    found = load_films(root, cfg.holdout, cfg.variants)
     print(f"device {device}", flush=True)
     print(f"config {cfg.source}", flush=True)
     print(f"network {shape_text(*cfg.arch_key())}", flush=True)
@@ -700,9 +717,9 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         print(f"fine-tune {generator.path}  loaded step {shown}", flush=True)
     for problem in found.problems:
         print(problem, flush=True)
-    require_films(found, orig_dir, low_dir, cfg.variants)
+    require_films(found, root, cfg.variants)
     print(f"pairs {found.kept} of {found.total}", flush=True)
-    films = open_films(found.films, cfg.holdout)
+    films = found.films
 
     out_dir.mkdir(parents=True, exist_ok=True)
     copied = out_dir / "config.yaml"
@@ -766,13 +783,10 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     try:
         loader = BatchLoader(
             rng,
-            root / "orig",
-            root / "low",
-            cfg.holdout,
+            films,
             cfg.batch,
             radius,
             None if gan is None else gan.crop,
-            cfg.variants,
         )
         loader.start()
         if train_state is not None:
@@ -921,7 +935,6 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             loader.close()
         if live is not None:
             live.close()
-        close_films(films)
     shown = saved_at / "model.pt" if saved_at is not None else out_dir / "model.pt"
     print(f"done  {shown}", flush=True)
 

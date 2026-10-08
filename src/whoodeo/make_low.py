@@ -1,18 +1,18 @@
 """Write training videos.
 
-`whoodeo-make-low import` writes a source into the orig folder. A picture
-about Full HD or larger is encoded near 1280x720. That master keeps the
-picture's aspect and is 10-bit 4:4:4 HEVC with a short closed GOP, so
-training seeks stay cheap. A smaller picture is remuxed as it is: the video
-bitstream stays, and the audio is dropped. Low variants are written unless
-`--no-degrade` is set.
+`whoodeo-make-low import` writes a source into the orig folder and records
+it in catalog.json beside orig/ and low/. The catalog's rungs are pixel
+budgets. A source larger than a rung is encoded down to it, 10-bit 4:4:4
+HEVC with a short closed GOP, so training seeks stay cheap. A source that
+already sits on a rung is remuxed as it is: the video bitstream stays, and
+the audio is dropped. Smaller rungs are still encoded from that same
+source. Nothing is upscaled. The file is <title>.<rung>.mkv. Low variants
+come from the catalog's degrade list and are written unless `--no-degrade`
+is set, under the same filename.
 
-The plain command writes half-resolution variants of videos already in orig.
-Variant directories live under the low root. Each one keeps the source
-filename. Codec, quantizer, and bitrate come from a YAML recipe: the short
-name is the directory, and the value is extra ffmpeg arguments. A
-degrade.yaml beside the user config replaces the recipe shipped with the
-package.
+The plain command writes the missing variants of masters already in the
+catalog. With no filenames it also encodes any rung the catalog's origin
+file can still supply. Variant directories live under the low root.
 """
 
 import argparse
@@ -22,15 +22,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
-
-from whoodeo.catalog import EnvPath, degrade_path, resolve_data
-
-CONFIG = Path(__file__).resolve().parent / "degrade.yaml"
+from whoodeo.catalog import EnvPath, resolve_data
+from whoodeo.library import (
+    catalog_file,
+    degrade_of,
+    master_filename,
+    open_catalog,
+    plan_masters,
+    rungs_of,
+    save_catalog,
+    split_master_filename,
+    titles_of,
+    video_record,
+)
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
-MASTER_PIXELS = 1280 * 720
-FULLHD_PIXELS = 1920 * 1080
 MASTER_PIX_FMT = "yuv444p10le"
 # No preset: x265 medium. CRF 12 is the quality knob. psy stays at x265's default.
 # bframes=0 keeps encode order equal to display order. It does not repair
@@ -53,62 +59,6 @@ MATRIX_ALL = {
     "bt470m": "bt470m",
     "smpte240m": "smpte240m",
 }
-
-
-def recipe_path():
-    """User recipe if that path exists, otherwise the shipped file."""
-    user = degrade_path()
-    if user.exists():
-        return user
-    return CONFIG
-
-
-def active_config():
-    """Recipe to load. A user path that is not a file is an error."""
-    path = recipe_path()
-    if path == CONFIG or path.is_file():
-        return path
-    raise SystemExit(f"{path}: expected a file")
-
-
-class _RecipeDefault:
-    """Omitted `--config`. Help prints the recipe that would be used.
-
-    argparse expands this while building the parser, before it knows
-    whether `--config` was passed, so this must not reject the user path.
-    """
-
-    def __str__(self):
-        return str(recipe_path())
-
-
-def load_config(path):
-    try:
-        config = yaml.safe_load(path.read_text())
-    except FileNotFoundError:
-        raise SystemExit(f"no config: {path}")
-    except yaml.YAMLError as exc:
-        raise SystemExit(f"{path}: {exc}")
-    if not isinstance(config, dict):
-        raise SystemExit(f"{path}: expected an object")
-    scale = config.get("scale", 2)
-    flags = config.get("scale_flags", "bicubic")
-    pix_fmt = config.get("pix_fmt", "yuv420p")
-    variants = config.get("variants")
-    if not isinstance(scale, int) or scale < 2:
-        raise SystemExit(f"{path}: scale must be an integer >= 2")
-    if not isinstance(flags, str) or not flags:
-        raise SystemExit(f"{path}: scale_flags must be a string")
-    if not isinstance(pix_fmt, str) or not pix_fmt:
-        raise SystemExit(f"{path}: pix_fmt must be a string")
-    if not isinstance(variants, dict) or not variants:
-        raise SystemExit(f"{path}: variants must be a non-empty object")
-    for name, args in variants.items():
-        if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name:
-            raise SystemExit(f"{path}: bad variant name {name!r}")
-        if not isinstance(args, str) or not args.strip():
-            raise SystemExit(f"{path}: variant {name} must be an ffmpeg argument string")
-    return scale, flags, pix_fmt, variants
 
 
 def select_variants(variants, text):
@@ -207,34 +157,39 @@ def has_audio(path):
 
 
 def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, force, strict):
+    """Write one low variant. Return its frame count, -1 when ignored, None on failure."""
     name = src.name
     label = f"{variant}/{name}"
     if src.suffix.lower() not in VIDEO_EXTS:
         if strict:
             print(f"skip {label}: train does not read this extension", file=sys.stderr)
-            return False
-        return True
+            return None
+        return -1
     codec = codec_of(ffmpeg_args)
     if src.suffix.lower() == ".webm" and codec not in WEBM_CODECS:
         print(
             f"skip {label}: webm cannot hold codec {codec or '(unset)'}",
             file=sys.stderr,
         )
-        return not strict
+        return None if strict else -1
     sar = sample_aspect(src)
     if not square_pixels(sar):
         print(
             f"{label} has sample aspect ratio {sar}; stored pixels are not square",
             file=sys.stderr,
         )
-        return False
+        return None
 
     out_dir = low_dir / variant
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / name
     if out.exists() and not force:
         print(f"keep {label}", flush=True)
-        return True
+        try:
+            return packets_of(out)
+        except RuntimeError as exc:
+            print(f"{label}: {exc}", file=sys.stderr)
+            return None
 
     width, height = size_of(src)
     if width % (scale * 2) or height % (scale * 2):
@@ -243,7 +198,7 @@ def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, 
             f"{scale * 2} so the 1/{scale} frame is even.",
             file=sys.stderr,
         )
-        return False
+        return None
     low_w = width // scale
     low_h = height // scale
     tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
@@ -263,7 +218,7 @@ def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, 
     if result.returncode != 0:
         tmp.unlink(missing_ok=True)
         print(f"{label}: ffmpeg failed", file=sys.stderr)
-        return False
+        return None
 
     try:
         out_size = size_of(tmp)
@@ -273,22 +228,22 @@ def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, 
     except RuntimeError as exc:
         tmp.unlink(missing_ok=True)
         print(f"{label}: {exc}", file=sys.stderr)
-        return False
+        return None
     if out_size != (low_w, low_h):
         tmp.unlink(missing_ok=True)
         print(f"{label}: output is {out_size[0]}x{out_size[1]}, expected {low_w}x{low_h}", file=sys.stderr)
-        return False
+        return None
     if in_packets != out_packets:
         tmp.unlink(missing_ok=True)
         print(f"{label}: {in_packets} input frames, {out_packets} output frames", file=sys.stderr)
-        return False
+        return None
     if audio:
         tmp.unlink(missing_ok=True)
         print(f"{label}: output still has audio", file=sys.stderr)
-        return False
+        return None
     tmp.replace(out)
     print(f"wrote {out}  {low_w}x{low_h}  {out_packets} frames", flush=True)
-    return True
+    return out_packets
 
 
 def probe_video(path):
@@ -333,44 +288,6 @@ def sar_factors(sar):
     if num <= 0 or den <= 0:
         return None
     return num, den
-
-
-def reaches_full_hd(width, height, sar):
-    """True when the display picture is about Full HD or larger.
-
-    None means the sample aspect ratio cannot be read, so the display size
-    is unknown.
-    """
-    factors = sar_factors(sar)
-    if factors is None:
-        return None
-    num, den = factors
-    return width * num * height >= FULLHD_PIXELS * den
-
-
-def snap4(value):
-    snapped = int(round(value / 4.0)) * 4
-    if snapped < 4:
-        return 4
-    return snapped
-
-
-def master_dimensions(width, height, sar):
-    """Square-pixel size near 1280x720, aspect kept, both sides a multiple of 4.
-
-    A picture that already has fewer pixels stays at its display size. The
-    multiple of 4 keeps the half-resolution low frame even.
-    """
-    factors = sar_factors(sar)
-    if factors is None:
-        return None
-    num, den = factors
-    disp_w = width * num / den
-    disp_h = float(height)
-    scale = 1.0
-    if disp_w * disp_h > MASTER_PIXELS:
-        scale = (MASTER_PIXELS / (disp_w * disp_h)) ** 0.5
-    return snap4(disp_w * scale), snap4(disp_h * scale)
 
 
 def input_matrix(color_space):
@@ -660,17 +577,12 @@ def master_problem(path, width, height, packets):
     return timestamp_problem(path)
 
 
-def encode_master(src, label, out, stream, in_packets, width, height, sar, matrix_name):
-    """Encode src to a 10-bit 4:4:4 HEVC master near 1280x720."""
+def encode_master(src, label, out, stream, in_packets, width, height, matrix_name, out_w, out_h):
+    """Encode src to a 10-bit 4:4:4 HEVC master at out_w by out_h."""
     matrix = input_matrix(matrix_name)
     if matrix is None:
         print(f"{label}: unsupported color matrix {matrix_name}", file=sys.stderr)
         return None
-    size = master_dimensions(width, height, sar)
-    if size is None:
-        print(f"{label}: bad sample aspect ratio {sar or 'unset'}", file=sys.stderr)
-        return None
-    out_w, out_h = size
     tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
     tmp.unlink(missing_ok=True)
     print(
@@ -756,26 +668,18 @@ def remux_master(src, label, out, stream, in_packets, width, height):
     return out.name
 
 
-def import_one(src, orig_dir, force):
-    """Write src into orig. Return the new filename, or None on failure.
+def display_size(width, height, sar):
+    """Square-pixel display size. None when the sample aspect ratio is unreadable."""
+    factors = sar_factors(sar)
+    if factors is None:
+        return None
+    num, den = factors
+    return width * num / den, float(height)
 
-    About Full HD and larger is encoded near 1280x720. A smaller picture is
-    remuxed without scaling or re-encoding.
-    """
+
+def inspect_source(src):
+    """Probe a source. Return a dict, or None when the file cannot be a master."""
     label = src.name
-    if src.suffix.lower() not in VIDEO_EXTS:
-        print(f"skip {label}: train does not read this extension", file=sys.stderr)
-        return None
-    if not src.is_file():
-        print(f"no video: {src}", file=sys.stderr)
-        return None
-    if src.parent == orig_dir:
-        print(f"{src} is already in {orig_dir}", file=sys.stderr)
-        return None
-    out = orig_dir / f"{src.stem}.mkv"
-    if out.exists() and not force:
-        print(f"{out.name}: already in {orig_dir}", file=sys.stderr)
-        return None
     try:
         stream = probe_video(src)
         in_packets = packets_of(src)
@@ -798,28 +702,201 @@ def import_one(src, orig_dir, force):
         print(f"{label}: HDR or wide-gamut source", file=sys.stderr)
         return None
     sar = stream_text(stream, "sample_aspect_ratio")
-    full_hd = reaches_full_hd(width, height, sar)
-    if full_hd is None and width * height >= FULLHD_PIXELS:
+    size = display_size(width, height, sar)
+    if size is None:
         print(f"{label}: bad sample aspect ratio {sar or 'unset'}", file=sys.stderr)
         return None
-    if full_hd:
-        return encode_master(
-            src, label, out, stream, in_packets, width, height, sar, matrix_name,
-        )
-    return remux_master(src, label, out, stream, in_packets, width, height)
+    return {
+        "stream": stream,
+        "packets": in_packets,
+        "width": width,
+        "height": height,
+        "matrix": matrix_name,
+        "display": size,
+    }
 
 
-def degrade_files(orig_dir, low_dir, names, force):
-    scale, flags, pix_fmt, variants = load_config(active_config())
+def title_entry(catalog, root, title):
+    titles = titles_of(catalog, catalog_file(root))
+    entry = titles.get(title)
+    if not isinstance(entry, dict):
+        entry = {"origin": None, "masters": {}}
+        titles[title] = entry
+    if "origin" not in entry:
+        entry["origin"] = None
+    if not isinstance(entry.get("masters"), dict):
+        entry["masters"] = {}
+    return entry
+
+
+def remember_master(catalog, root, title, rung, path, frames, force):
+    entry = title_entry(catalog, root, title)
+    previous = entry["masters"].get(rung)
+    low = {}
+    if not force and isinstance(previous, dict) and isinstance(previous.get("low"), dict):
+        low = previous["low"]
+    record = video_record(path, frames)
+    record["low"] = low
+    entry["masters"][rung] = record
+    save_catalog(root, catalog)
+
+
+def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root):
+    """Write the planned masters that are missing. Return (filenames, failed)."""
     failed = False
-    for name in names:
-        src = orig_dir / name
-        for variant, ffmpeg_args in variants.items():
-            ok = encode_one(
-                src, low_dir, variant, ffmpeg_args,
-                scale, flags, pix_fmt, force, True,
+    names = []
+    entry = title_entry(catalog, root, title)
+    for rung, out_w, out_h, kind in planned:
+        name = master_filename(title, rung)
+        out = orig_dir / name
+        if out.exists() and not force:
+            print(f"keep {name}", flush=True)
+            if rung not in entry["masters"]:
+                try:
+                    frames = packets_of(out)
+                except RuntimeError as exc:
+                    print(f"{name}: {exc}", file=sys.stderr)
+                    failed = True
+                    continue
+                try:
+                    remember_master(catalog, root, title, rung, out, frames, False)
+                except RuntimeError as exc:
+                    print(f"{name}: {exc}", file=sys.stderr)
+                    failed = True
+                    continue
+            names.append(name)
+            continue
+        if kind == "encode":
+            wrote = encode_master(
+                src, name, out, probed["stream"], probed["packets"],
+                probed["width"], probed["height"], probed["matrix"], out_w, out_h,
             )
-            failed = failed or not ok
+        else:
+            wrote = remux_master(
+                src, name, out, probed["stream"], probed["packets"],
+                probed["width"], probed["height"],
+            )
+        if wrote is None:
+            failed = True
+            continue
+        try:
+            remember_master(catalog, root, title, rung, out, probed["packets"], force)
+        except RuntimeError as exc:
+            print(f"{name}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        names.append(name)
+    return names, failed
+
+
+def import_source(src, orig_dir, rungs, catalog, root, force):
+    """Write every rung of src. Return (filenames, failed)."""
+    label = src.name
+    if src.suffix.lower() not in VIDEO_EXTS:
+        print(f"skip {label}: train does not read this extension", file=sys.stderr)
+        return [], True
+    if not src.is_file():
+        print(f"no video: {src}", file=sys.stderr)
+        return [], True
+    if src.parent == orig_dir:
+        print(f"{src} is already in {orig_dir}", file=sys.stderr)
+        return [], True
+    probed = inspect_source(src)
+    if probed is None:
+        return [], True
+    planned = plan_masters(*probed["display"], rungs)
+    if not planned:
+        print(f"{label}: no master rung", file=sys.stderr)
+        return [], True
+    title = src.stem
+    entry = title_entry(catalog, root, title)
+    entry["origin"] = str(src.resolve())
+    save_catalog(root, catalog)
+    return produce_planned(src, title, planned, probed, orig_dir, force, catalog, root)
+
+
+def degrade_master(src, low_dir, selected, scale, flags, pix_fmt, force, strict, catalog, root):
+    """Write the selected lows of one master and record them. Return False on failure."""
+    parts = split_master_filename(src.name)
+    if parts is None:
+        print(f"{src.name}: expected <title>.<rung>.mkv", file=sys.stderr)
+        return False
+    title, rung = parts
+    entry = titles_of(catalog, catalog_file(root)).get(title)
+    masters = entry.get("masters") if isinstance(entry, dict) else None
+    master = masters.get(rung) if isinstance(masters, dict) else None
+    if not isinstance(master, dict):
+        print(f"{src.name}: not in the catalog", file=sys.stderr)
+        return False
+    if not isinstance(master.get("low"), dict):
+        master["low"] = {}
+    failed = False
+    for variant, ffmpeg_args in selected:
+        low_path = low_dir / variant / src.name
+        if low_path.is_file() and not force and variant in master["low"]:
+            print(f"keep {variant}/{src.name}", flush=True)
+            continue
+        frames = encode_one(
+            src, low_dir, variant, ffmpeg_args,
+            scale, flags, pix_fmt, force, strict,
+        )
+        if frames is None:
+            failed = True
+            continue
+        if frames < 0:
+            continue
+        try:
+            record = video_record(low_path, frames)
+        except RuntimeError as exc:
+            print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
+            failed = True
+            continue
+        if (
+            master.get("width") != record["width"] * scale
+            or master.get("height") != record["height"] * scale
+        ):
+            print(
+                f"{variant}/{src.name} is {record['width']}x{record['height']}, "
+                f"orig is {master.get('width')}x{master.get('height')}, "
+                f"expected exactly {scale}x",
+                file=sys.stderr,
+            )
+            failed = True
+            continue
+        master["low"][variant] = record
+        save_catalog(root, catalog)
+    return not failed
+
+
+def fill_from_origin(title, orig_dir, rungs, catalog, root):
+    """Encode rungs the stored origin can still supply. A missing origin is kept."""
+    entry = titles_of(catalog, catalog_file(root)).get(title)
+    if not isinstance(entry, dict):
+        return True
+    origin = entry.get("origin")
+    if not origin:
+        return True
+    src = Path(origin)
+    if not src.is_file():
+        print(f"{title}: origin is gone, masters stay", file=sys.stderr)
+        return True
+    probed = inspect_source(src)
+    if probed is None:
+        return False
+    planned = plan_masters(*probed["display"], rungs)
+    masters = entry.get("masters") if isinstance(entry.get("masters"), dict) else {}
+    missing = []
+    for item in planned:
+        rung = item[0]
+        path = orig_dir / master_filename(title, rung)
+        if rung in masters and path.is_file():
+            continue
+        missing.append(item)
+    if not missing:
+        return True
+    _names, failed = produce_planned(
+        src, title, missing, probed, orig_dir, False, catalog, root,
+    )
     return not failed
 
 
@@ -848,29 +925,27 @@ def sources_from_args(orig_dir, names):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="encode half-resolution variants of orig videos. "
+        description="encode half-resolution variants of catalog masters. "
         "`whoodeo-make-low import` writes a source into orig first",
     )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=_RecipeDefault(),
-        help="degrade recipe (default: %(default)s)",
-    )
-    parser.add_argument("--variants", help="comma-separated variant names; default is all of them")
+    parser.add_argument("--variants", help="comma-separated names from the catalog degrade list; default is all of them")
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing low video")
-    parser.add_argument("videos", nargs="*", help="filenames in orig; default encodes every missing partner")
+    parser.add_argument(
+        "videos", nargs="*",
+        help="filenames in orig; default fills missing rungs from origin and encodes every missing partner",
+    )
     return parser.parse_args(argv)
 
 
 def parse_import_args(argv):
     parser = argparse.ArgumentParser(
         prog="whoodeo-make-low import",
-        description="write sources into orig. About Full HD and larger become "
-        "10-bit 4:4:4 HEVC masters near 1280x720. Smaller sources are remuxed "
-        "without re-encoding. Low variants are written unless --no-degrade",
+        description="write sources into orig, one file per catalog rung. "
+        "A source larger than a rung is encoded down to it. A source that "
+        "already sits on a rung is remuxed. Low variants are written unless "
+        "--no-degrade",
     )
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: %(default)s)")
@@ -885,23 +960,32 @@ def import_main(argv):
     args.orig = resolve_data(args.orig)
     orig_dir = args.orig.expanduser().resolve()
     orig_dir.mkdir(parents=True, exist_ok=True)
+    root = orig_dir.parent
+    catalog = open_catalog(root, create=True)
+    where = catalog_file(root)
+    rungs = rungs_of(catalog, where)
     low_dir = None
+    selected = None
+    scale = flags = pix_fmt = None
     if not args.no_degrade:
         args.low = resolve_data(args.low)
         low_dir = args.low.expanduser().resolve()
         low_dir.mkdir(parents=True, exist_ok=True)
+        scale, flags, pix_fmt, variants = degrade_of(catalog, where)
+        selected = list(variants.items())
     failed = False
-    written = []
     for name in args.videos:
         src = Path(name).expanduser().resolve()
-        out_name = import_one(src, orig_dir, args.force)
-        if out_name is None:
-            failed = True
+        written, one_failed = import_source(src, orig_dir, rungs, catalog, root, args.force)
+        failed = failed or one_failed
+        if args.no_degrade:
             continue
-        written.append(out_name)
-    if not args.no_degrade and written:
-        if not degrade_files(orig_dir, low_dir, written, args.force):
-            failed = True
+        for master_name in written:
+            ok = degrade_master(
+                orig_dir / master_name, low_dir, selected,
+                scale, flags, pix_fmt, args.force, True, catalog, root,
+            )
+            failed = failed or not ok
     if failed:
         raise SystemExit(1)
 
@@ -915,23 +999,44 @@ def main(argv=None):
     args = parse_args(argv)
     args.orig = resolve_data(args.orig)
     args.low = resolve_data(args.low)
-    recipe = args.config if isinstance(args.config, Path) else active_config()
-    scale, scale_flags, pix_fmt, variants = load_config(recipe)
-    selected = select_variants(variants, args.variants)
     orig_dir = args.orig.expanduser().resolve()
     low_dir = args.low.expanduser().resolve()
     if not orig_dir.is_dir():
         raise SystemExit(f"no orig folder: {orig_dir}")
     low_dir.mkdir(parents=True, exist_ok=True)
-    sources, strict = sources_from_args(orig_dir, args.videos)
+    root = orig_dir.parent
+    catalog = open_catalog(root, create=False)
+    where = catalog_file(root)
+    scale, scale_flags, pix_fmt, variants = degrade_of(catalog, where)
+    selected = select_variants(variants, args.variants)
+    rungs = rungs_of(catalog, where)
+    titles = titles_of(catalog, where)
     failed = False
+    if not args.videos:
+        for title in list(titles):
+            if not fill_from_origin(title, orig_dir, rungs, catalog, root):
+                failed = True
+        sources = []
+        for title, entry in titles.items():
+            masters = entry.get("masters") if isinstance(entry, dict) else None
+            if not isinstance(masters, dict):
+                continue
+            for rung in masters:
+                path = orig_dir / master_filename(title, rung)
+                if path.is_file():
+                    sources.append(path)
+                else:
+                    print(f"skip {path.name}: file missing", file=sys.stderr)
+                    failed = True
+        strict = False
+    else:
+        sources, strict = sources_from_args(orig_dir, args.videos)
     for src in sources:
-        for variant, ffmpeg_args in selected:
-            ok = encode_one(
-                src, low_dir, variant, ffmpeg_args,
-                scale, scale_flags, pix_fmt, args.force, strict,
-            )
-            failed = failed or not ok
+        ok = degrade_master(
+            src, low_dir, selected, scale, scale_flags, pix_fmt,
+            args.force, strict, catalog, root,
+        )
+        failed = failed or not ok
     if failed:
         raise SystemExit(1)
 
