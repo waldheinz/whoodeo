@@ -8,11 +8,14 @@ already sits on a rung is remuxed as it is: the video bitstream stays, and
 the audio is dropped. Smaller rungs are still encoded from that same
 source. Nothing is upscaled. The file is <title>.<rung>.mkv. Low variants
 come from the catalog's degrade list and are written unless `--no-degrade`
-is set, under the same filename.
+is set, under the same filename. One master is finished, variants included,
+before the next master starts.
 
 The plain command writes the missing variants of masters already in the
 catalog. With no filenames it also encodes any rung the catalog's origin
-file can still supply. Variant directories live under the low root.
+file can still supply, and degrades that master before the next one.
+Variant directories live under the low root. `--dry-run` prints each encode
+or remux the command would start and writes nothing.
 """
 
 import argparse
@@ -26,6 +29,7 @@ from whoodeo.catalog import EnvPath, resolve_data
 from whoodeo.library import (
     catalog_file,
     degrade_of,
+    empty_catalog,
     master_filename,
     open_catalog,
     plan_masters,
@@ -741,10 +745,41 @@ def remember_master(catalog, root, title, rung, path, frames, force):
     save_catalog(root, catalog)
 
 
-def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root):
-    """Write the planned masters that are missing. Return (filenames, failed)."""
+def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root, dry_run=False):
+    """Write the planned masters that are missing. Return (filenames, failed).
+
+    `dry_run` prints the master line and writes nothing. A file that is
+    already present is reported as ready either way.
+    """
     failed = False
     names = []
+    if dry_run:
+        for rung, out_w, out_h, kind in planned:
+            name = master_filename(title, rung)
+            out = orig_dir / name
+            if out.exists() and not force:
+                names.append(name)
+                continue
+            if kind == "encode":
+                if input_matrix(probed["matrix"]) is None:
+                    print(
+                        f"{name}: unsupported color matrix {probed['matrix']}",
+                        file=sys.stderr,
+                    )
+                    failed = True
+                    continue
+                print(
+                    f"import {name}  {probed['width']}x{probed['height']} -> "
+                    f"{out_w}x{out_h}  {MASTER_PIX_FMT} crf 12",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"import {name}  {probed['width']}x{probed['height']}  remux",
+                    flush=True,
+                )
+            names.append(name)
+        return names, failed
     entry = title_entry(catalog, root, title)
     for rung, out_w, out_h, kind in planned:
         name = master_filename(title, rung)
@@ -789,34 +824,123 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root)
     return names, failed
 
 
-def import_source(src, orig_dir, rungs, catalog, root, force):
-    """Write every rung of src. Return (filenames, failed)."""
+def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False):
+    """Record src as the title's origin. Return (title, planned, probed), or None.
+
+    `dry_run` leaves the catalog untouched.
+    """
     label = src.name
     if src.suffix.lower() not in VIDEO_EXTS:
         print(f"skip {label}: train does not read this extension", file=sys.stderr)
-        return [], True
+        return None
     if not src.is_file():
         print(f"no video: {src}", file=sys.stderr)
-        return [], True
+        return None
     if src.parent == orig_dir:
         print(f"{src} is already in {orig_dir}", file=sys.stderr)
-        return [], True
+        return None
     probed = inspect_source(src)
     if probed is None:
-        return [], True
+        return None
     planned = plan_masters(*probed["display"], rungs)
     if not planned:
         print(f"{label}: no master rung", file=sys.stderr)
-        return [], True
+        return None
     title = src.stem
+    if dry_run:
+        return title, planned, probed
     entry = title_entry(catalog, root, title)
     entry["origin"] = str(src.resolve())
     save_catalog(root, catalog)
-    return produce_planned(src, title, planned, probed, orig_dir, force, catalog, root)
+    return title, planned, probed
 
 
-def degrade_master(src, low_dir, selected, scale, flags, pix_fmt, force, strict, catalog, root):
-    """Write the selected lows of one master and record them. Return False on failure."""
+def planned_geometry(item, probed):
+    """Size a master would have before its file exists.
+
+    An encode is square pixels at the planned size. A remux keeps the source.
+    """
+    _rung, out_w, out_h, kind = item
+    if kind == "encode":
+        return (out_w, out_h)
+    return (
+        probed["width"],
+        probed["height"],
+        stream_text(probed["stream"], "sample_aspect_ratio") or None,
+    )
+
+
+def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry):
+    """Print each low encode that would be started. Write nothing.
+
+    `geometry` is None to measure an existing master, or the size a missing
+    master would have. Return False when an encode would be refused.
+    """
+    failed = False
+    measured = None
+    for variant, ffmpeg_args in selected:
+        name = src.name
+        label = f"{variant}/{name}"
+        if src.suffix.lower() not in VIDEO_EXTS:
+            if strict:
+                print(f"skip {label}: train does not read this extension", file=sys.stderr)
+                failed = True
+            continue
+        codec = codec_of(ffmpeg_args)
+        if src.suffix.lower() == ".webm" and codec not in WEBM_CODECS:
+            print(
+                f"skip {label}: webm cannot hold codec {codec or '(unset)'}",
+                file=sys.stderr,
+            )
+            if strict:
+                failed = True
+            continue
+        low_path = low_dir / variant / name
+        if low_path.is_file() and not force:
+            continue
+        if measured is None:
+            if geometry is None:
+                width, height = size_of(src)
+                sar = sample_aspect(src)
+            else:
+                width, height = geometry[0], geometry[1]
+                sar = geometry[2] if len(geometry) > 2 else None
+            measured = (width, height, sar)
+        width, height, sar = measured
+        if not square_pixels(sar):
+            print(
+                f"{label} has sample aspect ratio {sar}; stored pixels are not square",
+                file=sys.stderr,
+            )
+            failed = True
+            continue
+        if width % (scale * 2) or height % (scale * 2):
+            print(
+                f"{label} is {width}x{height}. Both sides must be divisible by "
+                f"{scale * 2} so the 1/{scale} frame is even.",
+                file=sys.stderr,
+            )
+            failed = True
+            continue
+        low_w = width // scale
+        low_h = height // scale
+        print(
+            f"encode {label}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}",
+            flush=True,
+        )
+    return not failed
+
+
+def degrade_master(
+    src, low_dir, selected, scale, flags, pix_fmt, force, strict, catalog, root,
+    dry_run=False, geometry=None, unlisted=False,
+):
+    """Write the selected lows of one master and record them. Return False on failure.
+
+    `dry_run` only prints the encode lines. `geometry` is the size of a master
+    that is not on disk yet. `unlisted` allows an on-disk file the catalog
+    does not name yet; a real run would record it before degrading.
+    """
     parts = split_master_filename(src.name)
     if parts is None:
         print(f"{src.name}: expected <title>.<rung>.mkv", file=sys.stderr)
@@ -826,8 +950,14 @@ def degrade_master(src, low_dir, selected, scale, flags, pix_fmt, force, strict,
     masters = entry.get("masters") if isinstance(entry, dict) else None
     master = masters.get(rung) if isinstance(masters, dict) else None
     if not isinstance(master, dict):
-        print(f"{src.name}: not in the catalog", file=sys.stderr)
-        return False
+        if not (dry_run and (geometry is not None or unlisted)):
+            print(f"{src.name}: not in the catalog", file=sys.stderr)
+            return False
+        master = {"low": {}}
+    if dry_run:
+        return list_low_encodes(
+            src, low_dir, selected, scale, force, strict, geometry,
+        )
     if not isinstance(master.get("low"), dict):
         master["low"] = {}
     failed = False
@@ -868,35 +998,98 @@ def degrade_master(src, low_dir, selected, scale, flags, pix_fmt, force, strict,
     return not failed
 
 
-def fill_from_origin(title, orig_dir, rungs, catalog, root):
-    """Encode rungs the stored origin can still supply. A missing origin is kept."""
+def finish_title(
+    title, orig_dir, rungs, low_dir, selected,
+    scale, flags, pix_fmt, force, strict, catalog, root, dry_run=False,
+):
+    """Degrade one master before the next one is encoded.
+
+    Masters already on disk come first, largest planned rung first. A missing
+    rung is encoded from origin and degraded before the next missing rung.
+    A missing origin leaves the written masters in place. `dry_run` lists
+    those encodes and writes nothing. Return False when a step fails.
+    """
     entry = titles_of(catalog, catalog_file(root)).get(title)
     if not isinstance(entry, dict):
         return True
+    failed = False
+    planned = []
+    src = None
+    probed = None
     origin = entry.get("origin")
-    if not origin:
-        return True
-    src = Path(origin)
-    if not src.is_file():
-        print(f"{title}: origin is gone, masters stay", file=sys.stderr)
-        return True
-    probed = inspect_source(src)
-    if probed is None:
-        return False
-    planned = plan_masters(*probed["display"], rungs)
-    masters = entry.get("masters") if isinstance(entry.get("masters"), dict) else {}
-    missing = []
+    if origin:
+        src = Path(origin)
+        if not src.is_file():
+            print(f"{title}: origin is gone, masters stay", file=sys.stderr)
+        else:
+            probed = inspect_source(src)
+            if probed is None:
+                failed = True
+            else:
+                planned = plan_masters(*probed["display"], rungs)
+
+    def degrade_path(path, geometry=None, unlisted=False):
+        nonlocal failed
+        ok = degrade_master(
+            path, low_dir, selected, scale, flags, pix_fmt,
+            force, strict, catalog, root,
+            dry_run=dry_run, geometry=geometry, unlisted=unlisted,
+        )
+        failed = failed or not ok
+
+    def masters_of():
+        masters = entry.get("masters")
+        if isinstance(masters, dict):
+            return masters
+        return {}
+
+    seen = set()
+    planned_rungs = {item[0] for item in planned}
     for item in planned:
         rung = item[0]
         path = orig_dir / master_filename(title, rung)
-        if rung in masters and path.is_file():
+        if not path.is_file():
             continue
-        missing.append(item)
-    if not missing:
-        return True
-    _names, failed = produce_planned(
-        src, title, missing, probed, orig_dir, False, catalog, root,
-    )
+        unlisted = rung not in masters_of()
+        if unlisted:
+            names, one_failed = produce_planned(
+                src, title, [item], probed, orig_dir, False, catalog, root,
+                dry_run=dry_run,
+            )
+            failed = failed or one_failed
+            if one_failed or path.name not in names:
+                continue
+        seen.add(rung)
+        degrade_path(path, unlisted=dry_run and unlisted)
+    for rung in list(masters_of()):
+        if rung in seen or rung in planned_rungs:
+            continue
+        path = orig_dir / master_filename(title, rung)
+        if not path.is_file():
+            print(f"skip {path.name}: file missing", file=sys.stderr)
+            failed = True
+            continue
+        seen.add(rung)
+        degrade_path(path)
+    for item in planned:
+        rung = item[0]
+        if rung in seen:
+            continue
+        path = orig_dir / master_filename(title, rung)
+        names, one_failed = produce_planned(
+            src, title, [item], probed, orig_dir, False, catalog, root,
+            dry_run=dry_run,
+        )
+        failed = failed or one_failed
+        ready = path.name in names and (path.is_file() or dry_run)
+        if one_failed or not ready:
+            if not path.is_file():
+                print(f"skip {path.name}: file missing", file=sys.stderr)
+                failed = True
+            continue
+        seen.add(rung)
+        geometry = planned_geometry(item, probed) if dry_run and not path.is_file() else None
+        degrade_path(path, geometry=geometry)
     return not failed
 
 
@@ -925,7 +1118,8 @@ def sources_from_args(orig_dir, names):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="encode half-resolution variants of catalog masters. "
+        description="encode half-resolution variants of catalog masters, "
+        "finishing one master before the next. "
         "`whoodeo-make-low import` writes a source into orig first",
     )
     parser.add_argument("--variants", help="comma-separated names from the catalog degrade list; default is all of them")
@@ -933,8 +1127,12 @@ def parse_args(argv):
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing low video")
     parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="list each encode or remux that would be written, and write nothing",
+    )
+    parser.add_argument(
         "videos", nargs="*",
-        help="filenames in orig; default fills missing rungs from origin and encodes every missing partner",
+        help="filenames in orig; default also encodes each missing rung from origin and degrades that master before the next",
     )
     return parser.parse_args(argv)
 
@@ -944,13 +1142,17 @@ def parse_import_args(argv):
         prog="whoodeo-make-low import",
         description="write sources into orig, one file per catalog rung. "
         "A source larger than a rung is encoded down to it. A source that "
-        "already sits on a rung is remuxed. Low variants are written unless "
-        "--no-degrade",
+        "already sits on a rung is remuxed. Each master's low variants are "
+        "written before the next master, unless --no-degrade",
     )
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
     parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: %(default)s)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing master")
     parser.add_argument("--no-degrade", action="store_true", help="do not write the low variants of each new master")
+    parser.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="list each encode or remux that would be written, and write nothing",
+    )
     parser.add_argument("videos", nargs="+", help="source videos to write into orig")
     return parser.parse_args(argv)
 
@@ -959,9 +1161,15 @@ def import_main(argv):
     args = parse_import_args(argv)
     args.orig = resolve_data(args.orig)
     orig_dir = args.orig.expanduser().resolve()
-    orig_dir.mkdir(parents=True, exist_ok=True)
     root = orig_dir.parent
-    catalog = open_catalog(root, create=True)
+    if args.dry_run:
+        if catalog_file(root).is_file():
+            catalog = open_catalog(root, create=False)
+        else:
+            catalog = empty_catalog()
+    else:
+        orig_dir.mkdir(parents=True, exist_ok=True)
+        catalog = open_catalog(root, create=True)
     where = catalog_file(root)
     rungs = rungs_of(catalog, where)
     low_dir = None
@@ -970,22 +1178,37 @@ def import_main(argv):
     if not args.no_degrade:
         args.low = resolve_data(args.low)
         low_dir = args.low.expanduser().resolve()
-        low_dir.mkdir(parents=True, exist_ok=True)
+        if not args.dry_run:
+            low_dir.mkdir(parents=True, exist_ok=True)
         scale, flags, pix_fmt, variants = degrade_of(catalog, where)
         selected = list(variants.items())
     failed = False
     for name in args.videos:
         src = Path(name).expanduser().resolve()
-        written, one_failed = import_source(src, orig_dir, rungs, catalog, root, args.force)
-        failed = failed or one_failed
-        if args.no_degrade:
+        prepared = prepare_import(src, orig_dir, rungs, catalog, root, dry_run=args.dry_run)
+        if prepared is None:
+            failed = True
             continue
-        for master_name in written:
-            ok = degrade_master(
-                orig_dir / master_name, low_dir, selected,
-                scale, flags, pix_fmt, args.force, True, catalog, root,
+        title, planned, probed = prepared
+        for item in planned:
+            written, one_failed = produce_planned(
+                src, title, [item], probed, orig_dir, args.force, catalog, root,
+                dry_run=args.dry_run,
             )
-            failed = failed or not ok
+            failed = failed or one_failed
+            if args.no_degrade:
+                continue
+            for master_name in written:
+                path = orig_dir / master_name
+                geometry = None
+                if args.dry_run and (args.force or not path.is_file()):
+                    geometry = planned_geometry(item, probed)
+                ok = degrade_master(
+                    path, low_dir, selected,
+                    scale, flags, pix_fmt, args.force, True, catalog, root,
+                    dry_run=args.dry_run, geometry=geometry,
+                )
+                failed = failed or not ok
     if failed:
         raise SystemExit(1)
 
@@ -1003,7 +1226,8 @@ def main(argv=None):
     low_dir = args.low.expanduser().resolve()
     if not orig_dir.is_dir():
         raise SystemExit(f"no orig folder: {orig_dir}")
-    low_dir.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        low_dir.mkdir(parents=True, exist_ok=True)
     root = orig_dir.parent
     catalog = open_catalog(root, create=False)
     where = catalog_file(root)
@@ -1014,29 +1238,20 @@ def main(argv=None):
     failed = False
     if not args.videos:
         for title in list(titles):
-            if not fill_from_origin(title, orig_dir, rungs, catalog, root):
-                failed = True
-        sources = []
-        for title, entry in titles.items():
-            masters = entry.get("masters") if isinstance(entry, dict) else None
-            if not isinstance(masters, dict):
-                continue
-            for rung in masters:
-                path = orig_dir / master_filename(title, rung)
-                if path.is_file():
-                    sources.append(path)
-                else:
-                    print(f"skip {path.name}: file missing", file=sys.stderr)
-                    failed = True
-        strict = False
+            ok = finish_title(
+                title, orig_dir, rungs, low_dir, selected,
+                scale, scale_flags, pix_fmt, args.force, False, catalog, root,
+                dry_run=args.dry_run,
+            )
+            failed = failed or not ok
     else:
         sources, strict = sources_from_args(orig_dir, args.videos)
-    for src in sources:
-        ok = degrade_master(
-            src, low_dir, selected, scale, scale_flags, pix_fmt,
-            args.force, strict, catalog, root,
-        )
-        failed = failed or not ok
+        for src in sources:
+            ok = degrade_master(
+                src, low_dir, selected, scale, scale_flags, pix_fmt,
+                args.force, strict, catalog, root, dry_run=args.dry_run,
+            )
+            failed = failed or not ok
     if failed:
         raise SystemExit(1)
 
