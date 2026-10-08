@@ -2,15 +2,15 @@
 
 The recipe is a YAML file. Masters live in the data directory's orig/ and
 degraded variants in its low/. catalog.json beside those folders names the
-pairs, their sizes, and their durations. Training reads that file once at
-startup. An optional variants regex is searched against each path relative
-to low/, such as x264-crf28/film.720.mkv. Without it, every pair is used.
-A step draws one film to pick a resolution, then fills the batch with films
-of that resolution. The draw is without replacement when that resolution has
-at least as many films as the batch, and with replacement when it has fewer,
-so a lone size still fills whole batches. Each film draws one variant per
-sample it received, with the same rule. Two time spans per variant are held
-out for validation.
+pairs, their sizes, and the frame count of each title. Training reads that
+file once at startup. An optional variants regex is searched against each
+path relative to low/, such as x264-crf28/film.720.mkv. Without it, every
+pair is used. A step draws one film to pick a resolution, then fills the
+batch with films of that resolution. The draw is without replacement when
+that resolution has at least as many films as the batch, and with replacement
+when it has fewer, so a lone size still fills whole batches. Each film draws
+one variant per sample it received, with the same rule. Two spans of frames
+are held out for validation.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. A frame read opens the video and closes it before the next read.
@@ -86,30 +86,45 @@ def get_device():
     return torch.device("cpu")
 
 
-def holdout_ranges(duration, fraction):
-    span = duration * fraction / 2
+def holdout_ranges(count, fraction):
+    span = count * fraction / 2
     ranges = []
-    for start in (0.30 * duration, 0.70 * duration):
-        end = min(duration, start + span)
+    for start in (0.30 * count, 0.70 * count):
+        end = min(count, start + span)
         if end > start:
             ranges.append((start, end))
     return ranges
 
 
-def in_ranges(time_sec, ranges):
-    return any(start <= time_sec < end for start, end in ranges)
+def in_ranges(index, ranges):
+    return any(start <= index < end for start, end in ranges)
+
+
+def frame_index(stamp, rate):
+    """Display index of a presentation time at this frame rate."""
+    return round(stamp * float(rate))
 
 
 class Clip:
     """A video named in the catalog. Nothing stays open between reads."""
 
-    def __init__(self, path, width, height, duration):
+    def __init__(self, path, width, height, frames):
         self.path = Path(path)
         self.width = width
         self.height = height
-        self.duration = duration
+        self.frames = frames
 
-    def frames_around(self, time_sec, radius):
+    def frames_around(self, index, radius):
+        """Frames centered on this display index.
+
+        The seek timestamp only reaches a keyframe. The index is the frame
+        rate times the presentation time, and each kept step has to be one
+        frame. A gap, or a landing past the requested index, stops the read.
+        """
+        if index < 0 or index >= self.frames:
+            raise RuntimeError(
+                f"{self.path.name}: frame {index} outside 0..{self.frames - 1}"
+            )
         container = av.open(str(self.path))
         try:
             stream = container.streams.video[0]
@@ -120,29 +135,41 @@ class Clip:
                     f"{self.path.name} is {width}x{height}, "
                     f"catalog says {self.width}x{self.height}"
                 )
-            if not stream.average_rate:
+            rate = stream.average_rate
+            if not rate:
                 raise RuntimeError(f"no frame rate: {self.path}")
-            fps = float(stream.average_rate)
-            pad = (radius + 1) / fps
-            start = max(0.0, time_sec - pad)
-            container.seek(int(start * av.time_base), backward=True, any_frame=False)
-            frames = []
-            times = []
+            first = max(0, index - radius)
+            last = min(self.frames - 1, index + radius)
+            hint = max(0.0, (first - 1) / float(rate))
+            container.seek(int(hint * av.time_base), backward=True, any_frame=False)
+            found = {}
+            previous = None
             for frame in container.decode(stream):
-                if frame.time is None or frame.time + 1e-3 < start:
+                if frame.time is None:
+                    raise RuntimeError(f"no timestamp: {self.path.name}")
+                current = frame_index(frame.time, rate)
+                if previous is None:
+                    if current > first:
+                        raise RuntimeError(
+                            f"{self.path.name}: seek landed on frame {current}, "
+                            f"needed {first}"
+                        )
+                elif current != previous + 1:
+                    raise RuntimeError(
+                        f"{self.path.name}: frame {previous} is followed by {current}"
+                    )
+                previous = current
+                if current < first:
                     continue
-                frames.append(frame_tensor(frame))
-                times.append(frame.time)
-                if frame.time >= time_sec + pad and len(frames) >= radius * 2 + 1:
+                found[current] = frame_tensor(frame)
+                if current >= last:
                     break
-            if not frames:
-                raise RuntimeError(f"no frames near {time_sec:.3f}s in {self.path.name}")
-            center = min(range(len(times)), key=lambda i: abs(times[i] - time_sec))
-            picked = []
-            last = len(frames) - 1
-            for delta in range(-radius, radius + 1):
-                picked.append(frames[min(max(center + delta, 0), last)])
-            return picked
+            if first not in found or last not in found:
+                raise RuntimeError(f"no frame {index} in {self.path.name}")
+            return [
+                found[min(max(index + delta, 0), self.frames - 1)]
+                for delta in range(-radius, radius + 1)
+            ]
         finally:
             container.close()
 
@@ -151,14 +178,14 @@ class Clip:
 class Variant:
     name: str
     low: Clip
-    duration: float
-    holdouts: list = field(default_factory=list)
 
 
 @dataclass
 class Film:
     name: str
     orig: Clip
+    frames: int
+    holdouts: list
     variants: list = field(default_factory=list)
 
 
@@ -175,6 +202,13 @@ class FoundFilms:
 def _number(record, key, label):
     value = record.get(key) if isinstance(record, dict) else None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SystemExit(f"{label}: missing {key}")
+    return value
+
+
+def _count(record, key, label):
+    value = record.get(key) if isinstance(record, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise SystemExit(f"{label}: missing {key}")
     return value
 
@@ -200,6 +234,8 @@ def load_films(root, holdout, variants=None):
         if not isinstance(masters, dict):
             problems.append(f"skip {title}: no masters")
             continue
+        frames = _count(entry, "frames", title)
+        holdouts = holdout_ranges(frames, holdout)
         for rung, master in masters.items():
             name = master_filename(title, rung)
             orig_path = orig_dir / name
@@ -211,42 +247,51 @@ def load_films(root, holdout, variants=None):
                 continue
             orig_w = int(_number(master, "width", name))
             orig_h = int(_number(master, "height", name))
-            orig_duration = float(_number(master, "duration", name))
             lows = master.get("low")
-            if not isinstance(lows, dict):
+            if not isinstance(lows, list):
                 problems.append(f"skip {name}: no lows")
                 continue
+            names = []
+            for variant_name in lows:
+                if (
+                    not isinstance(variant_name, str)
+                    or not variant_name
+                    or "/" in variant_name
+                    or variant_name in {".", ".."}
+                ):
+                    problems.append(f"skip {name}: bad variant name")
+                    continue
+                if variant_name not in names:
+                    names.append(variant_name)
+            low_w = orig_w // SCALE
+            low_h = orig_h // SCALE
             variants_here = []
-            for variant_name in sorted(lows):
-                low = lows[variant_name]
+            for variant_name in sorted(names):
                 rel = f"{variant_name}/{name}"
                 low_path = low_dir / variant_name / name
-                if not isinstance(low, dict) or not low_path.is_file():
+                if not low_path.is_file():
                     problems.append(f"skip {rel}: file missing")
                     continue
                 total += 1
                 if pattern is not None and pattern.search(rel) is None:
                     continue
-                low_w = int(_number(low, "width", rel))
-                low_h = int(_number(low, "height", rel))
-                if (orig_h, orig_w) != (low_h * SCALE, low_w * SCALE):
+                if orig_w % SCALE or orig_h % SCALE:
                     raise SystemExit(
-                        f"{rel} is {low_w}x{low_h}, "
-                        f"orig is {orig_w}x{orig_h}, expected exactly {SCALE}x"
+                        f"{name} is {orig_w}x{orig_h}, "
+                        f"both sides must be divisible by {SCALE}"
                     )
                 kept += 1
-                duration = min(orig_duration, float(_number(low, "duration", rel)))
                 variants_here.append(Variant(
                     name=variant_name,
-                    low=Clip(low_path, low_w, low_h, duration),
-                    duration=duration,
-                    holdouts=holdout_ranges(duration, holdout),
+                    low=Clip(low_path, low_w, low_h, frames),
                 ))
             if not variants_here:
                 continue
             film = Film(
                 name=f"{title}.{rung}",
-                orig=Clip(orig_path, orig_w, orig_h, orig_duration),
+                orig=Clip(orig_path, orig_w, orig_h, frames),
+                frames=frames,
+                holdouts=holdouts,
                 variants=variants_here,
             )
             ordered.append((f"{title}.mkv", orig_w * orig_h, film))
@@ -265,20 +310,20 @@ def require_films(found, root, variants):
     raise SystemExit(f"no video pairs in {root / 'orig'} and {root / 'low'}")
 
 
-def sample_time(rng, film, variant, split):
+def sample_index(rng, film, split):
     for _ in range(10000):
-        time_sec = rng.uniform(0.0, variant.duration)
-        inside = in_ranges(time_sec, variant.holdouts)
+        index = rng.randrange(film.frames)
+        inside = in_ranges(index, film.holdouts)
         if split == "val" and inside:
-            return time_sec
+            return index
         if split == "train" and not inside:
-            return time_sec
-    raise RuntimeError(f"could not sample a {split} time in {film.name} {variant.name}")
+            return index
+    raise RuntimeError(f"could not sample a {split} frame in {film.name}")
 
 
-def load_sample(film, variant, time_sec, radius):
-    low_frames = variant.low.frames_around(time_sec, radius)
-    hr = film.orig.frames_around(time_sec, radius)[radius]
+def load_sample(film, variant, index, radius):
+    low_frames = variant.low.frames_around(index, radius)
+    hr = film.orig.frames_around(index, radius)[radius]
     stacked = torch.cat(low_frames, dim=0)
     return stacked, hr
 
@@ -301,7 +346,7 @@ def frame_size(film):
 
 
 def make_batch_specs(rng, films, split, count):
-    """count times that share a low resolution.
+    """count frame indexes that share a low resolution.
 
     One uniform film picks the resolution. The samples are films of that
     resolution, without replacement when the group has at least count films
@@ -330,7 +375,7 @@ def make_batch_specs(rng, films, split, count):
         specs.append((
             film_index,
             variant_index,
-            sample_time(rng, film, film.variants[variant_index], split),
+            sample_index(rng, film, split),
         ))
     return specs
 
@@ -338,9 +383,9 @@ def make_batch_specs(rng, films, split, count):
 def batch_from_specs(films, specs, radius):
     lows = []
     highs = []
-    for film_index, variant_index, time_sec in specs:
+    for film_index, variant_index, index in specs:
         film = films[film_index]
-        low, high = load_sample(film, film.variants[variant_index], time_sec, radius)
+        low, high = load_sample(film, film.variants[variant_index], index, radius)
         lows.append(low)
         highs.append(high)
     return torch.stack(lows), torch.stack(highs)
@@ -417,7 +462,7 @@ class BatchLoader:
         try:
             while not self._stop.is_set():
                 specs = make_batch_specs(self._rng, films, "train", self._batch)
-                film_index, variant_index, _time_sec = specs[0]
+                film_index, variant_index, _index = specs[0]
                 variant = films[film_index].variants[variant_index]
                 low, high = batch_from_specs(films, specs, self._radius)
                 box = None

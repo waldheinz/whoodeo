@@ -1,8 +1,10 @@
 """Index of the training masters and their degraded variants.
 
 catalog.json sits beside orig/ and low/. It holds the rung list, the degrade
-recipe, and the titles. One title can have several masters, each named
-<title>.<rung>.mkv, and the lows repeat that name under their variant
+recipe, and the titles. frames on a title is the packet count shared by
+every rung. One title can have several masters, each named
+<title>.<rung>.mkv. A master records its width, height, and the names of
+its low variants. Those files repeat the master name under their variant
 directory. origin is the file a later rung is encoded from. It may be null.
 A missing source leaves the masters that are already written.
 
@@ -136,25 +138,32 @@ def save_catalog(root, data):
     os.replace(tmp, path)
 
 
-def measure_clip(path):
-    """Width, height, and duration. The container is closed before return.
-
-    Duration matches the value training used to read from an open clip:
-    the container duration in seconds.
-    """
+def picture_size(path):
+    """Stored width and height. The container is closed before return."""
     import av
 
     container = av.open(str(path))
     try:
         stream = container.streams.video[0]
-        if not container.duration:
-            raise RuntimeError(f"no duration: {path}")
         width = stream.codec_context.width
         height = stream.codec_context.height
-        duration = container.duration / av.time_base
     finally:
         container.close()
-    return width, height, duration
+    if not width or not height:
+        raise RuntimeError(f"no video size: {path}")
+    return width, height
+
+
+def same_frame_count(entry, title, frames):
+    """Record this packet count, or reject a title that already differs."""
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
+        raise RuntimeError(f"{title}: bad frame count {frames!r}")
+    current = entry.get("frames")
+    if current is None:
+        entry["frames"] = frames
+        return
+    if current != frames:
+        raise RuntimeError(f"{title}: {frames} frames, catalog says {current}")
 
 
 def _where(path):
@@ -269,11 +278,3 @@ def open_catalog(root, create=False):
     return data
 
 
-def video_record(path, frames):
-    width, height, duration = measure_clip(path)
-    return {
-        "width": width,
-        "height": height,
-        "frames": frames,
-        "duration": duration,
-    }

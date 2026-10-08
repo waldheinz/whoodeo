@@ -33,11 +33,12 @@ from whoodeo.library import (
     master_filename,
     open_catalog,
     plan_masters,
+    picture_size,
     rungs_of,
+    same_frame_count,
     save_catalog,
     split_master_filename,
     titles_of,
-    video_record,
 )
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
@@ -735,13 +736,13 @@ def title_entry(catalog, root, title):
 
 def remember_master(catalog, root, title, rung, path, frames, force):
     entry = title_entry(catalog, root, title)
+    width, height = picture_size(path)
+    same_frame_count(entry, title, frames)
     previous = entry["masters"].get(rung)
-    low = {}
-    if not force and isinstance(previous, dict) and isinstance(previous.get("low"), dict):
-        low = previous["low"]
-    record = video_record(path, frames)
-    record["low"] = low
-    entry["masters"][rung] = record
+    low = []
+    if not force and isinstance(previous, dict) and isinstance(previous.get("low"), list):
+        low = list(previous["low"])
+    entry["masters"][rung] = {"width": width, "height": height, "low": low}
     save_catalog(root, catalog)
 
 
@@ -850,6 +851,13 @@ def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False):
     if dry_run:
         return title, planned, probed
     entry = title_entry(catalog, root, title)
+    try:
+        same_frame_count(entry, title, probed["packets"])
+    except RuntimeError as exc:
+        if not entry.get("masters") and entry.get("origin") is None:
+            titles_of(catalog, catalog_file(root)).pop(title, None)
+        print(exc, file=sys.stderr)
+        return None
     entry["origin"] = str(src.resolve())
     save_catalog(root, catalog)
     return title, planned, probed
@@ -953,13 +961,14 @@ def degrade_master(
         if not (dry_run and (geometry is not None or unlisted)):
             print(f"{src.name}: not in the catalog", file=sys.stderr)
             return False
-        master = {"low": {}}
+        master = {"low": []}
     if dry_run:
         return list_low_encodes(
             src, low_dir, selected, scale, force, strict, geometry,
         )
-    if not isinstance(master.get("low"), dict):
-        master["low"] = {}
+    if not isinstance(master.get("low"), list):
+        print(f"{src.name}: low variants must be a list", file=sys.stderr)
+        return False
     failed = False
     for variant, ffmpeg_args in selected:
         low_path = low_dir / variant / src.name
@@ -975,25 +984,31 @@ def degrade_master(
             continue
         if frames < 0:
             continue
+        if entry.get("frames") != frames:
+            print(
+                f"{variant}/{src.name}: {frames} frames, "
+                f"catalog says {entry.get('frames')}",
+                file=sys.stderr,
+            )
+            failed = True
+            continue
         try:
-            record = video_record(low_path, frames)
+            low_w, low_h = picture_size(low_path)
         except RuntimeError as exc:
             print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
             failed = True
             continue
-        if (
-            master.get("width") != record["width"] * scale
-            or master.get("height") != record["height"] * scale
-        ):
+        if master.get("width") != low_w * scale or master.get("height") != low_h * scale:
             print(
-                f"{variant}/{src.name} is {record['width']}x{record['height']}, "
+                f"{variant}/{src.name} is {low_w}x{low_h}, "
                 f"orig is {master.get('width')}x{master.get('height')}, "
                 f"expected exactly {scale}x",
                 file=sys.stderr,
             )
             failed = True
             continue
-        master["low"][variant] = record
+        if variant not in master["low"]:
+            master["low"].append(variant)
         save_catalog(root, catalog)
     return not failed
 
