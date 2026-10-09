@@ -16,6 +16,10 @@ catalog. With no filenames it also encodes any rung the catalog's origin
 file can still supply, and degrades that master before the next one.
 Variant directories live under the low root. `--dry-run` prints each encode
 or remux the command would start and writes nothing.
+
+`whoodeo-make-low stats` prints one row per master size. A film is a master
+that already has a low file. Pairs count finished files from the catalog's
+degrade list, and frames are that master's frame count once.
 """
 
 import argparse
@@ -683,11 +687,14 @@ def display_size(width, height, sar):
 
 
 def inspect_source(src):
-    """Probe a source. Return a dict, or None when the file cannot be a master."""
+    """Probe a source header. Return a dict, or None when the file cannot be a master.
+
+    The packet count stays unset. Counting reads every packet, so it waits
+    until a missing master is written.
+    """
     label = src.name
     try:
         stream = probe_video(src)
-        in_packets = packets_of(src)
     except (RuntimeError, json.JSONDecodeError) as exc:
         print(f"{label}: {exc}", file=sys.stderr)
         return None
@@ -713,12 +720,20 @@ def inspect_source(src):
         return None
     return {
         "stream": stream,
-        "packets": in_packets,
         "width": width,
         "height": height,
         "matrix": matrix_name,
         "display": size,
     }
+
+
+def source_packets(src, probed):
+    """Packet count of this origin. The first missing master pays for the read."""
+    cached = probed.get("packets")
+    if cached is None:
+        cached = packets_of(src)
+        probed["packets"] = cached
+    return cached
 
 
 def title_entry(catalog, root, title):
@@ -802,21 +817,28 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
                     continue
             names.append(name)
             continue
+        try:
+            frames = source_packets(src, probed)
+            same_frame_count(entry, title, frames)
+        except RuntimeError as exc:
+            print(f"{name}: {exc}", file=sys.stderr)
+            failed = True
+            continue
         if kind == "encode":
             wrote = encode_master(
-                src, name, out, probed["stream"], probed["packets"],
+                src, name, out, probed["stream"], frames,
                 probed["width"], probed["height"], probed["matrix"], out_w, out_h,
             )
         else:
             wrote = remux_master(
-                src, name, out, probed["stream"], probed["packets"],
+                src, name, out, probed["stream"], frames,
                 probed["width"], probed["height"],
             )
         if wrote is None:
             failed = True
             continue
         try:
-            remember_master(catalog, root, title, rung, out, probed["packets"], force)
+            remember_master(catalog, root, title, rung, out, frames, force)
         except RuntimeError as exc:
             print(f"{name}: {exc}", file=sys.stderr)
             failed = True
@@ -825,10 +847,21 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
     return names, failed
 
 
-def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False):
+def masters_to_write(orig_dir, title, planned, force):
+    """Planned rungs whose master file is missing, or every rung when forcing."""
+    if force:
+        return [item[0] for item in planned]
+    return [
+        item[0] for item in planned
+        if not (orig_dir / master_filename(title, item[0])).exists()
+    ]
+
+
+def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=False):
     """Record src as the title's origin. Return (title, planned, probed), or None.
 
-    `dry_run` leaves the catalog untouched.
+    `dry_run` leaves the catalog untouched. The source packet count runs only
+    when a master will be written, and a frame mismatch is refused then.
     """
     label = src.name
     if src.suffix.lower() not in VIDEO_EXTS:
@@ -851,13 +884,15 @@ def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False):
     if dry_run:
         return title, planned, probed
     entry = title_entry(catalog, root, title)
-    try:
-        same_frame_count(entry, title, probed["packets"])
-    except RuntimeError as exc:
-        if not entry.get("masters") and entry.get("origin") is None:
-            titles_of(catalog, catalog_file(root)).pop(title, None)
-        print(exc, file=sys.stderr)
-        return None
+    if masters_to_write(orig_dir, title, planned, force):
+        try:
+            frames = source_packets(src, probed)
+            same_frame_count(entry, title, frames)
+        except RuntimeError as exc:
+            if not entry.get("masters") and entry.get("origin") is None:
+                titles_of(catalog, catalog_file(root)).pop(title, None)
+            print(f"{label}: {exc}", file=sys.stderr)
+            return None
     entry["origin"] = str(src.resolve())
     save_catalog(root, catalog)
     return title, planned, probed
@@ -1108,6 +1143,145 @@ def finish_title(
     return not failed
 
 
+def _listed_lows(master):
+    """Variant names recorded on this master, in catalog order."""
+    lows = master.get("low") if isinstance(master, dict) else None
+    if not isinstance(lows, list):
+        return None
+    names = []
+    for name in lows:
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or name in names
+        ):
+            continue
+        names.append(name)
+    return names
+
+
+def library_stats(catalog, where, orig_dir, low_dir):
+    """Ready films grouped by master size, plus masters that are not ready.
+
+    A film is one catalog master whose file exists and that has at least one
+    low file. `pairs` counts files named in the degrade list. Frames are the
+    title's frame count, added once per film. Masters with no low file, and
+    masters still missing a degrade variant, are listed after the table.
+    """
+    scale, _, _, variants = degrade_of(catalog, where)
+    titles = titles_of(catalog, where)
+    recipe = list(variants)
+    groups = {}
+    gaps = []
+    for title, entry in titles.items():
+        if not isinstance(entry, dict):
+            gaps.append(("skip", title, "bad catalog entry"))
+            continue
+        frames = entry.get("frames")
+        masters = entry.get("masters")
+        if not isinstance(masters, dict):
+            gaps.append(("skip", title, "no masters"))
+            continue
+        if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
+            gaps.append(("skip", title, "missing frames"))
+            continue
+        for rung, master in masters.items():
+            name = master_filename(title, rung)
+            if not isinstance(master, dict):
+                gaps.append(("skip", name, "bad catalog entry"))
+                continue
+            width = master.get("width")
+            height = master.get("height")
+            if isinstance(width, bool) or not isinstance(width, int) or width < 1:
+                gaps.append(("skip", name, "missing width"))
+                continue
+            if isinstance(height, bool) or not isinstance(height, int) or height < 1:
+                gaps.append(("skip", name, "missing height"))
+                continue
+            listed = _listed_lows(master)
+            if listed is None:
+                gaps.append(("skip", name, "no lows"))
+                continue
+            if not (orig_dir / name).is_file():
+                gaps.append(("no master", name, None))
+                continue
+            present = [variant for variant in recipe if (low_dir / variant / name).is_file()]
+            other = [
+                variant for variant in listed
+                if variant not in variants and (low_dir / variant / name).is_file()
+            ]
+            if not present and not other:
+                gaps.append(("no low", name, None))
+                continue
+            bucket = groups.setdefault((width, height), {"films": 0, "pairs": 0, "frames": 0})
+            bucket["films"] += 1
+            bucket["pairs"] += len(present)
+            bucket["frames"] += frames
+            missing = [variant for variant in recipe if variant not in present]
+            if missing:
+                gaps.append(("incomplete", name, (len(present), len(recipe), missing)))
+    rows = []
+    for (width, height), bucket in groups.items():
+        rows.append({
+            "width": width,
+            "height": height,
+            "low_w": width // scale,
+            "low_h": height // scale,
+            "films": bucket["films"],
+            "pairs": bucket["pairs"],
+            "frames": bucket["frames"],
+        })
+    rows.sort(key=lambda row: (row["width"] * row["height"], row["width"]), reverse=True)
+    return recipe, rows, gaps
+
+
+def format_stats(recipe, rows, gaps):
+    """The size table, then any master that is not fully degraded."""
+    lines = ["degrade  " + " ".join(recipe)]
+    headers = ("master", "low", "films", "pairs", "frames")
+    body = [
+        (
+            f"{row['width']}x{row['height']}",
+            f"{row['low_w']}x{row['low_h']}",
+            str(row["films"]),
+            str(row["pairs"]),
+            f"{row['frames']:,}",
+        )
+        for row in rows
+    ]
+    widths = [len(cell) for cell in headers]
+    for cells in body:
+        for index, cell in enumerate(cells):
+            widths[index] = max(widths[index], len(cell))
+    numeric = {2, 3, 4}
+
+    def emit(cells):
+        parts = []
+        for index, cell in enumerate(cells):
+            if index in numeric:
+                parts.append(cell.rjust(widths[index]))
+            else:
+                parts.append(cell.ljust(widths[index]))
+        lines.append("  ".join(parts).rstrip())
+
+    emit(headers)
+    for cells in body:
+        emit(cells)
+    for kind, name, detail in gaps:
+        if kind == "incomplete":
+            have, total, missing = detail
+            lines.append(
+                f"incomplete {name}: {have}/{total}, missing {', '.join(missing)}"
+            )
+        elif kind == "skip":
+            lines.append(f"skip {name}: {detail}")
+        else:
+            lines.append(f"{kind} {name}")
+    return "\n".join(lines) + "\n"
+
+
 def sources_from_args(orig_dir, names):
     if not names:
         found = sorted(
@@ -1135,7 +1309,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description="encode half-resolution variants of catalog masters, "
         "finishing one master before the next. "
-        "`whoodeo-make-low import` writes a source into orig first",
+        "`whoodeo-make-low import` writes a source into orig first. "
+        "`whoodeo-make-low stats` prints masters grouped by size",
     )
     parser.add_argument("--variants", help="comma-separated names from the catalog degrade list; default is all of them")
     parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
@@ -1150,6 +1325,33 @@ def parse_args(argv):
         help="filenames in orig; default also encodes each missing rung from origin and degrades that master before the next",
     )
     return parser.parse_args(argv)
+
+
+def parse_stats_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="whoodeo-make-low stats",
+        description="print catalog masters grouped by size. "
+        "A film has at least one low file. Pairs are finished files from "
+        "the catalog degrade list. Frames are counted once per film.",
+    )
+    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
+    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
+    return parser.parse_args(argv)
+
+
+def stats_main(argv):
+    args = parse_stats_args(argv)
+    args.orig = resolve_data(args.orig)
+    args.low = resolve_data(args.low)
+    orig_dir = args.orig.expanduser().resolve()
+    low_dir = args.low.expanduser().resolve()
+    if not orig_dir.is_dir():
+        raise SystemExit(f"no orig folder: {orig_dir}")
+    root = orig_dir.parent
+    catalog = open_catalog(root, create=False)
+    where = catalog_file(root)
+    text = format_stats(*library_stats(catalog, where, orig_dir, low_dir))
+    sys.stdout.write(text)
 
 
 def parse_import_args(argv):
@@ -1200,7 +1402,10 @@ def import_main(argv):
     failed = False
     for name in args.videos:
         src = Path(name).expanduser().resolve()
-        prepared = prepare_import(src, orig_dir, rungs, catalog, root, dry_run=args.dry_run)
+        prepared = prepare_import(
+            src, orig_dir, rungs, catalog, root,
+            dry_run=args.dry_run, force=args.force,
+        )
         if prepared is None:
             failed = True
             continue
@@ -1233,6 +1438,9 @@ def main(argv=None):
         argv = sys.argv[1:]
     if argv and argv[0] == "import":
         import_main(argv[1:])
+        return
+    if argv and argv[0] == "stats":
+        stats_main(argv[1:])
         return
     args = parse_args(argv)
     args.orig = resolve_data(args.orig)
