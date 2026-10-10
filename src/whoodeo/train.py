@@ -14,8 +14,8 @@ are held out for validation.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. A frame read opens the video and closes it before the next read.
-The step copies a batch onto the device. Validation reads the same way on
-the main thread.
+An unreadable training clip is logged and the loader draws a new batch.
+The step copies a batch onto the device. Validation reads on the main thread.
 
 The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
@@ -56,6 +56,7 @@ import queue
 import random
 import re
 import shutil
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -321,9 +322,24 @@ def sample_index(rng, film, split):
     raise RuntimeError(f"could not sample a {split} frame in {film.name}")
 
 
+class UnreadableSample(RuntimeError):
+    """A training clip could not be read. The loader draws another batch."""
+
+
+def _unreadable(where, index, exc):
+    return UnreadableSample(f"{where} frame {index}: {exc}")
+
+
 def load_sample(film, variant, index, radius):
-    low_frames = variant.low.frames_around(index, radius)
-    hr = film.orig.frames_around(index, radius)[radius]
+    try:
+        low_frames = variant.low.frames_around(index, radius)
+    except (RuntimeError, OSError, av.error.FFmpegError) as exc:
+        where = f"low {variant.name}/{variant.low.path.name}"
+        raise _unreadable(where, index, exc) from exc
+    try:
+        hr = film.orig.frames_around(index, radius)[radius]
+    except (RuntimeError, OSError, av.error.FFmpegError) as exc:
+        raise _unreadable(f"master {film.orig.path.name}", index, exc) from exc
     stacked = torch.cat(low_frames, dim=0)
     return stacked, hr
 
@@ -398,6 +414,9 @@ def batch_on_device(films, specs, radius, device):
 
 _QUEUE_DEPTH = 3
 _QUEUE_POLL = 0.2
+# One bad clip is skipped. This many failed batches in a row means the
+# draw can no longer produce a readable batch, so the run stops.
+_UNREADABLE_LIMIT = 32
 
 
 @dataclass
@@ -413,9 +432,11 @@ class BatchLoader:
     """One thread of CPU training batches.
 
     Each frame read opens its video and closes it. The thread never moves
-    tensors onto a device. ``put`` times out so a full queue cannot block
-    shutdown. ``get`` raises an error from the thread instead of waiting
-    on a dead loader.
+    tensors onto a device. An unreadable clip is logged and the batch is
+    drawn again. After too many failures in a row the error stops the
+    loader. ``put`` times out so a full queue cannot block shutdown.
+    ``get`` raises an error from the thread instead of waiting on a dead
+    loader.
     """
 
     def __init__(self, rng, films, batch, radius, crop):
@@ -459,12 +480,23 @@ class BatchLoader:
 
     def _run(self):
         films = self._films
+        failed = 0
         try:
             while not self._stop.is_set():
                 specs = make_batch_specs(self._rng, films, "train", self._batch)
                 film_index, variant_index, _index = specs[0]
                 variant = films[film_index].variants[variant_index]
-                low, high = batch_from_specs(films, specs, self._radius)
+                try:
+                    low, high = batch_from_specs(films, specs, self._radius)
+                except UnreadableSample as exc:
+                    failed += 1
+                    print(f"skip batch: {exc}", file=sys.stderr, flush=True)
+                    if failed >= _UNREADABLE_LIMIT:
+                        raise RuntimeError(
+                            f"{failed} batches in a row could not be read"
+                        ) from exc
+                    continue
+                failed = 0
                 box = None
                 if self._crop is not None:
                     box = sample_box(high, self._crop, self._rng)
