@@ -10,8 +10,9 @@ step those weights were saved at. whoodeo-apply and a fine-tune read only
 this file.
 
 train.pt is everything else the same run needs in order to continue: the
-step again, both optimizers, the discriminator, the loss recipe, and the
-loss scales. --resume reads it. A fine-tune does not.
+step again, both optimizers, the discriminator, the loss recipe, the loss
+scales, and the plateau schedule when that schedule is in use. --resume
+reads it. A fine-tune does not.
 
 A run directory follows its latest link. A checkpoint directory, model.pt,
 or train.pt names one step exactly. An older run that still keeps model.pt
@@ -56,6 +57,7 @@ class TrainState:
     objective: dict
     discriminator: dict | None
     disc_optimizer: dict | None
+    schedule: dict | None
 
 
 def latest_link():
@@ -73,7 +75,7 @@ def run_directory(model_path):
 
 def save_run(
     directory, model, architecture, step, optimizer, loss, objective,
-    discriminator=None, disc_optimizer=None,
+    discriminator=None, disc_optimizer=None, schedule=None,
 ):
     """Write checkpoints/<step>/ and point both latest links at it.
 
@@ -93,6 +95,8 @@ def save_run(
     if discriminator is not None:
         train_payload["discriminator"] = discriminator.state_dict()
         train_payload["disc_optimizer"] = disc_optimizer.state_dict()
+    if schedule is not None:
+        train_payload["schedule"] = schedule
     model_payload = {
         "architecture": architecture,
         "state_dict": model.state_dict(),
@@ -349,6 +353,7 @@ def _train_state(path, data):
         data["objective"],
         discriminator,
         disc_optimizer,
+        data.get("schedule"),
     )
 
 

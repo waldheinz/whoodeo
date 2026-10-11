@@ -21,6 +21,19 @@ The loss is the weighted sum of the terms in the file. The first term anchors
 the magnitude. balance start freezes the scales on the validation frames
 before the first step. balance running keeps the weights as shares.
 
+schedule chooses how lr moves. Left out, it is const: lr stays put. steps,
+at the top of the file or under schedule, stops const and plateau after
+that many new updates; without it those runs wait for Ctrl-C. A resume
+counts that cap from zero again. cosine needs steps. Its rate follows one
+hump on the run's step counter: the first step is just above zero, the
+halfway step is lr, and the last step is just above zero. A resume
+continues that same hump.
+plateau reads the validation loss. After patience misses it multiplies lr
+by factor, and never goes below min_lr. A miss at that floor stops the
+run. A resume keeps the dropped rate and the miss count when lr is the
+same peak. The discriminator, when there is one, keeps the same fraction
+of disc_lr.
+
 A fresh run validates once at step 0, before any update. Where the last
 layer starts at zero, that pass is the bilinear upscale. Modified leaves
 that layer at the default initialization, so step 0 already includes a
@@ -39,8 +52,9 @@ cover every kernel in the shared vote.
 whoodeo-board serves every run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
-the same loss, the Adam state, and the loss scales. Learning rates come
-from the file. Resuming an older checkpoint starts a new run, so the later
+the same loss, the Adam state, and the loss scales. The schedule comes
+from the file. A plateau resume keeps its rate and its miss count when lr
+is unchanged. Resuming an older checkpoint starts a new run, so the later
 checkpoints stay where they are. An older model.pt that still carries the
 optimizer loads the same way, and the next save writes checkpoints/.
 
@@ -69,7 +83,10 @@ from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
 from whoodeo.library import load_catalog, master_filename, titles_of
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
-from whoodeo.config import architecture_dict, assert_resume_matches, load_config, shape_text
+from whoodeo.config import (
+    architecture_dict, assert_resume_matches, cosine_learning_rate, load_config,
+    restore_plateau, shape_text,
+)
 from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
@@ -513,7 +530,7 @@ class BatchLoader:
             self._put(exc)
 
 
-def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image):
+def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr):
     """One TensorBoard point per value that this step actually has."""
     def emit(tag, value):
         if value is not None:
@@ -521,6 +538,7 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, us
 
     emit("loss/train", train_loss)
     emit("loss/val", val_loss)
+    emit("lr", lr)
     for prefix, parts in (("train", train_parts), ("val", val_parts)):
         if parts is None:
             continue
@@ -755,6 +773,39 @@ def apply_learning_rate(optimizer, lr):
         group["lr"] = lr
 
 
+def learning_rate(cfg, step, plateau):
+    """The generator rate for this step. Plateau carries its own current rate."""
+    if cfg.schedule.kind == "cosine":
+        return cosine_learning_rate(step, cfg.steps, cfg.lr)
+    if cfg.schedule.kind == "plateau":
+        return plateau.lr
+    return cfg.lr
+
+
+def describe_schedule(cfg, plateau, note):
+    schedule = cfg.schedule
+    if schedule.kind == "const":
+        span = "until Ctrl-C" if cfg.steps is None else f"{cfg.steps} steps"
+        print(f"schedule const  lr {cfg.lr:g}  {span}", flush=True)
+        return
+    if schedule.kind == "cosine":
+        print(f"schedule cosine  peak {cfg.lr:g}  {cfg.steps} steps", flush=True)
+        return
+    line = (
+        f"schedule plateau  peak {cfg.lr:g}  patience {schedule.patience}  "
+        f"factor {schedule.factor:g}  min_delta {schedule.min_delta:g}  "
+        f"min_lr {schedule.min_lr:g}"
+    )
+    if note == "restored":
+        best = "none" if plateau.best is None else f"{plateau.best:.6f}"
+        line += f"  resumed lr {plateau.lr:g}  best {best}  missed {plateau.bad}"
+    elif note == "reset":
+        line += "  lr changed, starting over"
+    elif note == "missing":
+        line += "  checkpoint has no plateau, starting over"
+    print(line, flush=True)
+
+
 def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
     if resume is not None and finetune is not None:
         raise SystemExit("pass either --resume or --model")
@@ -763,6 +814,13 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     if resume is not None:
         generator, train_state = load_resume(resume)
         assert_resume_matches(cfg, generator.architecture, train_state.loss, generator.path)
+        if cfg.schedule.kind == "cosine" and train_state.step >= cfg.steps:
+            print(
+                f"cosine sweep ended at step {cfg.steps}, "
+                f"{train_state.path} is step {train_state.step}",
+                flush=True,
+            )
+            return
 
     out_dir = cfg.out
     if out_dir is None and train_state is not None:
@@ -806,7 +864,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         generator is not None
         and out_dir.resolve() == run_directory(generator.path).resolve()
     )
-    limit = "until Ctrl-C" if cfg.steps is None else str(cfg.steps)
+    if cfg.schedule.kind == "cosine":
+        limit = str(cfg.steps)
+    elif cfg.steps is None and cfg.schedule.kind == "plateau":
+        limit = "until the plateau stops or Ctrl-C"
+    elif cfg.steps is None:
+        limit = "until Ctrl-C"
+    else:
+        limit = str(cfg.steps)
     if train_state is not None and not same_run:
         print(f"new run from {generator.path}", flush=True)
     print(f"run {out_dir}  steps {limit}", flush=True)
@@ -825,7 +890,6 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     if train_state is not None:
         optimizer.load_state_dict(train_state.optimizer)
         move_optimizer(optimizer, device)
-        apply_learning_rate(optimizer, cfg.lr)
         print(f"resume step {train_state.step}", flush=True)
 
     gan = cfg.term("gan")
@@ -841,13 +905,30 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             discriminator.load_state_dict(train_state.discriminator)
             disc_optimizer.load_state_dict(train_state.disc_optimizer)
             move_optimizer(disc_optimizer, device)
-            apply_learning_rate(disc_optimizer, gan.disc_lr)
             print("loaded discriminator", flush=True)
         print(
             f"discriminator unet-sn  {count} parameters  crop {gan.crop}  "
             f"lr {gan.disc_lr:g}",
             flush=True,
         )
+
+    start_step = train_state.step if train_state is not None else 0
+    plateau = None
+    plateau_note = None
+    if cfg.schedule.kind == "plateau":
+        if train_state is None:
+            plateau, _note = restore_plateau(cfg, None, "checkpoint")
+        else:
+            plateau, plateau_note = restore_plateau(cfg, train_state.schedule, train_state.path)
+
+    def apply_rate(at_step):
+        rate = learning_rate(cfg, at_step, plateau)
+        apply_learning_rate(optimizer, rate)
+        if disc_optimizer is not None:
+            apply_learning_rate(disc_optimizer, gan.disc_lr * rate / cfg.lr)
+        return rate
+
+    apply_rate(start_step)
 
     objective = Objective(cfg, device)
     val_specs = []
@@ -875,6 +956,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             )
             objective.calibrate(layer_means, term_means)
         describe_loss(cfg, objective)
+        describe_schedule(cfg, plateau, plateau_note)
 
         live = open_live(live_bind, preview)
         writer = SummaryWriter(log_dir=out_dir)
@@ -889,13 +971,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 d_value if gan is not None else None,
             )
 
-        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image):
+        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr):
             write_scalars(
-                writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image,
+                writer, step, train_loss, val_loss, train_parts, val_parts, usage,
+                neighbor_image, lr,
             )
             if val_loss is None:
                 return
-            message = f"step {step:06d}  val {val_loss:.6f}"
+            message = f"step {step:06d}  val {val_loss:.6f}  lr {lr:.4g}"
             if val_parts is not None:
                 message += "  " + part_text(*val_parts)
             if neighbor_image is not None:
@@ -912,15 +995,24 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
         def checkpoint():
             nonlocal saved_at
+            schedule_state = None if plateau is None else plateau.state_dict(cfg.lr)
             saved_at = save_run(
                 out_dir, model, architecture_dict(cfg), step, optimizer,
                 cfg.loss_recipe(), objective.state_dict(),
-                discriminator, disc_optimizer,
+                discriminator, disc_optimizer, schedule_state,
             )
 
-        start_step = train_state.step if train_state is not None else 0
         step = start_step
         steps_done = 0
+
+        def updates_done():
+            # cosine follows the run's step counter. const and plateau count
+            # new updates, so a resume can ask for more.
+            if cfg.steps is None:
+                return False
+            if cfg.schedule.kind == "cosine":
+                return step >= cfg.steps
+            return steps_done >= cfg.steps
 
         def validate():
             """Validation loss, images, and a checkpoint at the current step."""
@@ -929,18 +1021,41 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 cfg, objective, discriminator,
                 image_dir=out_dir / "val", step=step,
             )
+            old = None if plateau is None else plateau.lr
+            decision = None if plateau is None else plateau.observe(loss)
+            if decision == "drop":
+                apply_rate(step)
             checkpoint()
-            return loss, logged_parts(pixel, vgg, gan_value, d_value), neighbor_image
+            return loss, logged_parts(pixel, vgg, gan_value, d_value), neighbor_image, decision, old
+
+        def note_plateau(decision, old):
+            if decision == "drop":
+                print(f"step {step:06d}  lr {old:.4g} -> {plateau.lr:.4g}", flush=True)
+                return False
+            if decision == "stop":
+                print(
+                    f"step {step:06d}  stop  validation stood still at lr {plateau.lr:.4g}"
+                    f"  min_lr {cfg.schedule.min_lr:.4g}  best val {plateau.best:.6f}",
+                    flush=True,
+                )
+                return True
+            return False
 
         try:
             # A new run validates before any update. A fine-tune's step 0 is
             # the generator that was loaded.
+            stopped = False
             if train_state is None:
-                val_loss, val_parts, neighbor_image = validate()
-                log(step, None, val_loss, None, val_parts, None, neighbor_image)
-            while cfg.steps is None or steps_done < cfg.steps:
+                val_loss, val_parts, neighbor_image, decision, old_lr = validate()
+                log(
+                    step, None, val_loss, None, val_parts, None, neighbor_image,
+                    learning_rate(cfg, step, plateau),
+                )
+                stopped = note_plateau(decision, old_lr)
+            while not stopped and not updates_done():
                 step += 1
                 steps_done += 1
+                lr = apply_rate(step)
                 started = time.perf_counter()
                 prepared = loader.get()
                 low = prepared.low.to(device)
@@ -980,7 +1095,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 )
                 line = (
                     f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
-                    f"loss {loss.item():.6f}  {part_text(*batch_parts)}  "
+                    f"lr {lr:.4g}  loss {loss.item():.6f}  {part_text(*batch_parts)}  "
                     f"{prepared.width}x{prepared.height}"
                 )
                 print(line, flush=True)
@@ -994,13 +1109,17 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                         "master": rgb_image(high[0]),
                     })
 
-                finished = cfg.steps is not None and steps_done == cfg.steps
+                finished = updates_done()
                 val_loss = None
                 val_parts = None
                 neighbor_image = None
+                decision = None
+                old_lr = None
                 if step % cfg.val_every == 0 or finished:
-                    val_loss, val_parts, neighbor_image = validate()
-                log(step, loss.item(), val_loss, batch_parts, val_parts, usage, neighbor_image)
+                    val_loss, val_parts, neighbor_image, decision, old_lr = validate()
+                log(step, loss.item(), val_loss, batch_parts, val_parts, usage, neighbor_image, lr)
+                if note_plateau(decision, old_lr):
+                    break
         except KeyboardInterrupt:
             checkpoint()
             print(f"interrupted, saved {saved_at / 'model.pt'}", flush=True)
@@ -1027,7 +1146,7 @@ def main():
             "continue this run from its newest checkpoint "
             "(directory, latest, a checkpoint, model.pt, or train.pt). "
             "An older checkpoint starts a new run. "
-            "Same network and loss; learning rates come from the file"
+            "Same network and loss. The schedule comes from the file"
         ),
     )
     parser.add_argument(

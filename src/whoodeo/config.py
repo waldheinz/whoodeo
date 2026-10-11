@@ -1,5 +1,6 @@
 """Training recipe loaded from one YAML file."""
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,17 @@ class Term:
 
 
 @dataclass(frozen=True)
+class Schedule:
+    """How `lr` moves. `patience`, `factor`, `min_delta`, and `min_lr` are set for plateau only."""
+
+    kind: str
+    patience: int | None = None
+    factor: float | None = None
+    min_delta: float | None = None
+    min_lr: float | None = None
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     source: Path
     arch: str
@@ -68,6 +80,7 @@ class TrainConfig:
     out: Path | None
     balance: str
     terms: tuple[Term, ...]
+    schedule: Schedule
     radius: int | None = None
     stem: int | None = None
     vote: int | None = None
@@ -176,7 +189,10 @@ def architecture_dict(cfg):
 
 
 def assert_resume_matches(cfg, architecture, loss, checkpoint):
-    """The checkpoint must be the same network and the same loss. Learning rates may change."""
+    """The checkpoint must be the same network and the same loss.
+
+    Learning rates and the schedule may change.
+    """
     saved_key = model_key(*parse_model(architecture, f"{checkpoint}: architecture"))
     if saved_key != cfg.arch_key():
         found = shape_text(*saved_key)
@@ -213,6 +229,13 @@ def load_config(path, architecture=None, architecture_from=None):
     out = _take_path(data, "out", where)
     variants = _take_variants(data, where)
     balance, terms = _take_loss(data, where)
+    schedule, schedule_steps = _take_schedule(data, where, lr)
+    if schedule_steps is not None and steps is not None:
+        raise SystemExit(f"{where}: steps is set twice, at the top and under schedule")
+    if schedule_steps is not None:
+        steps = schedule_steps
+    if schedule.kind == "cosine" and steps is None:
+        raise SystemExit(f"{where}: cosine needs steps")
     _reject_unknown(data, where)
     return TrainConfig(
         source=path,
@@ -241,6 +264,7 @@ def load_config(path, architecture=None, architecture_from=None):
         res_scale=res_scale,
         vote=vote,
         variants=variants,
+        schedule=schedule,
     )
 
 
@@ -373,6 +397,149 @@ def _take_pyramid(data, where):
     if radius < 0 or radius > 8:
         raise SystemExit(f"{where}: radius must be from 0 to 8")
     return levels, stem, radius
+
+
+SCHEDULE_KINDS = ("const", "cosine", "plateau")
+
+
+def cosine_learning_rate(step, steps, peak):
+    """One hump over steps 1..steps. Halfway is `peak`, and both ends sit just off zero.
+
+    Each step takes the middle of its slot on a cosine that is flat at the
+    bottom, the top, and the bottom again, so the rise and the fall leave
+    and arrive gently. The first step and the last step are the same rate.
+    """
+    if step <= 0 or step > steps:
+        return 0.0
+    progress = (step - 0.5) / steps
+    return peak * 0.5 * (1.0 - math.cos(2.0 * math.pi * progress))
+
+
+class Plateau:
+    """Drop `lr` when validation misses, and stop once that rate is already the floor.
+
+    A miss is a validation that does not beat the best by `min_delta`, a
+    fraction of that best. After `patience` misses the rate is multiplied
+    by `factor`, and never set below `min_lr`. The next miss at `min_lr`
+    asks the run to stop. A real improvement clears the miss count and
+    keeps going, including at the floor.
+    """
+
+    def __init__(self, lr, patience, factor, min_delta, min_lr, best=None, bad=0):
+        self.lr = float(lr)
+        self.patience = patience
+        self.factor = factor
+        self.min_delta = min_delta
+        self.min_lr = float(min_lr)
+        self.best = None if best is None else float(best)
+        self.bad = bad
+
+    def observe(self, val_loss):
+        """Return 'ok', 'drop', or 'stop'."""
+        if self.best is None or val_loss < self.best * (1.0 - self.min_delta):
+            self.best = float(val_loss)
+            self.bad = 0
+            return "ok"
+        self.bad += 1
+        if self.bad < self.patience:
+            return "ok"
+        if self.lr <= self.min_lr:
+            return "stop"
+        nxt = self.lr * self.factor
+        if nxt < self.min_lr:
+            nxt = self.min_lr
+        self.lr = nxt
+        self.bad = 0
+        return "drop"
+
+    def state_dict(self, peak):
+        return {
+            "kind": "plateau",
+            "peak": float(peak),
+            "lr": self.lr,
+            "best": self.best,
+            "bad": self.bad,
+        }
+
+
+def restore_plateau(cfg, saved, where):
+    """Continue a plateau, or start at `lr` when the checkpoint has nothing to continue.
+
+    The note is 'missing' when the checkpoint has no schedule, 'reset' when
+    `lr` changed, and 'restored' when the miss count and the current rate
+    come from the checkpoint. `where` is the checkpoint path named in errors.
+    """
+    schedule = cfg.schedule
+    fresh = Plateau(cfg.lr, schedule.patience, schedule.factor, schedule.min_delta, schedule.min_lr)
+    if saved is None:
+        return fresh, "missing"
+    if not isinstance(saved, dict):
+        raise SystemExit(f"{where}: schedule must be a mapping")
+    if saved.get("kind") != "plateau":
+        return fresh, "missing"
+    peak = saved.get("peak")
+    if isinstance(peak, bool) or not isinstance(peak, (int, float)):
+        raise SystemExit(f"{where}: schedule is missing peak")
+    if not math.isclose(float(peak), cfg.lr, rel_tol=1e-6, abs_tol=0.0):
+        return fresh, "reset"
+    lr = saved.get("lr")
+    bad = saved.get("bad")
+    best = saved.get("best")
+    if isinstance(lr, bool) or not isinstance(lr, (int, float)) or not math.isfinite(float(lr)) or float(lr) <= 0:
+        raise SystemExit(f"{where}: schedule has no learning rate")
+    if isinstance(bad, bool) or not isinstance(bad, int) or bad < 0:
+        raise SystemExit(f"{where}: schedule has no miss count")
+    if best is not None and (
+        isinstance(best, bool) or not isinstance(best, (int, float)) or not math.isfinite(float(best))
+    ):
+        raise SystemExit(f"{where}: schedule has no best validation")
+    if float(lr) < schedule.min_lr:
+        raise SystemExit(
+            f"{where}: learning rate {float(lr):g} is below min_lr {schedule.min_lr:g}"
+        )
+    return Plateau(
+        float(lr), schedule.patience, schedule.factor, schedule.min_delta, schedule.min_lr,
+        best=best, bad=bad,
+    ), "restored"
+
+
+def _take_schedule(data, where, lr):
+    """The schedule section. A bare name is the kind. Missing means const.
+
+    `steps` may sit here or at the top of the file, not in both. Cosine
+    requires it. Plateau uses patience 8, factor 0.5, min_delta 0.01, and
+    min_lr at one hundredth of `lr` when those keys are left out.
+    """
+    if "schedule" not in data:
+        return Schedule("const"), None
+    raw = data.pop("schedule")
+    label = f"{where}: schedule"
+    if isinstance(raw, str):
+        kind = raw
+        raw = {}
+        if kind not in SCHEDULE_KINDS:
+            known = ", ".join(SCHEDULE_KINDS)
+            raise SystemExit(f"{label}: unknown kind {kind!r}. choices: {known}")
+    elif isinstance(raw, dict):
+        kind = _take_choice(raw, "kind", label, SCHEDULE_KINDS)
+    else:
+        raise SystemExit(f"{label} must be a name or a mapping")
+    steps = _take_int(raw, "steps", label, positive=True, default=None)
+    if kind != "plateau":
+        _reject_unknown(raw, label)
+        return Schedule(kind), steps
+    patience = _take_int(raw, "patience", label, positive=True, default=8)
+    factor = _take_float(raw, "factor", label, positive=True, default=0.5)
+    if factor >= 1:
+        raise SystemExit(f"{label}: factor must be below 1")
+    min_delta = _take_float(raw, "min_delta", label, default=0.01)
+    if min_delta < 0 or min_delta >= 1:
+        raise SystemExit(f"{label}: min_delta must be at least 0 and below 1")
+    min_lr = _take_float(raw, "min_lr", label, positive=True, default=lr * 0.01)
+    if min_lr >= lr:
+        raise SystemExit(f"{label}: min_lr must be below lr")
+    _reject_unknown(raw, label)
+    return Schedule(kind, patience, factor, min_delta, min_lr), steps
 
 
 def _take_loss(data, where):

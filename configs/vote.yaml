@@ -44,10 +44,40 @@ model:
   vote: 4
   res_scale: 1.0
 
-batch: 2
+batch: 8
 lr: 1.0e-4
+
+# schedule chooses how lr moves. Leave it out and the rate stays at lr
+# until Ctrl-C, which is const.
+#
+# const keeps lr. steps, at the top of the file or here, stops the run
+# after that many new updates. Without steps it waits for Ctrl-C. A
+# resume counts steps from zero again, so the file asks for that many
+# further updates.
+#
+# cosine needs steps. The count is the training step. The rate follows
+# one hump: the first step is just above zero, the halfway step is lr,
+# and the last step is just above zero again. A resume continues the
+# same hump and stops at that step.
+#
+# plateau watches the validation loss, the same frames each time. A
+# validation is better only when it beats the best by min_delta, a
+# fraction of that best. After patience misses the rate is multiplied
+# by factor, and it never goes below min_lr. One more miss at that
+# floor stops the run.
+# An improvement, including at the floor, clears the misses and keeps
+# going. steps, if set, is still a cap. Ctrl-C stops it earlier. A
+# resume keeps the dropped rate and the miss count when lr is unchanged.
+# The discriminator, when the loss has one, keeps the same fraction of
+# its own disc_lr.
+#
+# Plateau defaults when the keys are left out: patience 8, factor 0.5,
+# min_delta 0.01, min_lr one hundredth of lr.
+schedule:
+  kind: plateau
+
 holdout: 0.1
-val_every: 1000
+val_every: 250
 val_count: 32
 seed: 42
 variants: "^x264-"
