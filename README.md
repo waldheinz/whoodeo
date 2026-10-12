@@ -76,7 +76,7 @@ The vote sits on the difference between a neighbor and the middle. The same weig
 
 `configs/vote.yaml` is a worked example. The loss and the x264 pair filter match the EDSR baseline recipe. `blocks` there is the trunk only, not the stem and not the vote.
 
-While a vote run trains, TensorBoard records four neighbor numbers. `neighbor/weight` is the mean absolute value of the kernels in the shared vote. `neighbor/vote` is the mean absolute vote with the resting output removed, divided by the mean absolute middle features, measured on the training batch. The resting output is what the vote produces from a zero difference, and it does not depend on the neighbors. `neighbor/grad` is the mean absolute gradient of those kernels divided by the same quantity on the first convolution, so a value near zero means the loss is not asking the vote to change. `neighbor/image` is written when validation runs. It is the mean absolute change in the picture when both neighbors are replaced by a copy of the middle frame.
+While a vote run trains, TensorBoard records three neighbor numbers. `neighbor/weight` is the mean absolute value of the kernels in the shared vote. `neighbor/grad` is the mean absolute gradient of those kernels divided by the same quantity on the first convolution, so a value near zero means the loss is not asking the vote to change. `neighbor/image` is written when validation runs. It is the mean absolute change in the picture when both neighbors are replaced by a copy of the middle frame.
 
 # The SwinIR models
 

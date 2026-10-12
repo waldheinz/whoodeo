@@ -46,9 +46,9 @@ file. train.pt is the step, the optimizers, the discriminator, the loss
 recipe, and the loss scales. latest in the run points at the newest of
 those directories, and latest in the runs directory follows the newest
 checkpoint written. The run directory also gets a TensorBoard event file for the losses.
-The vote model adds neighbor/weight, neighbor/grad, and neighbor/vote
-on each step, and neighbor/image when validation runs. weight and grad
-cover every kernel in the shared vote.
+The vote model adds neighbor/weight and neighbor/grad on each step, and
+neighbor/image when validation runs. weight and grad cover every kernel
+in the shared vote.
 whoodeo-board serves every run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
@@ -549,7 +549,6 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, us
         emit(f"{prefix}/d", d_loss)
     if usage is not None:
         emit("neighbor/weight", usage.get("weight"))
-        emit("neighbor/vote", usage.get("vote"))
         emit("neighbor/grad", usage.get("grad"))
     emit("neighbor/image", neighbor_image)
     writer.flush()
@@ -984,7 +983,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             if neighbor_image is not None:
                 message += f"  neighbors {neighbor_image:.6f}"
             if usage is not None:
-                message += f"  vote {usage['vote']:.4f}  weight {usage['weight']:.5f}"
+                message += f"  weight {usage['weight']:.5f}"
                 if usage.get("grad") is not None:
                     message += f"  grad {usage['grad']:.4f}"
             print(message, flush=True)

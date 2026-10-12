@@ -59,8 +59,6 @@ class VoteEDSR(nn.Module):
             Upsampler(conv, scale, n_feats, act=False),
             conv(n_feats, 3, kernel_size),
         )
-        self.last_vote = None
-        self.last_center = None
 
     def _features(self, frame):
         return self.stem(self.head(self.sub_mean(frame)))
@@ -88,31 +86,18 @@ class VoteEDSR(nn.Module):
             term = self._decide(feat - center)
             vote = term if vote is None else vote + term
         res = self.body(center + vote) + center
-        out = self.add_mean(self.tail(res))
-        # A zero difference still produces a resting vote. Subtract it so the
-        # logged number is the part that depends on the frames.
-        with torch.no_grad():
-            rest = self._decide(torch.zeros_like(center))
-            content = vote.detach() - rest * (self.in_frames - 1)
-        self.last_vote = content.abs().mean()
-        self.last_center = center.detach().abs().mean()
-        return out
+        return self.add_mean(self.tail(res))
 
     def neighbor_usage(self):
-        """Weight, vote, and gradient ratios from the forward just run.
+        """Weight and gradient ratios of the shared vote.
 
-        weight is the mean absolute kernel of the shared vote. vote is the
-        mean absolute frame-dependent vote divided by the mean absolute
-        middle features. grad is the mean absolute gradient of those kernels
-        divided by the same quantity on the head. grad is absent until the
-        first backward. None before the first forward.
+        weight is the mean absolute kernel. grad is the mean absolute
+        gradient of those kernels divided by the same quantity on the head.
+        grad is absent until the first backward.
         """
-        if self.last_vote is None or self.last_center is None:
-            return None
         kernels = self._kernels()
         weight = torch.cat([param.detach().reshape(-1) for param in kernels]).abs().mean()
-        vote = self.last_vote / self.last_center.clamp_min(1e-8)
-        parts = [weight, vote]
+        parts = [weight]
         head_grad = self.head.weight.grad
         grads = [param.grad for param in kernels]
         has_grad = head_grad is not None and all(grad is not None for grad in grads)
@@ -120,7 +105,7 @@ class VoteEDSR(nn.Module):
             grad = torch.cat([param.grad.detach().reshape(-1) for param in kernels]).abs().mean()
             parts.append(grad / head_grad.detach().abs().mean().clamp_min(1e-12))
         values = torch.stack(parts).detach().float().cpu().tolist()
-        stats = {"weight": values[0], "vote": values[1]}
+        stats = {"weight": values[0]}
         if has_grad:
-            stats["grad"] = values[2]
+            stats["grad"] = values[1]
         return stats
