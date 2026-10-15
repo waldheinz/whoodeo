@@ -3,7 +3,7 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-struct FilmFacts: Sendable {
+nonisolated struct FilmFacts: Sendable {
     var url: URL
     var width: Int
     var height: Int
@@ -12,14 +12,14 @@ struct FilmFacts: Sendable {
     var bits: Int
 }
 
-struct AudioFacts: Sendable {
+nonisolated struct AudioFacts: Sendable {
     var channels: Int
     var sampleRate: Double
     var subtype: AudioFormatID
     var dataRate: Double
 }
 
-struct Decoded {
+nonisolated struct Decoded {
     var index: Int
     var time: CMTime
     var width: Int
@@ -27,7 +27,7 @@ struct Decoded {
     var rgb: [Float]
 }
 
-final class Film {
+nonisolated final class Film {
     let facts: FilmFacts
     let asset: AVURLAsset
     let video: AVAssetTrack
@@ -45,6 +45,7 @@ final class Film {
     private var heldOrder: [Int] = []
     private var pixelFormat: OSType
 
+    @concurrent
     static func load(_ url: URL) async throws -> Film {
         // AVFoundation does not read Matroska. A stream copy keeps the pictures.
         let media = try await readableVideo(url)
@@ -146,6 +147,7 @@ final class Film {
     }
 
     /// The file AVFoundation can actually read. Matroska is copied into a QuickTime cache.
+    @concurrent
     private static func readableVideo(_ url: URL) async throws -> URL {
         if await hasVideo(url) { return url }
         guard let ffmpeg = ffmpegURL() else {
@@ -174,6 +176,7 @@ final class Film {
         return dest
     }
 
+    @concurrent
     private static func hasVideo(_ url: URL) async -> Bool {
         let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         do {

@@ -2,7 +2,7 @@ import AppKit
 import UniformTypeIdentifiers
 
 /// Movie files the window accepts when they are dropped onto it.
-enum FilmDrop {
+nonisolated enum FilmDrop {
     static var contentTypes: [UTType] {
         var types: [UTType] = [.movie, .mpeg4Movie, .quickTimeMovie, .video]
         if let mkv = UTType(filenameExtension: "mkv"), !types.contains(where: { $0 == mkv }) {
@@ -22,6 +22,7 @@ enum FilmDrop {
         return contentTypes.contains { type.conforms(to: $0) }
     }
 
+    @MainActor
     static func firstFilm(in info: NSDraggingInfo) -> URL? {
         let pasteboard = info.draggingPasteboard
         let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
@@ -54,11 +55,12 @@ enum FilmDrop {
                 group.leave()
             }
             if provider.canLoadObject(ofClass: URL.self) {
+                let held = HeldProvider(provider)
                 _ = provider.loadObject(ofClass: URL.self) { object, _ in
                     if let object {
                         finish(object)
                     } else {
-                        loadFileURL(provider, finish)
+                        loadFileURL(held.provider, finish)
                     }
                 }
             } else {
@@ -90,7 +92,16 @@ enum FilmDrop {
     }
 }
 
-private final class OrderedURLs: @unchecked Sendable {
+/// `NSItemProvider` is not sendable. The load callback only uses it after the call has returned.
+private nonisolated final class HeldProvider: @unchecked Sendable {
+    let provider: NSItemProvider
+
+    init(_ provider: NSItemProvider) {
+        self.provider = provider
+    }
+}
+
+private nonisolated final class OrderedURLs: @unchecked Sendable {
     private var items: [Int: URL] = [:]
     private let lock = NSLock()
 

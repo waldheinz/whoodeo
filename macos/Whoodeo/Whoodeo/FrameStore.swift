@@ -5,7 +5,7 @@ import Foundation
 import VideoToolbox
 
 /// Which frames of one film, model, and compute unit are already encoded.
-struct Coverage: Equatable {
+nonisolated struct Coverage: Equatable {
     private(set) var count: Int
     private var words: [UInt64]
 
@@ -77,7 +77,7 @@ struct Coverage: Equatable {
 
 /// Append-only ProRes 4444 frames. A slot table points at each frame, so a seek can fill one hole.
 /// Playback reads through its own handle and decoder, so an append on the model queue can proceed.
-final class FrameStore {
+nonisolated final class FrameStore: @unchecked Sendable {
     let count: Int
     private(set) var width: Int
     private(set) var height: Int
@@ -186,20 +186,19 @@ final class FrameStore {
         defer { decodeLock.unlock() }
         let sample = try sampleBuffer(data, time: .zero, duration: .invalid)
         let session = try decoderSession()
-        var image: CVPixelBuffer?
-        var decodeStatus: OSStatus = noErr
+        let decoded = DecodedImage()
         let gate = DispatchSemaphore(value: 0)
         let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { result, _, buffer, _, _ in
-            decodeStatus = result
-            image = buffer
+            decoded.status = result
+            decoded.image = buffer
             gate.signal()
         }
         guard status == noErr else { throw CLIError("Cache liest Bild \(index) nicht (\(status))") }
         guard gate.wait(timeout: .now() + 30) == .success else {
             throw CLIError("Cache liest Bild \(index) nicht")
         }
-        guard decodeStatus == noErr, let image else {
-            throw CLIError("Cache liest Bild \(index) nicht (\(decodeStatus))")
+        guard decoded.status == noErr, let image = decoded.image else {
+            throw CLIError("Cache liest Bild \(index) nicht (\(decoded.status))")
         }
         guard CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_64RGBALE else {
             throw CLIError("Cache liefert ein unbekanntes Bildformat")
@@ -516,6 +515,12 @@ final class FrameStore {
 
     private static func write(_ meta: Meta, to url: URL) throws {
         try JSONEncoder().encode(meta).write(to: url, options: .atomic)
+    }
+
+    /// The decode callback writes here. The caller waits on a semaphore, so the buffer is not used concurrently.
+    private final class DecodedImage: @unchecked Sendable {
+        var image: CVPixelBuffer?
+        var status: OSStatus = noErr
     }
 
     private struct Slot {

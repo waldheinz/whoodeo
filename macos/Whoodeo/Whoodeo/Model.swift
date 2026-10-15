@@ -1,7 +1,7 @@
 import CoreML
 import Foundation
 
-enum Compute: String, CaseIterable, Identifiable {
+nonisolated enum Compute: String, CaseIterable, Identifiable {
     case gpu, ane, auto
 
     var id: String { rawValue }
@@ -32,7 +32,7 @@ enum Compute: String, CaseIterable, Identifiable {
     }
 }
 
-struct PackageInfo {
+nonisolated struct PackageInfo {
     var arch: String
     var blocks: Int
     var channels: Int
@@ -96,14 +96,14 @@ struct PackageInfo {
     }
 }
 
-struct Prediction {
+nonisolated struct Prediction {
     var image: [Float]
     var width: Int
     var height: Int
     var milliseconds: Double
 }
 
-final class Predictor {
+nonisolated final class Predictor {
     let info: PackageInfo
     let model: MLModel
     let unit: Compute

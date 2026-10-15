@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-struct LibraryModel: Identifiable, Hashable {
+nonisolated struct LibraryModel: Identifiable, Hashable {
     var url: URL
     var title: String
     var detail: String
@@ -32,7 +32,7 @@ struct LibraryModel: Identifiable, Hashable {
     }
 }
 
-enum ModelLibrary {
+nonisolated enum ModelLibrary {
     static var directory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let url = base.appendingPathComponent("Whoodeo/Models", isDirectory: true)

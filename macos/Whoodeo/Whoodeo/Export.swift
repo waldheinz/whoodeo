@@ -5,7 +5,7 @@ import CoreVideo
 import Foundation
 import VideoToolbox
 
-enum Codec: String, CaseIterable, Identifiable {
+nonisolated enum Codec: String, CaseIterable, Identifiable {
     case hevc, prores, prores4444
 
     var id: String { rawValue }
@@ -19,7 +19,7 @@ enum Codec: String, CaseIterable, Identifiable {
     }
 }
 
-enum Export {
+nonisolated enum Export {
     static func write(
         film: Film,
         predictor: Predictor,
@@ -234,6 +234,7 @@ enum Export {
         }
     }
 
+    @concurrent
     private static func writeCachedPictures(
         film: Film,
         predictor: Predictor,
@@ -261,6 +262,7 @@ enum Export {
         receiver.finish()
     }
 
+    @concurrent
     private static func writeEncodedPictures(
         film: Film,
         predictor: Predictor,
@@ -298,6 +300,7 @@ enum Export {
         receiver.finish()
     }
 
+    @concurrent
     private static func writeAudioSamples(
         output: AVAssetReaderTrackOutput,
         reader: AVAssetReader,
@@ -454,7 +457,7 @@ enum Export {
 }
 
 /// Gamma RGB in, limited-range BT.709 YCbCr out. VideoToolbox keeps the 10 bits.
-final class ColorTransfer {
+nonisolated final class ColorTransfer {
     private var session: VTPixelTransferSession?
 
     init() throws {
@@ -523,6 +526,6 @@ final class ColorTransfer {
     }
 }
 
-private extension URL {
+private nonisolated extension URL {
     var exists: Bool { FileManager.default.fileExists(atPath: path) }
 }

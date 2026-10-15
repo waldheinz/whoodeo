@@ -1,7 +1,9 @@
 import AppKit
+import Combine
 import CoreGraphics
 import Darwin
 import Foundation
+import os
 import UniformTypeIdentifiers
 
 enum DisplayZoom: Hashable {
@@ -31,6 +33,8 @@ enum ZoomScale {
 
 @MainActor
 final class Session: ObservableObject {
+    nonisolated let objectWillChange = ObservableObjectPublisher()
+
     @Published var zoomToFit = true
     @Published var magnification: CGFloat = 1
     @Published private(set) var zoomPlacement = 0
@@ -440,10 +444,11 @@ final class Session: ObservableObject {
         let removingCurrent = target == modelURL
         let removingSelection = target == selection
         NSWorkspace.shared.recycle([target]) { [weak self] _, error in
-            Task { @MainActor in
+            let message = error?.localizedDescription
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                if let error {
-                    self.failure = error.localizedDescription
+                if let message {
+                    self.failure = message
                     self.status = self.failure!
                     return
                 }

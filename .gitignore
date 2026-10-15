@@ -1,4 +1,5 @@
 .venv/
+macos/Whoodeo/build/
 __pycache__/
 *.py[cod]
 *.egg-info/

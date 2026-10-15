@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-struct Shown {
+nonisolated struct Shown {
     var index: Int
     var recon: Picture?
     var source: Picture?
@@ -14,7 +14,7 @@ struct Shown {
     var ahead: [Shown] = []
 }
 
-enum FrameNeed {
+nonisolated enum FrameNeed {
     /// Show this frame, from the archive or by running the model. Includes the original.
     case display
     /// Playback picture only. A cached frame does not decode the source film.
@@ -25,7 +25,8 @@ enum FrameNeed {
     case cached
 }
 
-final class Engine {
+/// The main actor only enqueues work. `queue` runs the model, `playback` decodes cached frames, and `lock` covers the request slot.
+nonisolated final class Engine: @unchecked Sendable {
     private let queue = DispatchQueue(label: "whoodeo.engine")
     /// Cached playback. Kept off `queue`, so a running model is not the thing that decodes the blue span.
     private let playback = DispatchQueue(label: "whoodeo.playback")

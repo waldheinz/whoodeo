@@ -3,13 +3,13 @@ import CoreImage
 import CoreVideo
 import Foundation
 
-struct Picture {
+nonisolated struct Picture {
     var image: CGImage
     var width: Int
     var height: Int
 }
 
-enum Pixels {
+nonisolated enum Pixels {
     private static let flags = vImage_Flags(kvImageNoFlags)
     private static let scale16 = Float(1) / 65535
 
@@ -222,7 +222,7 @@ enum Pixels {
     }
 }
 
-private enum Preview {
+private nonisolated enum Preview {
     static let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     static let context = CIContext(options: [
         .cacheIntermediates: false,
@@ -230,7 +230,7 @@ private enum Preview {
     ])
 }
 
-private enum RGBAPool {
+private nonisolated enum RGBAPool {
     static let lock = NSLock()
     static var pool: CVPixelBufferPool?
     static var width = 0
@@ -265,7 +265,7 @@ private enum RGBAPool {
     }
 }
 
-enum TensorFile {
+nonisolated enum TensorFile {
     /// int32 n,c,h,w then float32, little-endian, contiguous NCHW.
     static func read(_ url: URL) throws -> (shape: [Int], data: [Float]) {
         let data = try Data(contentsOf: url)
@@ -294,7 +294,7 @@ enum TensorFile {
     }
 }
 
-struct CLIError: LocalizedError, CustomStringConvertible {
+nonisolated struct CLIError: LocalizedError, CustomStringConvertible {
     var description: String
     var errorDescription: String? { description }
     init(_ description: String) { self.description = description }

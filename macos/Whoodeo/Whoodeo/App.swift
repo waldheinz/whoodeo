@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 @main
@@ -63,7 +64,7 @@ struct WhoodeoApp: App {
     }
 }
 
-enum CLI {
+nonisolated enum CLI {
     static let usage = """
     Whoodeo --check model.mlpackage in.f32 out.f32 [--unit gpu|ane|all]
     Whoodeo --decode video index out.f32
