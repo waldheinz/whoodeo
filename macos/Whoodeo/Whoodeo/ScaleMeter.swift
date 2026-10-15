@@ -4,6 +4,10 @@ import SwiftUI
 struct ScaleMeter: View {
     var rate: Double
     var realtime: Double
+    /// Frames still to scale. Zero hides the estimate.
+    var remaining: Int = 0
+    /// "Cache" while filling, "Export" while writing the movie.
+    var work: String = "Cache"
     /// How many times realtime the right end of the dial stands for. Grows so the needle stays on the scale.
     @State private var span: Double = 2
 
@@ -27,6 +31,14 @@ struct ScaleMeter: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
+            if let eta {
+                Text(eta)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
         }
         .padding(.horizontal, 8)
         .padding(.top, 2)
@@ -37,7 +49,7 @@ struct ScaleMeter: View {
         .onChange(of: realtime) { _, _ in refit() }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessLabel)
-        .help("Neu skalierte Bilder pro Sekunde. Die Marke ist die Echtzeit des Films.")
+        .help("Neu skalierte Bilder pro Sekunde, auch wenn ein Bild länger als eine Sekunde braucht. Die Marke ist die Echtzeit des Films. Darunter steht, wie lange Cache oder Export bei diesem Tempo noch brauchen.")
     }
 
     private var dial: some View {
@@ -82,8 +94,14 @@ struct ScaleMeter: View {
     }
 
     private var number: String {
-        guard rate >= 0.05 else { return "–" }
-        return rate.formatted(.number.precision(.fractionLength(1)))
+        guard rate > 0 else { return "–" }
+        let digits = rate < 1 ? 2 : 1
+        return rate.formatted(.number.precision(.fractionLength(digits)))
+    }
+
+    private var eta: String? {
+        guard rate > 0, remaining > 0 else { return nil }
+        return ScaleReadout.eta(Double(remaining) / rate, work: work)
     }
 
     private var endLabel: String {
@@ -94,14 +112,15 @@ struct ScaleMeter: View {
 
     private var caption: String {
         guard realtime > 0 else { return "noch kein Film" }
-        guard rate >= 0.05 else { return "Echtzeit \(Self.plain(realtime)) fps" }
+        guard rate > 0 else { return "Echtzeit \(Self.plain(realtime)) fps" }
         let ratio = rate / realtime
         if abs(ratio - 1) < 0.05 { return "Echtzeit" }
         return "\(Self.plain(ratio))× Echtzeit"
     }
 
     private var accessLabel: String {
-        if rate < 0.05 { return "Skalierung steht. \(caption)" }
+        if rate <= 0 { return "Skalierung steht. \(caption)" }
+        if let eta { return "Skalierung \(number) Bilder pro Sekunde, \(caption), \(eta)" }
         return "Skalierung \(number) Bilder pro Sekunde, \(caption)"
     }
 
@@ -114,8 +133,9 @@ struct ScaleMeter: View {
     }
 
     private static func plain(_ value: Double) -> String {
-        if abs(value - value.rounded()) < 0.05 { return String(Int(value.rounded())) }
-        return value.formatted(.number.precision(.fractionLength(1)))
+        if value >= 1, abs(value - value.rounded()) < 0.05 { return String(Int(value.rounded())) }
+        let digits = value >= 0.1 ? 1 : (value >= 0.01 ? 2 : 3)
+        return value.formatted(.number.precision(.fractionLength(digits)))
     }
 }
 
@@ -132,7 +152,7 @@ private struct DialArc: Shape {
 
     func path(in rect: CGRect) -> Path {
         let clamped = min(max(fraction, 0), 1)
-        guard clamped > 0.004 else { return Path() }
+        guard clamped > 0 else { return Path() }
         var path = Path()
         let steps = max(Int((clamped * 48).rounded(.up)), 2)
         for step in 0...steps {

@@ -64,7 +64,12 @@ struct ContentView: View {
                 }
             }
             .listStyle(.sidebar)
-            ScaleMeter(rate: session.scaleRate, realtime: session.realtimeRate)
+            ScaleMeter(
+                rate: session.scaleRate,
+                realtime: session.realtimeRate,
+                remaining: session.scaleRemaining,
+                work: session.exporting ? "Export" : "Cache"
+            )
         }
         .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
         .navigationTitle("Modelle")

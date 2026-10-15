@@ -33,8 +33,6 @@ enum ZoomScale {
 
 @MainActor
 final class Session: ObservableObject {
-    nonisolated let objectWillChange = ObservableObjectPublisher()
-
     @Published var zoomToFit = true
     @Published var magnification: CGFloat = 1
     @Published private(set) var zoomPlacement = 0
@@ -61,7 +59,8 @@ final class Session: ObservableObject {
     @Published var deleteName = ""
     @Published var loadingModel = false
     @Published private(set) var coverage = Coverage(count: 0)
-    /// Newly scaled frames per second over the last two seconds. Zero when nothing is computing.
+    /// Newly scaled frames per second. Zero when nothing is computing.
+    /// Slow film stays visible: the pace follows the gap between frames, not a two-second window.
     @Published private(set) var scaleRate: Double = 0
     /// Idle fill of missing frames. Playback and export still store what they compute.
     @Published var fillCache: Bool {
@@ -98,8 +97,8 @@ final class Session: ObservableObject {
     private var fillError: String?
     private var fillReportedDone = false
     private var fillAnnounced = false
-    private var scaleInstants: [ContinuousClock.Instant] = []
-    private var scaleSmooth: Double = 0
+    private var scalePace = ScalePace()
+    private var scaleOrigin: ContinuousClock.Instant?
     private var scaleWatch: Task<Void, Never>?
     private var playFetching = false
     /// ProRes decode for the blue span. Independent of `playFetching`, which is a model frame.
@@ -143,57 +142,44 @@ final class Session: ObservableObject {
     /// The open film's frame rate. Zero when no film is open. The gauge calls this realtime.
     var realtimeRate: Double { facts?.fps ?? 0 }
 
+    /// Frames the running job still has to scale. Zero when fill and export are idle.
+    var scaleRemaining: Int {
+        guard scaleRate > 0 else { return 0 }
+        if exporting {
+            return coverage.missing(from: inPoint, until: outPoint + 1)
+        }
+        guard fillCache, !fillHalted else { return 0 }
+        return max(0, frameCount - coverage.filled - fillSkipped.count)
+    }
+
     /// Count frames the model just produced. Cache hits are not scaling.
     func noteScaled(_ count: Int) {
         guard count > 0 else { return }
         let now = ContinuousClock.now
-        for _ in 0..<count {
-            scaleInstants.append(now)
-        }
-        publishScale(now)
+        if scaleOrigin == nil { scaleOrigin = now }
+        scalePace.add(count, at: Self.seconds(now - scaleOrigin!))
+        if scaleRate != scalePace.shown { scaleRate = scalePace.shown }
         guard scaleWatch == nil else { return }
         scaleWatch = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(400))
                 guard let self else { return }
                 self.publishScale(.now)
-                if self.scaleInstants.isEmpty { break }
+                if self.scalePace.isIdle { break }
             }
             self?.scaleWatch = nil
         }
     }
 
     private func publishScale(_ now: ContinuousClock.Instant) {
-        scaleInstants.removeAll { now - $0 > .seconds(2) }
-        let instant: Double
-        if let first = scaleInstants.first, scaleInstants.count >= 2 {
-            let span = Self.seconds(now - first)
-            instant = span >= 0.25 ? Double(scaleInstants.count - 1) / span : scaleSmooth
-        } else {
-            instant = 0
-        }
-        if instant == 0 {
-            scaleSmooth *= 0.5
-        } else if scaleSmooth == 0 {
-            scaleSmooth = instant
-        } else {
-            scaleSmooth += (instant - scaleSmooth) * 0.2
-        }
-        if scaleSmooth < 0.25 {
-            scaleSmooth = 0
-            if scaleRate != 0 { scaleRate = 0 }
-            return
-        }
-        let shown = (scaleSmooth * 10).rounded() / 10
-        // The tenth stays put until the smoothed rate has moved by half a frame per second.
-        if scaleRate == 0 || abs(scaleSmooth - scaleRate) >= 0.5 {
-            if shown != scaleRate { scaleRate = shown }
-        }
+        guard let origin = scaleOrigin else { return }
+        scalePace.revise(at: Self.seconds(now - origin))
+        if scaleRate != scalePace.shown { scaleRate = scalePace.shown }
     }
 
     private func resetScale() {
-        scaleInstants.removeAll()
-        scaleSmooth = 0
+        scalePace.reset()
+        scaleOrigin = nil
         scaleWatch?.cancel()
         scaleWatch = nil
         if scaleRate != 0 { scaleRate = 0 }

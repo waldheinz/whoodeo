@@ -29,6 +29,24 @@ nonisolated struct Coverage: Equatable {
         words.reduce(0) { $0 + $1.nonzeroBitCount }
     }
 
+    /// Frames still absent in `lower..<upper`.
+    func missing(from lower: Int, until upper: Int) -> Int {
+        let start = max(0, lower)
+        let end = min(count, upper)
+        guard start < end else { return 0 }
+        var missing = 0
+        var index = start
+        while index < end {
+            let bit = index % 64
+            let span = min(64 - bit, end - index)
+            let mask: UInt64 = span == 64 ? .max : (UInt64(1) << span) - 1
+            let present = ((words[index / 64] >> bit) & mask).nonzeroBitCount
+            missing += span - present
+            index += span
+        }
+        return missing
+    }
+
     /// The next hole after `index`, then anything earlier. Nil when every frame is present.
     func nextMissing(after index: Int) -> Int? {
         if count == 0 { return nil }
