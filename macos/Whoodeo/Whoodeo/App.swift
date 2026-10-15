@@ -101,9 +101,9 @@ nonisolated enum CLI {
 
     private static func decode(_ args: [String]) throws {
         guard args.count == 3, let index = Int(args[1]), index >= 0 else { throw CLIError(usage) }
-        let (url, id) = try filmID(for: args[0])
-        let film = try wait { try await Film.load(url, filmID: id) }
-        let frame = try film.frame(at: index)
+        let (url, _) = try filmID(for: args[0])
+        let film = try wait { try await Film.load(url) }
+        let frame = try wait { try await film.frame(at: index) }
         try TensorFile.write(
             URL(fileURLWithPath: args[2]),
             shape: [1, 3, frame.height, frame.width],
@@ -118,12 +118,12 @@ nonisolated enum CLI {
         guard paths.count == 2 else { throw CLIError(usage) }
         let count = frames > 0 ? frames : 8
         let predictor = try Predictor(url: URL(fileURLWithPath: paths[0]), unit: unit)
-        let (url, id) = try filmID(for: paths[1])
-        let film = try wait { try await Film.load(url, filmID: id) }
+        let (url, _) = try filmID(for: paths[1])
+        let film = try wait { try await Film.load(url) }
         let last = min(count + 2, film.facts.count)
         for index in 0..<last {
             let decodeStart = CFAbsoluteTimeGetCurrent()
-            let window = try film.window(at: index, frames: predictor.info.inFrames)
+            let window = try wait { try await film.window(at: index, frames: predictor.info.inFrames) }
             let decode = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000
             let modelStart = CFAbsoluteTimeGetCurrent()
             let predicted = try predictor.predict(
@@ -155,7 +155,7 @@ nonisolated enum CLI {
             if list.current.isEmpty { list.current = id }
             return id
         }
-        let film = try wait { try await Film.load(video, filmID: id) }
+        let film = try wait { try await Film.load(video) }
         try FilmLibrary.mutate { list in
             FilmLibrary.remember(id, width: film.facts.width, height: film.facts.height, frames: film.facts.count, in: &list)
         }
@@ -176,7 +176,7 @@ nonisolated enum CLI {
     }
 
     /// Listed films keep the id they already have. Anything else uses the digest it would get when added.
-    /// A remux for an id that is not in the list is pruned the next time the app starts.
+    /// A cache directory whose name is not a listed film id is pruned the next time the app starts.
     private static func filmID(for path: String) throws -> (URL, String) {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
         if let existing = FilmLibrary.load().films.first(where: { $0.path == url.path }) {

@@ -41,6 +41,8 @@ nonisolated enum Pixels {
         guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_64RGBALE else {
             throw CLIError("Bildformat lässt sich nicht zeichnen")
         }
+        Preview.lock.lock()
+        defer { Preview.lock.unlock() }
         let space = Preview.space
         CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, .shouldPropagate)
         CVBufferRemoveAttachment(buffer, kCVImageBufferColorPrimariesKey)
@@ -223,6 +225,7 @@ nonisolated enum Pixels {
 }
 
 private nonisolated enum Preview {
+    static let lock = NSLock()
     static let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     static let context = CIContext(options: [
         .cacheIntermediates: false,

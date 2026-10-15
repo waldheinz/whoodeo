@@ -56,10 +56,10 @@ nonisolated enum Export {
         predictor: Predictor,
         store: FrameStore,
         index: Int,
-        stored: (Int) -> Void
+        stored: @escaping (Int) -> Void
     ) throws -> (width: Int, height: Int) {
         if let size = store.dimensions() { return size }
-        _ = try materialize(index, film: film, predictor: predictor, store: store, stored: stored)
+        _ = try wait { try await materialize(index, film: film, predictor: predictor, store: store, stored: stored) }
         guard let size = store.dimensions() else { throw CLIError("Ausgabe ohne Größe") }
         return size
     }
@@ -71,9 +71,9 @@ nonisolated enum Export {
         predictor: Predictor,
         store: FrameStore,
         stored: (Int) -> Void
-    ) throws -> (data: Data, rgb: [Float]?) {
+    ) async throws -> (data: Data, rgb: [Float]?) {
         if let data = try store.data(at: index) { return (data, nil) }
-        let window = try film.window(at: index, frames: predictor.info.inFrames)
+        let window = try await film.window(at: index, frames: predictor.info.inFrames)
         let predicted = try predictor.predict(
             stack: window.stack,
             width: window.current.width,
@@ -112,12 +112,11 @@ nonisolated enum Export {
                     )
                 }
                 for pipe in audioPipes {
-                    let output = pipe.output
                     let reader = pipe.reader
                     let receiver = pipe.receiver
                     group.addTask {
                         try await writeAudioSamples(
-                            output: output, reader: reader, receiver: receiver,
+                            reader: reader, receiver: receiver,
                             pulse: pulse, cancelled: cancelled
                         )
                     }
@@ -166,12 +165,11 @@ nonisolated enum Export {
                     )
                 }
                 for pipe in audioPipes {
-                    let output = pipe.output
                     let reader = pipe.reader
                     let receiver = pipe.receiver
                     group.addTask {
                         try await writeAudioSamples(
-                            output: output, reader: reader, receiver: receiver,
+                            reader: reader, receiver: receiver,
                             pulse: pulse, cancelled: cancelled
                         )
                     }
@@ -252,7 +250,7 @@ nonisolated enum Export {
             try Task.checkCancellation()
             if cancelled() { throw CLIError("abgebrochen") }
             let time = film.time(for: index)
-            let prepared = try materialize(index, film: film, predictor: predictor, store: store, stored: stored)
+            let prepared = try await materialize(index, film: film, predictor: predictor, store: store, stored: stored)
             let sample = try store.sampleBuffer(prepared.data, time: time, duration: film.duration(at: index))
             try await receiver.append(CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample))
             done += 1
@@ -284,7 +282,7 @@ nonisolated enum Export {
             try Task.checkCancellation()
             if cancelled() { throw CLIError("abgebrochen") }
             let time = film.time(for: index)
-            let prepared = try materialize(index, film: film, predictor: predictor, store: store, stored: stored)
+            let prepared = try await materialize(index, film: film, predictor: predictor, store: store, stored: stored)
             let buffer: CVPixelBuffer
             if let rgb = prepared.rgb {
                 buffer = try transfer.convert(rgb, width: width, height: height, format: format, pool: nil)
@@ -302,8 +300,7 @@ nonisolated enum Export {
 
     @concurrent
     private static func writeAudioSamples(
-        output: AVAssetReaderTrackOutput,
-        reader: AVAssetReader,
+        reader: AudioReader,
         receiver: AVAssetWriterInput.SampleBufferReceiver,
         pulse: Pulse,
         cancelled: () -> Bool
@@ -311,13 +308,8 @@ nonisolated enum Export {
         while true {
             try Task.checkCancellation()
             if cancelled() { throw CLIError("abgebrochen") }
-            guard let sample = output.copyNextSampleBuffer() else {
-                if reader.status == .failed {
-                    throw reader.error ?? CLIError("Ton bricht ab")
-                }
-                break
-            }
-            try await receiver.append(CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample))
+            guard let sample = try reader.next() else { break }
+            try await receiver.append(sample)
             pulse.tick()
         }
         receiver.finish()
@@ -358,9 +350,132 @@ nonisolated enum Export {
     }
 
     private struct AudioPipe {
-        var output: AVAssetReaderTrackOutput
-        var reader: AVAssetReader
+        var reader: AudioReader
         var receiver: AVAssetWriterInput.SampleBufferReceiver
+    }
+
+    /// PCM from libav, one film file of its own so it does not share the picture decoder.
+    private final class AudioReader: @unchecked Sendable {
+        private let audio: OpaquePointer
+        private let channels: Int
+        private let rate: Double
+        private var done = false
+
+        init(film: Film, track: AudioFacts, start: Double, end: Double) throws {
+            var message = [CChar](repeating: 0, count: 512)
+            let opened = message.withUnsafeMutableBufferPointer { buffer in
+                film.facts.url.path.withCString {
+                    source_audio_begin($0, Int32(track.track), start, end, buffer.baseAddress, Int32(buffer.count))
+                }
+            }
+            guard let opened else {
+                let detail = String(cString: message)
+                throw CLIError(detail.isEmpty ? "Ton lässt sich nicht öffnen" : detail)
+            }
+            audio = opened
+            channels = Int(source_audio_channels(opened))
+            rate = source_audio_rate(opened)
+        }
+
+        deinit {
+            source_audio_close(audio)
+        }
+
+        func next() throws -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent>? {
+            if done { return nil }
+            let limit = 8192
+            var samples = [Int16](repeating: 0, count: limit * channels)
+            var frames: Int32 = 0
+            var pts = 0.0
+            let status = samples.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                guard let base = buffer.baseAddress else { return -1 }
+                return source_audio_read(audio, base, Int32(limit), &frames, &pts)
+            }
+            if status < 0 { throw CLIError(String(cString: source_audio_error(audio))) }
+            if status > 0 || frames == 0 {
+                done = true
+                return nil
+            }
+            return try Self.buffer(samples: samples, frames: Int(frames), channels: channels, rate: rate, pts: pts)
+        }
+
+        private static func buffer(
+            samples: [Int16],
+            frames: Int,
+            channels: Int,
+            rate: Double,
+            pts: Double
+        ) throws -> CMReadySampleBuffer<CMSampleBuffer.DynamicContent> {
+            var description = AudioStreamBasicDescription(
+                mSampleRate: rate,
+                mFormatID: kAudioFormatLinearPCM,
+                mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+                mBytesPerPacket: UInt32(channels * 2),
+                mFramesPerPacket: 1,
+                mBytesPerFrame: UInt32(channels * 2),
+                mChannelsPerFrame: UInt32(channels),
+                mBitsPerChannel: 16,
+                mReserved: 0
+            )
+            var format: CMAudioFormatDescription?
+            let made = CMAudioFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                asbd: &description,
+                layoutSize: 0,
+                layout: nil,
+                magicCookieSize: 0,
+                magicCookie: nil,
+                extensions: nil,
+                formatDescriptionOut: &format
+            )
+            guard made == noErr, let format else { throw CLIError("Tonformat fehlt (\(made))") }
+            let bytes = frames * channels * MemoryLayout<Int16>.size
+            var block: CMBlockBuffer?
+            var status = CMBlockBufferCreateWithMemoryBlock(
+                allocator: kCFAllocatorDefault,
+                memoryBlock: nil,
+                blockLength: bytes,
+                blockAllocator: kCFAllocatorDefault,
+                customBlockSource: nil,
+                offsetToData: 0,
+                dataLength: bytes,
+                flags: 0,
+                blockBufferOut: &block
+            )
+            guard status == kCMBlockBufferNoErr, let block else { throw CLIError("Tonpuffer fehlt") }
+            status = samples.withUnsafeBytes { raw in
+                CMBlockBufferReplaceDataBytes(
+                    with: raw.baseAddress!,
+                    blockBuffer: block,
+                    offsetIntoDestination: 0,
+                    dataLength: bytes
+                )
+            }
+            guard status == kCMBlockBufferNoErr else { throw CLIError("Tonpuffer fehlt") }
+            let scale = CMTimeScale(max(1, rate.rounded()))
+            var timing = CMSampleTimingInfo(
+                duration: CMTime(value: 1, timescale: scale),
+                presentationTimeStamp: CMTime(value: CMTimeValue((pts * rate).rounded()), timescale: scale),
+                decodeTimeStamp: .invalid
+            )
+            var sample: CMSampleBuffer?
+            status = CMSampleBufferCreate(
+                allocator: kCFAllocatorDefault,
+                dataBuffer: block,
+                dataReady: true,
+                makeDataReadyCallback: nil,
+                refcon: nil,
+                formatDescription: format,
+                sampleCount: frames,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleSizeEntryCount: 0,
+                sampleSizeArray: nil,
+                sampleBufferOut: &sample
+            )
+            guard status == noErr, let sample else { throw CLIError("Tonpuffer fehlt (\(status))") }
+            return CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample)
+        }
     }
 
     private final class Pulse: @unchecked Sendable {
@@ -398,36 +513,15 @@ nonisolated enum Export {
     }
 
     private static func audioInputs(film: Film, writer: AVAssetWriter, range: Range<Int>) throws -> [AudioPipe] {
-        let begin = film.time(for: range.lowerBound)
-        let end = film.time(for: range.upperBound)
-        let span = CMTimeRange(start: begin, end: end)
+        let begin = film.time(for: range.lowerBound).seconds
+        let end = film.time(for: range.upperBound).seconds
         var pipes: [AudioPipe] = []
-        for (track, facts) in film.audio {
-            let passthrough = facts.subtype == kAudioFormatMPEG4AAC
-                || facts.subtype == kAudioFormatLinearPCM
-                || facts.subtype == kAudioFormatAppleLossless
-            let settings = passthrough ? nil : aacSettings(facts)
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-            guard writer.canAdd(input) else {
-                throw CLIError("Audio \(fourCC(facts.subtype)) passt nicht in den Film")
-            }
+        for facts in film.audio {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings(facts))
+            guard writer.canAdd(input) else { throw CLIError("Audio passt nicht in den Film") }
             let receiver = writer.inputReceiver(for: input)
-            let reader = try AVAssetReader(asset: film.asset)
-            reader.timeRange = span
-            let outputSettings: [String: Any]? = passthrough ? nil : [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsNonInterleaved: false,
-                AVSampleRateKey: facts.sampleRate,
-                AVNumberOfChannelsKey: facts.channels,
-            ]
-            let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
-            guard reader.canAdd(output) else { throw CLIError("Audio lässt sich nicht lesen") }
-            reader.add(output)
-            guard reader.startReading() else { throw reader.error ?? CLIError("Audio startet nicht") }
-            pipes.append(AudioPipe(output: output, reader: reader, receiver: receiver))
+            let reader = try AudioReader(film: film, track: facts, start: begin, end: end)
+            pipes.append(AudioPipe(reader: reader, receiver: receiver))
         }
         return pipes
     }
@@ -445,15 +539,18 @@ nonisolated enum Export {
         ]
     }
 
-    private static func fourCC(_ value: AudioFormatID) -> String {
-        let bytes: [UInt8] = [
-            UInt8((value >> 24) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
-        ]
-        return String(bytes: bytes, encoding: .ascii) ?? String(value)
+    private static func wait<T>(_ body: @escaping () async throws -> T) throws -> T {
+        var result: Result<T, Error>?
+        let gate = DispatchSemaphore(value: 0)
+        Task {
+            do { result = .success(try await body()) }
+            catch { result = .failure(error) }
+            gate.signal()
+        }
+        gate.wait()
+        return try result!.get()
     }
+
 }
 
 /// Gamma RGB in, limited-range BT.709 YCbCr out. VideoToolbox keeps the 10 bits.

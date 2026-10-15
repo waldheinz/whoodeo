@@ -1,6 +1,4 @@
-import AVFoundation
 import CoreMedia
-import CoreVideo
 import Foundation
 
 nonisolated struct FilmFacts: Sendable {
@@ -15,8 +13,9 @@ nonisolated struct FilmFacts: Sendable {
 nonisolated struct AudioFacts: Sendable {
     var channels: Int
     var sampleRate: Double
-    var subtype: AudioFormatID
     var dataRate: Double
+    /// Which audio stream this is, in the order libav lists them.
+    var track: Int
 }
 
 nonisolated struct Decoded {
@@ -29,285 +28,148 @@ nonisolated struct Decoded {
 
 nonisolated final class Film {
     let facts: FilmFacts
-    let asset: AVURLAsset
-    let video: AVAssetTrack
-    let audio: [(track: AVAssetTrack, facts: AudioFacts)]
-    let start: CMTime
+    let audio: [AudioFacts]
     let frameDuration: CMTime
-    let timeRange: CMTimeRange
-    /// Sample index and its real timestamp, where the picture stayed up longer than one interval.
-    private let breaks: [(index: Int, time: CMTime)]
-
-    private var reader: AVAssetReader?
-    private var output: AVAssetReaderTrackOutput?
-    private var nextIndex: Int?
+    private let reader: OpaquePointer
     private var held: [Int: Decoded] = [:]
     private var heldOrder: [Int] = []
-    private var pixelFormat: OSType
 
     @concurrent
-    static func load(_ url: URL, filmID: String) async throws -> Film {
-        // AVFoundation does not read Matroska. A stream copy keeps the pictures.
-        let media = try await readableVideo(url, filmID: filmID)
-        let asset = AVURLAsset(url: media, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-        let videos = try await asset.loadTracks(withMediaType: .video)
-        guard let video = videos.first else { throw CLIError("kein Bild in \(url.lastPathComponent)") }
-        let range = try await video.load(.timeRange)
-        let rate = try await video.load(.nominalFrameRate)
-        let natural = try await video.load(.naturalSize)
-        let descriptions = try await video.load(.formatDescriptions)
-        var bits = 8
-        if let raw = descriptions.first {
-            let description = raw as CMFormatDescription
-            if let number = CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_BitsPerComponent) as? NSNumber {
-                bits = number.intValue
-            }
+    static func load(_ url: URL) async throws -> Film {
+        var message = [CChar](repeating: 0, count: 512)
+        let opened = message.withUnsafeMutableBufferPointer { buffer in
+            url.path.withCString { source_open($0, buffer.baseAddress, Int32(buffer.count)) }
         }
-        guard let cursor = video.makeSampleCursor(presentationTimeStamp: range.start) else {
+        guard let opened else {
+            let detail = String(cString: message)
+            throw CLIError(detail.isEmpty ? "kein Bild in \(url.lastPathComponent)" : detail)
+        }
+        let count = Int(source_count(opened))
+        let width = Int(source_width(opened))
+        let height = Int(source_height(opened))
+        guard count > 0, width > 0, height > 0 else {
+            source_close(opened)
             throw CLIError("keine Bilder in \(url.lastPathComponent)")
         }
-        let start = cursor.presentationTimeStamp
-        var duration = CMTime(value: 1, timescale: rate > 0 ? CMTimeScale(rate.rounded()) : 30)
-        var count = 1
-        // A frame that stays up longer than the first interval shifts every later
-        // timestamp. The picture is still the next sample, so remember where the clock jumped.
-        var breaks: [(index: Int, time: CMTime)] = []
-        if cursor.stepInPresentationOrder(byCount: 1) == 1 {
-            duration = CMTimeSubtract(cursor.presentationTimeStamp, start)
-            count = 2
-            var expected = cursor.presentationTimeStamp
-            let slack = duration.seconds * 0.45
-            while cursor.stepInPresentationOrder(byCount: 1) == 1 {
-                count += 1
-                expected = CMTimeAdd(expected, duration)
-                let stamp = cursor.presentationTimeStamp
-                if abs(CMTimeSubtract(stamp, expected).seconds) > slack {
-                    breaks.append((count - 1, stamp))
-                    expected = stamp
-                }
-            }
+        var audio: [AudioFacts] = []
+        let tracks = Int(source_audio_count(opened))
+        for track in 0..<tracks {
+            var channels: Int32 = 0
+            var rate = 0.0
+            var bitRate = 0.0
+            guard source_audio_info(opened, Int32(track), &channels, &rate, &bitRate) == 0 else { continue }
+            audio.append(AudioFacts(
+                channels: Int(channels),
+                sampleRate: rate,
+                dataRate: bitRate,
+                track: track
+            ))
         }
-        var audios: [(AVAssetTrack, AudioFacts)] = []
-        for track in try await asset.loadTracks(withMediaType: .audio) {
-            let formats = try await track.load(.formatDescriptions)
-            guard let raw = formats.first else { continue }
-            let description = raw as CMFormatDescription
-            let subtype = CMFormatDescriptionGetMediaSubType(description)
-            let basic = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee
-            let dataRate = try await track.load(.estimatedDataRate)
-            audios.append((track, AudioFacts(
-                channels: Int(basic?.mChannelsPerFrame ?? 2),
-                sampleRate: basic?.mSampleRate ?? 48_000,
-                subtype: subtype,
-                dataRate: Double(dataRate)
-            )))
-        }
-        let fps = duration.seconds > 0 ? 1 / duration.seconds : Double(rate > 0 ? rate : 30)
+        let fps = source_fps(opened)
+        let duration = Film.interval(opened, count: count, fps: fps)
         let facts = FilmFacts(
             url: url,
-            width: Int(abs(natural.width).rounded()),
-            height: Int(abs(natural.height).rounded()),
+            width: width,
+            height: height,
             count: count,
-            fps: fps,
-            bits: bits
+            fps: fps > 0 ? fps : 25,
+            bits: Int(source_bits(opened))
         )
-        return Film(
-            facts: facts,
-            asset: asset,
-            video: video,
-            audio: audios,
-            start: start,
-            frameDuration: duration,
-            timeRange: range,
-            breaks: breaks,
-            pixelFormat: bits > 8 ? kCVPixelFormatType_64RGBALE : kCVPixelFormatType_32BGRA
-        )
+        return Film(facts: facts, audio: audio, frameDuration: duration, reader: opened)
+    }
+
+    private static func interval(_ file: OpaquePointer, count: Int, fps: Double) -> CMTime {
+        if count >= 2 {
+            let delta = CMTimeSubtract(stamp(1, file), stamp(0, file))
+            if delta.seconds > 0 { return delta }
+        }
+        let scale = Int32(max(1, (fps > 0 ? fps : 25).rounded()))
+        return CMTime(value: 1, timescale: scale)
+    }
+
+    private static func stamp(_ index: Int, _ file: OpaquePointer) -> CMTime {
+        var value: Int64 = 0
+        var scale: Int32 = 1
+        if source_time(file, Int32(index), &value, &scale) != 0 || scale <= 0 {
+            return .zero
+        }
+        return CMTime(value: value, timescale: scale)
     }
 
     private init(
         facts: FilmFacts,
-        asset: AVURLAsset,
-        video: AVAssetTrack,
-        audio: [(AVAssetTrack, AudioFacts)],
-        start: CMTime,
+        audio: [AudioFacts],
         frameDuration: CMTime,
-        timeRange: CMTimeRange,
-        breaks: [(index: Int, time: CMTime)],
-        pixelFormat: OSType
+        reader: OpaquePointer
     ) {
         self.facts = facts
-        self.asset = asset
-        self.video = video
         self.audio = audio
-        self.start = start
         self.frameDuration = frameDuration
-        self.timeRange = timeRange
-        self.breaks = breaks
-        self.pixelFormat = pixelFormat
+        self.reader = reader
     }
 
-    /// The file AVFoundation can actually read. Otherwise a stream copy at `Cache/<filmID>/source.mov`.
-    @concurrent
-    private static func readableVideo(_ url: URL, filmID: String) async throws -> URL {
-        if await hasVideo(url) { return url }
-        guard let ffmpeg = ffmpegURL() else {
-            throw CLIError("AVFoundation öffnet \(url.pathExtension) nicht, und ffmpeg ist nicht installiert.")
-        }
-        let dest = FrameStore.remuxURL(filmID: filmID)
-        try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: dest.path) { return dest }
-        // The extension has to be .mov. ffmpeg refuses a file that ends in .partial.
-        let partial = dest.deletingLastPathComponent().appendingPathComponent(".source.partial.mov")
-        if try ffmpegCopy(ffmpeg, url: url, output: partial, audio: true) != nil {
-            if let reason = try ffmpegCopy(ffmpeg, url: url, output: partial, audio: false) {
-                throw CLIError("ffmpeg konnte \(url.lastPathComponent) nicht nach QuickTime umpacken. \(reason)")
-            }
-        }
-        if FileManager.default.fileExists(atPath: dest.path) {
-            try FileManager.default.removeItem(at: dest)
-        }
-        try FileManager.default.moveItem(at: partial, to: dest)
-        return dest
-    }
-
-    @concurrent
-    private static func hasVideo(_ url: URL) async -> Bool {
-        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-        do {
-            let tracks = try await asset.loadTracks(withMediaType: .video)
-            return !tracks.isEmpty
-        } catch {
-            return false
-        }
-    }
-
-    private static func ffmpegURL() -> URL? {
-        for path in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-        where FileManager.default.isExecutableFile(atPath: path) {
-            return URL(fileURLWithPath: path)
-        }
-        return nil
-    }
-
-    /// Nil when the copy landed. Otherwise the last ffmpeg error line.
-    private static func ffmpegCopy(_ ffmpeg: URL, url: URL, output: URL, audio: Bool) throws -> String? {
-        if FileManager.default.fileExists(atPath: output.path) {
-            try FileManager.default.removeItem(at: output)
-        }
-        var args = ["-hide_banner", "-loglevel", "error", "-y", "-i", url.path, "-map", "0:v:0"]
-        if audio {
-            args.append("-map")
-            args.append("0:a?")
-        }
-        args.append(contentsOf: ["-c", "copy", "-movflags", "+faststart", "-f", "mov", output.path])
-        let proc = Process()
-        proc.executableURL = ffmpeg
-        proc.arguments = args
-        let log = FileManager.default.temporaryDirectory.appendingPathComponent("whoodeo-ffmpeg-\(UUID().uuidString).log")
-        FileManager.default.createFile(atPath: log.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: log)
-        proc.standardError = handle
-        proc.standardOutput = FileHandle.nullDevice
-        try proc.run()
-        proc.waitUntilExit()
-        try handle.close()
-        defer { try? FileManager.default.removeItem(at: log) }
-        if proc.terminationStatus == 0 { return nil }
-        let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
-        try? FileManager.default.removeItem(at: output)
-        let line = text.split(whereSeparator: \.isNewline).last.map(String.init) ?? "exit \(proc.terminationStatus)"
-        return line
+    deinit {
+        source_close(reader)
     }
 
     func time(for index: Int) -> CMTime {
-        var originIndex = 0
-        var origin = start
-        for item in breaks where item.index <= index {
-            originIndex = item.index
-            origin = item.time
-        }
-        return CMTimeAdd(origin, CMTimeMultiply(frameDuration, multiplier: Int32(index - originIndex)))
+        guard facts.count > 0 else { return .zero }
+        if index < facts.count { return Film.stamp(max(index, 0), reader) }
+        let last = Film.stamp(facts.count - 1, reader)
+        let extra = index - (facts.count - 1)
+        guard extra > 0, extra <= Int(Int32.max) else { return last }
+        return CMTimeAdd(last, CMTimeMultiply(frameDuration, multiplier: Int32(extra)))
     }
 
     func duration(at index: Int) -> CMTime {
         guard index + 1 < facts.count else { return frameDuration }
-        return CMTimeSubtract(time(for: index + 1), time(for: index))
+        let delta = CMTimeSubtract(time(for: index + 1), time(for: index))
+        return delta.seconds > 0 ? delta : frameDuration
     }
 
-    func frame(at index: Int) throws -> Decoded {
+    func frame(at index: Int) async throws -> Decoded {
         let clamped = min(max(index, 0), max(facts.count - 1, 0))
         if let hit = held[clamped] { return hit }
-        if nextIndex != clamped { try openReader(at: clamped) }
-        let expected = time(for: clamped).seconds
-        let half = frameDuration.seconds * 0.45
-        while true {
-            guard let sample = output?.copyNextSampleBuffer(),
-                  let buffer = CMSampleBufferGetImageBuffer(sample) else {
-                throw CLIError("Bild \(clamped) fehlt")
-            }
-            let stamp = CMSampleBufferGetPresentationTimeStamp(sample)
-            let delta = stamp.seconds - expected
-            if delta > half {
-                throw CLIError("Bild \(clamped) kommt bei \(stamp.seconds) s, erwartet \(expected) s")
-            }
-            if delta < -half { continue }
-            let decoded = Decoded(
-                index: clamped,
-                time: stamp,
-                width: CVPixelBufferGetWidth(buffer),
-                height: CVPixelBufferGetHeight(buffer),
-                rgb: try Pixels.planar(buffer)
-            )
-            nextIndex = clamped + 1
-            remember(decoded)
-            return decoded
+        let plane = facts.width * facts.height
+        var rgb = [Float](repeating: 0, count: plane * 3)
+        var width: Int32 = 0
+        var height: Int32 = 0
+        let status = rgb.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            guard let base = buffer.baseAddress else { return -1 }
+            return source_frame(reader, Int32(clamped), base, Int32(buffer.count), &width, &height)
         }
+        guard status == 0, width > 0, height > 0 else {
+            throw CLIError(String(cString: source_error(reader)))
+        }
+        let pictureWidth = Int(width)
+        let pictureHeight = Int(height)
+        if pictureWidth != facts.width || pictureHeight != facts.height {
+            throw CLIError("Bild \(clamped + 1) ist \(pictureWidth)×\(pictureHeight), der Film \(facts.width)×\(facts.height)")
+        }
+        let decoded = Decoded(
+            index: clamped,
+            time: time(for: clamped),
+            width: pictureWidth,
+            height: pictureHeight,
+            rgb: rgb
+        )
+        remember(decoded)
+        return decoded
     }
 
     /// Previous, current, next. The same edge repeat as `iter_reconstructions`.
-    func window(at index: Int, frames: Int) throws -> (stack: [Float], current: Decoded) {
+    func window(at index: Int, frames: Int) async throws -> (stack: [Float], current: Decoded) {
         let radius = frames / 2
         var planes: [[Float]] = []
         var current: Decoded?
         for dt in -radius...radius {
             let slot = min(max(index + dt, 0), max(facts.count - 1, 0))
-            let decoded = try frame(at: slot)
+            let decoded = try await frame(at: slot)
             planes.append(decoded.rgb)
             if dt == 0 { current = decoded }
         }
         guard let current else { throw CLIError("Bild \(index) fehlt") }
         return (Pixels.stack(planes), current)
-    }
-
-    private func openReader(at index: Int) throws {
-        reader?.cancelReading()
-        reader = nil
-        output = nil
-        nextIndex = nil
-        let reader = try AVAssetReader(asset: asset)
-        let begin = time(for: index)
-        var end = timeRange.end
-        if CMTimeCompare(end, begin) <= 0 {
-            end = CMTimeAdd(begin, frameDuration)
-        }
-        reader.timeRange = CMTimeRange(start: begin, end: end)
-        let output = AVAssetReaderTrackOutput(track: video, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
-        ])
-        output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { throw CLIError("Decoder lehnt das Bildformat ab") }
-        reader.add(output)
-        if !reader.startReading() {
-            if pixelFormat != kCVPixelFormatType_32BGRA {
-                pixelFormat = kCVPixelFormatType_32BGRA
-                try openReader(at: index)
-                return
-            }
-            throw reader.error ?? CLIError("Decoder startet nicht")
-        }
-        self.reader = reader
-        self.output = output
-        nextIndex = index
     }
 
     private func remember(_ decoded: Decoded) {

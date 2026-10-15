@@ -10,32 +10,25 @@ nonisolated struct Shown {
     var height: Int
     var fromCache: Bool
     var stored: Bool
-    /// Further cached frames decoded in the same playback trip.
-    var ahead: [Shown] = []
 }
 
 nonisolated enum FrameNeed {
     /// Show this frame, from the archive or by running the model. Includes the original.
     case display
-    /// Playback picture only. A cached frame does not decode the source film.
-    case play
     /// Store this frame and skip the preview pictures.
     case fill
     /// Show this frame only when the archive already has it.
     case cached
 }
 
-/// The main actor only enqueues work. `queue` runs the model, `playback` decodes cached frames, and `lock` covers the request slot.
+/// The main actor only enqueues work. `queue` runs the model, and `lock` covers the request slot.
 nonisolated final class Engine: @unchecked Sendable {
     private let queue = DispatchQueue(label: "whoodeo.engine")
-    /// Cached playback. Kept off `queue`, so a running model is not the thing that decodes the blue span.
-    private let playback = DispatchQueue(label: "whoodeo.playback")
     private let lock = NSLock()
     private var wanted: Int?
     private var handler: ((Result<Shown, Error>) -> Void)?
     private var store: FrameStore?
     private var need = FrameNeed.display
-    private var runLimit = 1
     private var busy = false
     private var hold = false
     private var film: Film?
@@ -45,7 +38,7 @@ nonisolated final class Engine: @unchecked Sendable {
     func openFilm(_ url: URL, filmID: String, done: @escaping (Result<FilmFacts, Error>) -> Void) {
         queue.async {
             do {
-                let film = try Self.wait { try await Film.load(url, filmID: filmID) }
+                let film = try Self.wait { try await Film.load(url) }
                 self.film = film
                 done(.success(film.facts))
             } catch {
@@ -70,7 +63,7 @@ nonisolated final class Engine: @unchecked Sendable {
         openModel(url, unit: unit, done: done)
     }
 
-    func request(_ index: Int, store: FrameStore?, need: FrameNeed, run: Int = 1, done: @escaping (Result<Shown, Error>) -> Void) {
+    func request(_ index: Int, store: FrameStore?, need: FrameNeed, done: @escaping (Result<Shown, Error>) -> Void) {
         lock.lock()
         // A request that has not started yet is replaced. Tell its caller, or the
         // session keeps believing that fill is still running and never asks again.
@@ -79,7 +72,6 @@ nonisolated final class Engine: @unchecked Sendable {
         handler = done
         self.store = store
         self.need = need
-        self.runLimit = max(run, 1)
         let start = !busy && !hold
         if start { busy = true }
         lock.unlock()
@@ -157,17 +149,15 @@ nonisolated final class Engine: @unchecked Sendable {
         store = nil
         lock.unlock()
         displaced?(.failure(CancellationError()))
-        playback.async { [weak self] in
+        queue.async { [weak self] in
             guard let self else {
                 done()
                 return
             }
-            self.queue.async {
-                self.lock.lock()
-                self.store = nil
-                self.lock.unlock()
-                done()
-            }
+            self.lock.lock()
+            self.store = nil
+            self.lock.unlock()
+            done()
         }
     }
 
@@ -178,7 +168,6 @@ nonisolated final class Engine: @unchecked Sendable {
             let done = handler
             let store = store
             let need = need
-            let run = runLimit
             wanted = nil
             handler = nil
             if index == nil || done == nil {
@@ -189,43 +178,11 @@ nonisolated final class Engine: @unchecked Sendable {
             lock.unlock()
             let result: Result<Shown, Error>
             do {
-                let shown = try make(index!, store: store, need: need)
-                result = .success(cushion(shown, index: index!, store: store, need: need, run: run))
+                result = .success(try make(index!, store: store, need: need))
             } catch {
                 result = .failure(error)
             }
             done?(result)
-        }
-    }
-
-    /// Decode a cached run for playback. Does not use the model queue or the request slot.
-    func decodeCached(from index: Int, store: FrameStore, limit: Int, done: @escaping (Result<[Shown], Error>) -> Void) {
-        let count = max(limit, 1)
-        playback.async {
-            do {
-                var frames: [Shown] = []
-                var cursor = index
-                while frames.count < count {
-                    guard store.contains(cursor) else { break }
-                    let started = CFAbsoluteTimeGetCurrent()
-                    let buffer = try store.image(at: cursor)
-                    let picture = try Pixels.picture(buffer)
-                    frames.append(Shown(
-                        index: cursor,
-                        recon: picture,
-                        source: nil,
-                        milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000,
-                        width: picture.width,
-                        height: picture.height,
-                        fromCache: true,
-                        stored: true
-                    ))
-                    cursor += 1
-                }
-                done(.success(frames))
-            } catch {
-                done(.failure(error))
-            }
         }
     }
 
@@ -238,29 +195,6 @@ nonisolated final class Engine: @unchecked Sendable {
             }
             done(try? self.sourcePicture(film: film, index: index, width: width, height: height).image)
         }
-    }
-
-    /// One playback trip decodes the cached run, up to `run` frames.
-    /// A hole stops the run. The frame being watched is still computed when it is the first one.
-    private func cushion(_ first: Shown, index: Int, store: FrameStore?, need: FrameNeed, run: Int) -> Shown {
-        guard need == .play, run > 1, first.fromCache, first.recon != nil else { return first }
-        var ahead: [Shown] = []
-        var cursor = index + 1
-        while ahead.count + 1 < run {
-            guard let store, store.contains(cursor) else { break }
-            do {
-                let next = try make(cursor, store: store, need: .play)
-                guard next.recon != nil else { break }
-                ahead.append(next)
-            } catch {
-                break
-            }
-            cursor += 1
-        }
-        guard !ahead.isEmpty else { return first }
-        var first = first
-        first.ahead = ahead
-        return first
     }
 
     private func make(_ index: Int, store: FrameStore?, need: FrameNeed) throws -> Shown {
@@ -291,7 +225,7 @@ nonisolated final class Engine: @unchecked Sendable {
             return Shown(index: index, recon: nil, source: nil, milliseconds: 0, width: 0, height: 0, fromCache: false, stored: false)
         }
         guard let predictor else { throw CLIError("kein Modell") }
-        let window = try film.window(at: index, frames: predictor.info.inFrames)
+        let window = try Self.wait { try await film.window(at: index, frames: predictor.info.inFrames) }
         let predicted = try predictor.predict(
             stack: window.stack,
             width: window.current.width,
@@ -331,7 +265,7 @@ nonisolated final class Engine: @unchecked Sendable {
     }
 
     private func sourcePicture(film: Film, index: Int, width: Int, height: Int) throws -> Picture {
-        let current = try film.frame(at: index)
+        let current = try Self.wait { try await film.frame(at: index) }
         let scale = max(width / max(current.width, 1), 1)
         let enlarged = Pixels.nearest(current.rgb, width: current.width, height: current.height, scale: scale)
         let sized = enlarged.count == width * height * 3

@@ -105,13 +105,6 @@ final class Session: ObservableObject {
     private var scaleOrigin: ContinuousClock.Instant?
     private var scaleWatch: Task<Void, Never>?
     private var playFetching = false
-    /// ProRes decode for the blue span. Independent of `playFetching`, which is a model frame.
-    private var cacheDecoding = false
-    private var playStalled = false
-    private var playTask: Task<Void, Never>?
-    /// Film time. Frame `playEpochFrame` was on screen at `playEpoch`.
-    private var playEpoch: ContinuousClock.Instant?
-    private var playEpochFrame = 0
     private var scrubTask: Task<Void, Never>?
     private var keys: Any?
     private var honorPrefer = true
@@ -120,6 +113,9 @@ final class Session: ObservableObject {
     private var filmList = FilmList.empty
     /// Digest of the film on screen. Nil when the viewer has no film.
     private var shownFilmID: String?
+    /// The picture view. Playback attaches its video layer here.
+    private weak var stage: PictureStage?
+    private var loggedVideo = false
     private var removeTarget: String?
     private var loadingFilmID: String?
     private static let fillCacheKey = "fillCache"
@@ -469,6 +465,10 @@ final class Session: ObservableObject {
         return ""
     }
 
+    func attachStage(_ stage: PictureStage) {
+        self.stage = stage
+    }
+
     func installKeys() {
         startLibraryWatch()
         if keys != nil { return }
@@ -661,12 +661,10 @@ final class Session: ObservableObject {
         scrubTask?.cancel()
         playing = true
         playGeneration += 1
-        playStalled = false
-        playEpoch = .now
-        playEpochFrame = index
         source = nil
+        loggedVideo = false
         Log.play.info("Wiedergabe ab Bild \(self.index + 1, privacy: .public)")
-        playClock(playGeneration)
+        beginPlayback()
     }
 
     /// The original for the frame on screen, built when the mouse button goes down.
@@ -863,7 +861,7 @@ final class Session: ObservableObject {
     /// Drop the pictures on screen. The archive on disk stays with its model.
     private func releaseArchive() {
         epoch += 1
-        stopPlay()
+        stopPlay(.clear)
         scrubTask?.cancel()
         scrubbing = false
         filling = nil
@@ -918,20 +916,41 @@ final class Session: ObservableObject {
         showCurrent()
     }
 
-    private func stopPlay() {
+    private enum PlayEnd {
+        /// Leave the video clock where it is, so play continues from this frame.
+        case pause
+        /// Stop the clock and keep its last frame until the next still is drawn.
+        case yield
+        /// Stop the clock and remove the video frame.
+        case clear
+    }
+
+    private func stopPlay(_ end: PlayEnd = .yield) {
         playing = false
         playGeneration += 1
-        playTask?.cancel()
-        playTask = nil
-        playEpoch = nil
         playFetching = false
-        cacheDecoding = false
-        playStalled = false
+        switch end {
+        case .pause:
+            stage?.existingScreen()?.pause()
+        case .yield:
+            stage?.existingScreen()?.yield()
+        case .clear:
+            stage?.existingScreen()?.stop()
+        }
     }
 
     private func finishPlay() {
-        stopPlay()
+        let video = stage?.screenIsRunning() == true
+        stopPlay(video ? .pause : .yield)
         Log.play.info("Pause bei Bild \(self.index + 1, privacy: .public)")
+        if video {
+            if coverage.contains(index) {
+                status = "Bild \(index + 1) von \(frameCount) · Cache · \(unit.title)"
+            }
+            attachSource()
+            scheduleFill()
+            return
+        }
         if let shown = cache[index], shown.recon != nil {
             apply(shown)
         }
@@ -939,211 +958,92 @@ final class Session: ObservableObject {
         scheduleFill()
     }
 
-    /// Decoded pictures kept ahead of the playhead. One model frame fits inside this cushion.
-    private static let playAheadTarget = 12
-
-    /// Show cached frames on film time. A late picture jumps to the frame that is due,
-    /// instead of stretching every following interval by the lateness.
-    private func playClock(_ generation: Int) {
-        guard playing, generation == playGeneration else { return }
-        schedulePlayAhead()
-        let fps = max(facts?.fps ?? 25, 1)
-        let next = index + 1
-        guard next < frameCount else {
-            finishPlay()
+    /// Cached playback hands ProRes samples to the system video display.
+    private func beginPlayback() {
+        adoptStore()
+        guard pixelWidth > 0, let stage, let store else {
+            playing = false
             return
         }
-        if playEpoch == nil {
-            playEpoch = .now
-            playEpochFrame = index
+        let fps = max(facts?.fps ?? 25, 1)
+        if coverage.contains(index) {
+            if status != "Wiedergabe · Cache" { status = "Wiedergabe · Cache" }
+        } else if status != "rechnet…" {
+            status = "rechnet…"
         }
-        let due = playEpoch!.advanced(by: .seconds(Double(next - playEpochFrame) / fps))
-        playTask = Task { @MainActor [weak self] in
-            if due > ContinuousClock.now {
-                try? await Task.sleep(until: due, clock: .continuous)
+        stage.cacheScreen().play(from: index, fps: fps, store: store, count: frameCount) { [weak self] event in
+            self?.handlePlayback(event)
+        }
+        scheduleFill(allowWhilePlaying: true)
+    }
+
+    private func handlePlayback(_ event: CacheScreen.Event) {
+        switch event {
+        case .show(let frame):
+            guard playing, frame >= 0, frame < frameCount else { return }
+            if frame != index { index = frame }
+            if status != "Wiedergabe · Cache" { status = "Wiedergabe · Cache" }
+        case .needs(let frame):
+            guard playing else { return }
+            if frame <= index + 1, !coverage.contains(frame), status != "rechnet…" {
+                status = "rechnet…"
             }
-            guard let self, !Task.isCancelled, self.playing, generation == self.playGeneration else { return }
-            self.showDueFrames(generation, fps: fps)
+            ensureFrame(frame)
+        case .visible:
+            guard !loggedVideo else { return }
+            loggedVideo = true
+            Log.play.info("Video-Anzeige aktiv")
+        case .ended:
+            guard playing else { return }
+            finishPlay()
+        case .failed(let message):
+            guard playing else { return }
+            stopPlay()
+            failure = message
+            status = message
+            Log.play.error("Wiedergabe: \(message, privacy: .public)")
         }
     }
 
-    private func showDueFrames(_ generation: Int, fps: Double) {
-        guard playing, generation == playGeneration, let epoch = playEpoch else { return }
-        let elapsed = Self.seconds(ContinuousClock.now - epoch)
-        let dueIndex = playEpochFrame + Int((elapsed * fps).rounded(.down))
-        let target = min(frameCount - 1, max(index + 1, dueIndex))
-        var show = index
-        var frame = index + 1
-        while frame <= target {
-            guard cache[frame]?.recon != nil else { break }
-            show = frame
-            frame += 1
-        }
-        guard show != index, let shown = cache[show] else {
-            let missing = index + 1
-            if !playStalled {
-                Log.play.info("Wiedergabe wartet auf Bild \(missing, privacy: .public)")
+    /// The frame under or just ahead of the playhead is missing. Store it, and let the video layer show the ProRes sample.
+    private func ensureFrame(_ frame: Int) {
+        guard playing, frame >= 0, frame < frameCount else { return }
+        if coverage.contains(frame) || playFetching || filling == frame { return }
+        playFetching = true
+        let generation = playGeneration
+        let token = epoch
+        engine.request(frame, store: store, need: .fill) { [weak self] result in
+            Task { @MainActor in
+                guard let self, generation == self.playGeneration else { return }
+                self.playFetching = false
+                guard token == self.epoch else { return }
+                switch result {
+                case .success(let shown):
+                    if shown.stored { self.coverage.insert(shown.index) }
+                    if !shown.fromCache { self.noteScaled(1) }
+                    guard self.playing else { return }
+                    self.scheduleFill(allowWhilePlaying: true)
+                case .failure(let error):
+                    if error is CancellationError {
+                        if self.playing { self.continuePlaybackWork() }
+                        return
+                    }
+                    guard frame <= self.index + 1 else { return }
+                    self.stopPlay()
+                    self.failure = error.localizedDescription
+                    self.status = self.failure!
+                }
             }
-            playStalled = true
-            if missing < frameCount, !coverage.contains(missing) { status = "rechnet…" }
-            schedulePlayAhead()
-            return
         }
-        if playStalled {
-            Log.play.info("Wiedergabe weiter bei Bild \(show + 1, privacy: .public)")
-        }
-        playStalled = false
-        index = show
-        applyPlay(shown)
-        playClock(generation)
+    }
+
+    private func continuePlaybackWork() {
+        scheduleFill(allowWhilePlaying: playing)
     }
 
     private static func seconds(_ duration: Duration) -> Double {
         let parts = duration.components
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
-    }
-
-    /// Cached frames already decoded after the playhead.
-    private func playBufferReady() -> Int {
-        var ready = 0
-        var frame = index + 1
-        while ready < Self.playAheadTarget, frame < frameCount, cache[frame]?.recon != nil {
-            ready += 1
-            frame += 1
-        }
-        return ready
-    }
-
-    /// Next cached frame in the cushion that is not decoded yet. The immediate next hole is included.
-    private func nextPlayDecode() -> Int? {
-        for step in 1...Self.playAheadTarget {
-            let candidate = index + step
-            if candidate >= frameCount { return nil }
-            if cache[candidate]?.recon != nil { continue }
-            if step > 1, !coverage.contains(candidate) { return nil }
-            return candidate
-        }
-        return nil
-    }
-
-    private func schedulePlayAhead() {
-        guard playing else { return }
-        if playBufferReady() < Self.playAheadTarget, let target = nextPlayDecode() {
-            if coverage.contains(target) {
-                if !cacheDecoding { beginCacheDecode(target) }
-            } else if !playFetching, filling == nil {
-                // The frame under the playhead is still gray. One model, not a second fill of the same hole.
-                beginPlayFetch(target)
-                return
-            }
-        }
-        // One model frame takes longer than eight film frames, so a thinner cushion would stutter.
-        // Cache decode does not take the model queue, so fill keeps running beside it.
-        guard playBufferReady() >= 8, !playFetching, filling == nil else { return }
-        scheduleFill(allowWhilePlaying: true)
-    }
-
-    /// Cached frames ahead of the playhead. The model queue is left to fill.
-    private func beginCacheDecode(_ target: Int) {
-        guard let store else { return }
-        cacheDecoding = true
-        let generation = playGeneration
-        let token = epoch
-        engine.decodeCached(from: target, store: store, limit: Self.playAheadTarget) { [weak self] result in
-            Task { @MainActor in
-                guard let self, generation == self.playGeneration, token == self.epoch else { return }
-                self.cacheDecoding = false
-                guard self.playing else { return }
-                switch result {
-                case .success(let frames):
-                    guard let first = frames.first, first.recon != nil else { return }
-                    for frame in frames {
-                        var copy = frame
-                        copy.ahead = []
-                        self.remember(copy)
-                    }
-                    // The clock stops when the next picture is not ready yet, and nothing else
-                    // starts it. A late decode has to pick the timeline back up.
-                    if self.playStalled, let next = frames.first(where: { $0.index == self.index + 1 }) {
-                        self.playStalled = false
-                        self.index = next.index
-                        self.playEpoch = .now
-                        self.playEpochFrame = next.index
-                        self.applyPlay(next)
-                        self.playClock(generation)
-                        return
-                    }
-                    self.schedulePlayAhead()
-                case .failure(let error):
-                    Log.play.error("Wiedergabe liest Bild \(target + 1, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                    guard target == self.index + 1 else { return }
-                    self.stopPlay()
-                    self.failure = error.localizedDescription
-                    self.status = self.failure!
-                }
-            }
-        }
-    }
-
-    private func beginPlayFetch(_ target: Int) {
-        playFetching = true
-        let generation = playGeneration
-        let token = epoch
-        engine.request(target, store: store, need: .play, run: Self.playAheadTarget) { [weak self] result in
-            Task { @MainActor in
-                guard let self, generation == self.playGeneration else { return }
-                self.playFetching = false
-                guard token == self.epoch, self.playing else { return }
-                switch result {
-                case .success(let shown):
-                    var frames = [shown]
-                    frames.append(contentsOf: shown.ahead)
-                    var fresh = 0
-                    for frame in frames {
-                        if frame.stored { self.coverage.insert(frame.index) }
-                        if !frame.fromCache { fresh += 1 }
-                    }
-                    self.noteScaled(fresh)
-                    guard shown.recon != nil else {
-                        self.schedulePlayAhead()
-                        return
-                    }
-                    for frame in frames {
-                        var copy = frame
-                        copy.ahead = []
-                        self.remember(copy)
-                    }
-                    if self.playStalled, shown.index == self.index + 1 {
-                        self.playStalled = false
-                        self.index = shown.index
-                        self.playEpoch = .now
-                        self.playEpochFrame = shown.index
-                        self.applyPlay(shown)
-                        self.playClock(generation)
-                        return
-                    }
-                    self.schedulePlayAhead()
-                case .failure(let error):
-                    guard target == self.index + 1 else {
-                        self.schedulePlayAhead()
-                        return
-                    }
-                    self.stopPlay()
-                    self.failure = error.localizedDescription
-                    self.status = self.failure!
-                }
-            }
-        }
-    }
-
-    private func applyPlay(_ shown: Shown) {
-        recon = shown.recon?.image
-        if source != nil { source = nil }
-        if pixelWidth != shown.width { pixelWidth = shown.width }
-        if pixelHeight != shown.height { pixelHeight = shown.height }
-        failure = nil
-        let label = shown.fromCache ? "Wiedergabe · Cache" : "Wiedergabe · \(unit.title)"
-        if status != label { status = label }
     }
 
     private func attachSource() {
@@ -1172,7 +1072,9 @@ final class Session: ObservableObject {
             }
             remember(shown)
             if shown.index == index {
-                apply(shown)
+                if !(playing && stage?.screenIsRunning() == true) {
+                    apply(shown)
+                }
                 if !playing { scheduleFill() }
             }
         case .failure(let error):
@@ -1183,6 +1085,7 @@ final class Session: ObservableObject {
     }
 
     private func apply(_ shown: Shown) {
+        stage?.existingScreen()?.stepAside()
         recon = shown.recon?.image
         source = shown.source?.image
         pixelWidth = shown.width
@@ -1258,7 +1161,7 @@ final class Session: ObservableObject {
                     if !shown.fromCache { self.noteScaled(1) }
                     Log.fill.debug("fill speichert Bild \(shown.index + 1, privacy: .public)")
                     if self.playing {
-                        self.schedulePlayAhead()
+                        self.continuePlaybackWork()
                         return
                     }
                     guard !self.scrubbing, !self.exporting, !self.busy else { return }
@@ -1266,7 +1169,7 @@ final class Session: ObservableObject {
                 case .failure(let error):
                     if error is CancellationError {
                         Log.fill.info("fill Bild \(next + 1, privacy: .public) verdrängt")
-                        if self.playing { self.schedulePlayAhead() } else { self.scheduleFill() }
+                        self.continuePlaybackWork()
                         return
                     }
                     let text = error.localizedDescription
@@ -1280,7 +1183,7 @@ final class Session: ObservableObject {
                         Log.fill.error("fill steht nach zwei Fehlern hintereinander")
                         return
                     }
-                    if self.playing { self.schedulePlayAhead() } else { self.scheduleFill() }
+                    self.continuePlaybackWork()
                 }
             }
         }

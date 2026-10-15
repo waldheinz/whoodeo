@@ -12,7 +12,11 @@ nonisolated enum FilmDrop {
     }
 
     static var pasteboardTypes: [NSPasteboard.PasteboardType] {
-        contentTypes.map { NSPasteboard.PasteboardType($0.identifier) }
+        // Finder puts public.file-url on a file drag, not public.mpeg-4. A view
+        // registered only for movie types never hears about the drop.
+        var types = contentTypes.map { NSPasteboard.PasteboardType($0.identifier) }
+        if !types.contains(.fileURL) { types.append(.fileURL) }
+        return types
     }
 
     static func isFilm(_ url: URL) -> Bool {
@@ -75,8 +79,8 @@ nonisolated enum FilmDrop {
         let identifier = identifiers.contains(UTType.fileURL.identifier)
             ? UTType.fileURL.identifier
             : (identifiers.first ?? UTType.fileURL.identifier)
-        provider.loadItem(forTypeIdentifier: identifier, options: nil) { item, _ in
-            finish(url(from: item))
+        provider.loadDataRepresentation(forTypeIdentifier: identifier) { data, _ in
+            finish(url(from: data))
         }
     }
 

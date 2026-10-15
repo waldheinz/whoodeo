@@ -124,13 +124,6 @@ nonisolated final class FrameStore: @unchecked Sendable {
             .appendingPathComponent("Whoodeo/Cache", isDirectory: true)
     }
 
-    /// Stream copy for a film AVFoundation cannot read. It sits next to the model archives and goes away with them.
-    static func remuxURL(filmID: String) -> URL {
-        cacheRoot
-            .appendingPathComponent(filmID, isDirectory: true)
-            .appendingPathComponent("source.mov")
-    }
-
     /// Digest of the file as it is now. Call this once, when the film is added, and store the result.
     static func filmDigest(of url: URL) -> String {
         digest(identity(url))
@@ -148,7 +141,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
         return try FrameStore(directory: root, count: count)
     }
 
-    /// Deletes one film directory: every model archive and `source.mov`.
+    /// Deletes one film directory and every model archive in it.
     static func removeCache(id: String) throws {
         let directory = cacheRoot.appendingPathComponent(id, isDirectory: true)
         gate.lock()
@@ -263,6 +256,15 @@ nonisolated final class FrameStore: @unchecked Sendable {
         let slot = slots[index]
         lock.unlock()
         return try read(slot)
+    }
+
+    /// One stored ProRes access unit, timed on the film clock. The display layer decodes it.
+    /// The file read stays outside `decodeLock`; only the format description needs that lock.
+    func sample(at index: Int, time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
+        guard let data = try data(at: index) else { throw CLIError("Bild \(index) fehlt im Cache") }
+        decodeLock.lock()
+        defer { decodeLock.unlock() }
+        return try sampleBuffer(data, time: time, duration: duration)
     }
 
     /// Decode one stored frame to 16-bit RGBA for the preview and for a transcode.

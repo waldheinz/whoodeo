@@ -2,17 +2,60 @@ import AppKit
 import SwiftUI
 
 /// Draws one upright picture. Its frame is the picture.
+/// Cached playback sits in a video layer above this drawing. The layer is a subview that
+/// does not take clicks, and it is hidden while a still or the original is showing.
 final class PixelView: NSView {
     var recon: CGImage?
     var source: CGImage?
-    var sharp = false
+    var sharp = false {
+        didSet {
+            guard sharp != oldValue else { return }
+            playback?.setSharp(sharp)
+        }
+    }
     weak var stage: PictureStage?
-    var showSource = false
+    var showSource = false {
+        didSet {
+            guard showSource != oldValue else { return }
+            playback?.setCoveredByOriginal(showSource)
+        }
+    }
+    /// Created on the first cached playback. Absent until then, so a still does not build a video layer.
+    private var playback: CacheScreen?
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
 
+    func cacheScreen() -> CacheScreen {
+        if let playback { return playback }
+        let screen = CacheScreen()
+        screen.attach(to: self)
+        playback = screen
+        return screen
+    }
+
+    func screenIsRunning() -> Bool {
+        playback?.isRunning == true
+    }
+
+    func existingScreen() -> CacheScreen? {
+        playback
+    }
+
+    override func layout() {
+        super.layout()
+        playback?.layout(in: bounds)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        playback?.updateScale()
+    }
+
     override func draw(_ dirty: NSRect) {
+        if !showSource, playback?.isCoveringStill == true {
+            return
+        }
         guard let ctx = NSGraphicsContext.current?.cgContext, let image = shown else { return }
         ctx.interpolationQuality = sharp ? .none : .medium
         ctx.saveGState()
@@ -58,6 +101,12 @@ final class PictureStage: NSView {
     var onFilm: ((URL) -> Void)?
     var onHover: ((Bool) -> Void)?
     var onOriginal: (() -> CGImage?)?
+
+    func cacheScreen() -> CacheScreen { pixels.cacheScreen() }
+
+    func existingScreen() -> CacheScreen? { pixels.existingScreen() }
+
+    func screenIsRunning() -> Bool { pixels.screenIsRunning() }
 
     var fallbackTop: CGFloat = 0
     var fallbackLeading: CGFloat = 0
@@ -475,6 +524,7 @@ struct Viewer: NSViewRepresentable {
     var onHover: (Bool) -> Void
     var onZoom: (Bool, CGFloat) -> Void
     var onOriginal: () -> CGImage?
+    var onStage: (PictureStage) -> Void
 
     func makeNSView(context: Context) -> PictureStage {
         PictureStage()
@@ -485,22 +535,35 @@ struct Viewer: NSViewRepresentable {
         stage.onHover = onHover
         stage.onZoom = onZoom
         stage.onOriginal = onOriginal
+        let samePicture = sameImage(stage.pixels.recon, recon) && sameImage(stage.pixels.source, source)
+        let sameZoom = stage.zoomToFit == zoomToFit && abs(stage.magnification - magnification) < 0.0001
+        let samePixels = stage.pixelWidth == pixelWidth && stage.pixelHeight == pixelHeight
+        let sameInsets = stage.fallbackTop == fallbackTop
+            && stage.fallbackLeading == fallbackLeading
+            && stage.fallbackBottom == fallbackBottom
+            && stage.fallbackTrailing == fallbackTrailing
+        let samePlacement = context.coordinator.placement == placement
+        // The frame counter publishes on every film frame. Laying the picture out again marks it
+        // dirty and the video layer drops frames to keep up with a window that is redrawing.
+        if samePicture && sameZoom && samePixels && sameInsets && samePlacement {
+            onStage(stage)
+            return
+        }
         stage.fallbackTop = fallbackTop
         stage.fallbackLeading = fallbackLeading
         stage.fallbackBottom = fallbackBottom
         stage.fallbackTrailing = fallbackTrailing
         stage.pixels.recon = recon
         stage.pixels.source = source
-        let recenter = context.coordinator.placement != placement
+        let recenter = !samePlacement
         context.coordinator.placement = placement
         let wasFit = stage.zoomToFit
         let oldMagnification = stage.magnification
-        let oldPixels = stage.pixelWidth == pixelWidth && stage.pixelHeight == pixelHeight
         stage.pixelWidth = pixelWidth
         stage.pixelHeight = pixelHeight
         stage.zoomToFit = zoomToFit
         stage.magnification = magnification
-        if recenter || !oldPixels {
+        if recenter || !samePixels {
             stage.layoutPicture(recenter: true)
         } else if !zoomToFit && (wasFit || abs(oldMagnification - magnification) > 0.0001) {
             stage.zoomAboutSafeCenter()
@@ -508,6 +571,15 @@ struct Viewer: NSViewRepresentable {
             stage.layoutPicture(recenter: false)
         }
         stage.pixels.needsDisplay = true
+        onStage(stage)
+    }
+
+    private func sameImage(_ lhs: CGImage?, _ rhs: CGImage?) -> Bool {
+        switch (lhs, rhs) {
+        case (nil, nil): return true
+        case let (lhs?, rhs?): return lhs === rhs
+        default: return false
+        }
     }
 
     func makeCoordinator() -> Coordinator {

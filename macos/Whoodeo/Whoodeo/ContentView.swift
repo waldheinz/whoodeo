@@ -174,7 +174,8 @@ struct ContentView: View {
                         onZoom: { fits, factor in
                             session.noteZoom(fits: fits, magnification: factor)
                         },
-                        onOriginal: { session.originalNow() }
+                        onOriginal: { session.originalNow() },
+                        onStage: { session.attachStage($0) }
                     )
                 } else if session.loadingModel || (session.busy && session.recon == nil) {
                     ProgressView(session.loadingModel ? "Modell wird geladen…" : "rechnet…")
