@@ -95,20 +95,34 @@ nonisolated struct Coverage: Equatable {
 }
 
 /// Append-only ProRes 4444 frames. A slot table points at each frame, so a seek can fill one hole.
+/// The table in RAM follows every stored frame. `slots` on disk is updated from a patch of the
+/// runs that changed, about once a minute and again when the archive closes. `frames` is synchronized
+/// before that patch is renamed into place, so a published slot never points at bytes still in the cache.
 /// Playback reads through its own handle and decoder, so an append on the model queue can proceed.
 nonisolated final class FrameStore: @unchecked Sendable {
     let count: Int
     private(set) var width: Int
     private(set) var height: Int
 
+    /// Unpublished slots may sit in RAM for this long. A crash recomputes that stretch.
+    private static let checkpointInterval: TimeInterval = 60
+
     private let directory: URL
     private let lock = NSLock()
+    private let publishLock = NSLock()
     private let readLock = NSLock()
     private let decodeLock = NSLock()
     private var slots: [Slot]
+    /// Frame indexes stored since the last patch that reached disk.
+    private var dirty: Set<Int> = []
+    private var dirtySinceUptime: TimeInterval?
+    /// After a failed checkpoint, wait before trying again so fill does not stall on every frame.
+    private var holdUntilUptime: TimeInterval = 0
     private var dataHandle: FileHandle
     private var readHandle: FileHandle
     private var slotHandle: FileHandle
+    /// Separate from `dataHandle`, so a checkpoint can synchronize `frames` while another append writes.
+    private var syncHandle: FileHandle
     private var extensionsData: Data?
     private var format: CMVideoFormatDescription?
     private var encoder: VTCompressionSession?
@@ -214,37 +228,16 @@ nonisolated final class FrameStore: @unchecked Sendable {
     @discardableResult
     func put(rgb: [Float], width: Int, height: Int, index: Int) throws -> Data {
         guard slots.indices.contains(index) else { throw CLIError("Bild \(index) liegt außerhalb") }
-        lock.lock()
-        if slots[index].present {
-            let data = try readUnlocked(slots[index])
-            lock.unlock()
-            return data
-        }
-        lock.unlock()
+        if let hit = try cached(index) { return hit }
         let encoded = try encode(rgb, width: width, height: height)
-        lock.lock()
-        defer { lock.unlock() }
-        if slots[index].present { return try readUnlocked(slots[index]) }
-        if self.width == 0 {
-            self.width = width
-            self.height = height
-            try writeMeta()
-        } else if self.width != width || self.height != height {
-            throw CLIError("Cache erwartet \(self.width)×\(self.height), Bild \(index) ist \(width)×\(height)")
-        }
-        try append(encoded.data, index: index)
-        if extensionsData == nil {
-            try encoded.extensions.write(to: directory.appendingPathComponent("format.plist"), options: .atomic)
-            decodeLock.lock()
-            extensionsData = encoded.extensions
-            format = nil
-            if let decoder {
-                VTDecompressionSessionInvalidate(decoder)
-                self.decoder = nil
-            }
-            decodeLock.unlock()
-        }
-        return encoded.data
+        let stored = try remember(encoded, width: width, height: height, index: index)
+        if stored.due { publish(force: false) }
+        return stored.data
+    }
+
+    /// Publish the index now. Quitting and dropping the archive both come through here.
+    func flush() {
+        publish(force: true)
     }
 
     func data(at index: Int) throws -> Data? {
@@ -357,6 +350,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: slotURL)
             try? FileManager.default.removeItem(at: dataURL)
             try? FileManager.default.removeItem(at: directory.appendingPathComponent("format.plist"))
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent("slots.patch"))
+            try? FileManager.default.removeItem(at: directory.appendingPathComponent("slots.patch.tmp"))
             try Self.write(Meta(version: 1, count: count, width: 0, height: 0), to: metaURL)
         }
         if !FileManager.default.fileExists(atPath: slotURL.path) {
@@ -368,20 +363,24 @@ nonisolated final class FrameStore: @unchecked Sendable {
         slotHandle = try FileHandle(forUpdating: slotURL)
         dataHandle = try FileHandle(forUpdating: dataURL)
         readHandle = try FileHandle(forReadingFrom: dataURL)
+        syncHandle = try FileHandle(forUpdating: dataURL)
         let raw = try Data(contentsOf: slotURL)
         guard raw.count == count * Slot.size else {
             throw CLIError("Cache-Index passt nicht zum Film")
         }
         slots = (0..<count).map { Slot(raw, at: $0) }
         extensionsData = try? Data(contentsOf: directory.appendingPathComponent("format.plist"))
+        try recoverIndex()
     }
 
     deinit {
+        flush()
         if let encoder { VTCompressionSessionInvalidate(encoder) }
         decodeLock.lock()
         if let decoder { VTDecompressionSessionInvalidate(decoder) }
         decoder = nil
         decodeLock.unlock()
+        try? syncHandle.close()
         try? dataHandle.close()
         try? readHandle.close()
         try? slotHandle.close()
@@ -400,7 +399,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
         return data
     }
 
-    /// Playback and export. The bytes stay put once the slot is published, so this does not take `lock`.
+    /// Playback and export. Frames are append-only, so the bytes at `slot.offset` stay put.
+    /// This does not take `lock`. The slot itself was copied under the lock.
     private func read(_ slot: Slot) throws -> Data {
         readLock.lock()
         defer { readLock.unlock() }
@@ -411,6 +411,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
         return data
     }
 
+    /// The picture bytes are a normal write. The slot stays in RAM until the next checkpoint.
     private func append(_ data: Data, index: Int) throws {
         guard data.count <= Int(UInt32.max) else {
             throw CLIError("Cachebild ist zu groß")
@@ -418,12 +419,234 @@ nonisolated final class FrameStore: @unchecked Sendable {
         try dataHandle.seekToEnd()
         let offset = try dataHandle.offset()
         try dataHandle.write(contentsOf: data)
-        try dataHandle.synchronize()
         let slot = Slot(offset: offset, length: UInt32(data.count), flags: 1)
-        try slotHandle.seek(toOffset: UInt64(index * Slot.size))
-        try slotHandle.write(contentsOf: slot.bytes)
-        try slotHandle.synchronize()
         slots[index] = slot
+        dirty.insert(index)
+        if dirtySinceUptime == nil {
+            dirtySinceUptime = ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    private func cached(_ index: Int) throws -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard slots[index].present else { return nil }
+        return try readUnlocked(slots[index])
+    }
+
+    private struct Remembered {
+        var data: Data
+        var due: Bool
+    }
+
+    /// Callers hold no lock. The checkpoint, when it is due, runs after this returns.
+    private func remember(_ encoded: Encoded, width: Int, height: Int, index: Int) throws -> Remembered {
+        lock.lock()
+        defer { lock.unlock() }
+        if slots[index].present {
+            return Remembered(data: try readUnlocked(slots[index]), due: false)
+        }
+        if self.width == 0 {
+            self.width = width
+            self.height = height
+            try writeMeta()
+        } else if self.width != width || self.height != height {
+            throw CLIError("Cache erwartet \(self.width)×\(self.height), Bild \(index) ist \(width)×\(height)")
+        }
+        try append(encoded.data, index: index)
+        if extensionsData == nil {
+            try encoded.extensions.write(to: directory.appendingPathComponent("format.plist"), options: .atomic)
+            decodeLock.lock()
+            extensionsData = encoded.extensions
+            format = nil
+            if let decoder {
+                VTDecompressionSessionInvalidate(decoder)
+                self.decoder = nil
+            }
+            decodeLock.unlock()
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let due = dirtySinceUptime.map { now - $0 >= Self.checkpointInterval && now >= holdUntilUptime } ?? false
+        return Remembered(data: encoded.data, due: due)
+    }
+
+    /// Fold a leftover patch, then publish every slot that is already in RAM.
+    /// `frames` is synchronized before the patch is renamed, and the patch is only the runs
+    /// frozen at that moment. Frames that arrive while this is in progress stay dirty.
+    private func publish(force: Bool) {
+        publishLock.lock()
+        defer { publishLock.unlock() }
+        do {
+            try foldOrDiscard()
+            let runs = copySnapshot(force: force)
+            guard !runs.isEmpty else { return }
+            try syncHandle.synchronize()
+            try writePatchAtomically(runs)
+            try foldExistingPatch()
+            let published = runs.reduce(0) { $0 + $1.slots.count }
+            Log.fill.debug("Cache-Index veröffentlicht, \(published, privacy: .public) Bilder")
+        } catch {
+            lock.lock()
+            holdUntilUptime = ProcessInfo.processInfo.systemUptime + Self.checkpointInterval
+            lock.unlock()
+            Log.fill.error("Cache-Index bleibt unveröffentlicht: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Drop an unfinished temp patch, fold a published one, then drop frame bytes no slot names.
+    private func recoverIndex() throws {
+        if FileManager.default.fileExists(atPath: patchTempURL.path) {
+            try? FileManager.default.removeItem(at: patchTempURL)
+        }
+        try foldOrDiscard()
+        guard let end = publishedEnd() else { return }
+        let fileEnd = try dataHandle.seekToEnd()
+        if fileEnd > end {
+            try dataHandle.truncate(atOffset: end)
+            Log.fill.info("Cache kürzt \(fileEnd - end, privacy: .public) Bytes nach dem letzten veröffentlichten Bild")
+        }
+    }
+
+    private var patchURL: URL { directory.appendingPathComponent("slots.patch") }
+    private var patchTempURL: URL { directory.appendingPathComponent("slots.patch.tmp") }
+
+    /// The highest end offset named by a present slot. Nil when a slot's range overflows.
+    private func publishedEnd() -> UInt64? {
+        var end: UInt64 = 0
+        for slot in slots where slot.present {
+            let (next, overflow) = slot.offset.addingReportingOverflow(UInt64(slot.length))
+            if overflow { return nil }
+            if next > end { end = next }
+        }
+        return end
+    }
+
+    /// Copy the dirty runs. Frames appended after this returns are not in the result.
+    private func copySnapshot(force: Bool) -> [SlotRun] {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force {
+            if now < holdUntilUptime { return [] }
+            guard let dirtySinceUptime, now - dirtySinceUptime >= Self.checkpointInterval else { return [] }
+        }
+        guard !dirty.isEmpty else { return [] }
+        var runs: [SlotRun] = []
+        for index in dirty.sorted() {
+            let slot = slots[index]
+            if var last = runs.last, last.first + last.slots.count == index {
+                last.slots.append(slot)
+                runs[runs.count - 1] = last
+            } else {
+                runs.append(SlotRun(first: index, slots: [slot]))
+            }
+        }
+        return runs
+    }
+
+    /// A damaged patch is removed. An I/O error leaves it in place so the next open can try again.
+    private func foldOrDiscard() throws {
+        do {
+            try foldExistingPatch()
+        } catch is PatchRejected {
+            Log.fill.error("Cache-Index-Patch wird verworfen")
+            try? FileManager.default.removeItem(at: patchURL)
+            try? synchronizeDirectory()
+        }
+    }
+
+    /// Apply `slots.patch` onto the slot file. A format error is `PatchRejected` and writes nothing.
+    /// Applying the same patch twice writes the same bytes.
+    private func foldExistingPatch() throws {
+        guard FileManager.default.fileExists(atPath: patchURL.path) else { return }
+        let data = try Data(contentsOf: patchURL)
+        let runs: [SlotRun]
+        do {
+            runs = try SlotPatch.decode(data, count: count)
+        } catch {
+            throw PatchRejected()
+        }
+        try writeRuns(runs)
+        try slotHandle.synchronize()
+        install(runs)
+        try FileManager.default.removeItem(at: patchURL)
+        try synchronizeDirectory()
+        forget(runs)
+    }
+
+    private func writePatchAtomically(_ runs: [SlotRun]) throws {
+        if FileManager.default.fileExists(atPath: patchTempURL.path) {
+            try FileManager.default.removeItem(at: patchTempURL)
+        }
+        FileManager.default.createFile(atPath: patchTempURL.path, contents: nil)
+        do {
+            let handle = try FileHandle(forWritingTo: patchTempURL)
+            defer { try? handle.close() }
+            try handle.write(contentsOf: SlotPatch.encode(runs))
+            try handle.synchronize()
+        } catch {
+            try? FileManager.default.removeItem(at: patchTempURL)
+            throw error
+        }
+        guard !FileManager.default.fileExists(atPath: patchURL.path) else {
+            try? FileManager.default.removeItem(at: patchTempURL)
+            throw CLIError("Cache-Index-Patch liegt schon vor")
+        }
+        try FileManager.default.moveItem(at: patchTempURL, to: patchURL)
+        try synchronizeDirectory()
+    }
+
+    private func writeRuns(_ runs: [SlotRun]) throws {
+        for run in runs {
+            guard run.first >= 0, run.slots.count <= count, run.first <= count - run.slots.count else {
+                throw CLIError("Cache-Index-Patch ist beschädigt")
+            }
+            var bytes = Data()
+            bytes.reserveCapacity(run.slots.count * Slot.size)
+            for slot in run.slots {
+                bytes.append(slot.bytes)
+            }
+            try slotHandle.seek(toOffset: UInt64(run.first * Slot.size))
+            try slotHandle.write(contentsOf: bytes)
+        }
+    }
+
+    private func install(_ runs: [SlotRun]) {
+        lock.lock()
+        defer { lock.unlock() }
+        for run in runs {
+            for (offset, slot) in run.slots.enumerated() {
+                slots[run.first + offset] = slot
+            }
+        }
+    }
+
+    /// Drop published indexes from the dirty set. A slot that no longer matches stays dirty.
+    private func forget(_ runs: [SlotRun]) {
+        guard !runs.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for run in runs {
+            for (offset, slot) in run.slots.enumerated() {
+                let index = run.first + offset
+                if slots.indices.contains(index), slots[index] == slot {
+                    dirty.remove(index)
+                }
+            }
+        }
+        if dirty.isEmpty { dirtySinceUptime = nil }
+        holdUntilUptime = 0
+    }
+
+    private func synchronizeDirectory() throws {
+        let fd = Darwin.open(directory.path, O_RDONLY)
+        guard fd >= 0 else {
+            throw CLIError("Cache-Ordner lässt sich nicht öffnen (\(Darwin.errno))")
+        }
+        defer { Darwin.close(fd) }
+        guard Darwin.fsync(fd) == 0 else {
+            throw CLIError("Cache-Ordner bleibt unveröffentlicht (\(Darwin.errno))")
+        }
     }
 
     private struct Encoded {
@@ -611,7 +834,73 @@ nonisolated final class FrameStore: @unchecked Sendable {
         var status: OSStatus = noErr
     }
 
-    private struct Slot {
+    /// A published patch that is not a well-formed run list. The slot file has not been touched.
+    private struct PatchRejected: Error {}
+
+    private struct SlotRun {
+        var first: Int
+        var slots: [Slot]
+    }
+
+    private enum SlotPatch {
+        static func encode(_ runs: [SlotRun]) -> Data {
+            var data = Data("WSP1".utf8)
+            append(UInt32(runs.count), to: &data)
+            for run in runs {
+                append(UInt32(run.first), to: &data)
+                append(UInt32(run.slots.count), to: &data)
+                for slot in run.slots {
+                    data.append(slot.bytes)
+                }
+            }
+            return data
+        }
+
+        static func decode(_ data: Data, count: Int) throws -> [SlotRun] {
+            guard data.count >= 8, data.prefix(4) == Data("WSP1".utf8) else { throw PatchRejected() }
+            let runCount = Int(readUInt32(data, 4))
+            var cursor = 8
+            var runs: [SlotRun] = []
+            var previousEnd = 0
+            for _ in 0..<runCount {
+                guard data.count >= 8, cursor <= data.count - 8 else { throw PatchRejected() }
+                let first = Int(readUInt32(data, cursor))
+                let n = Int(readUInt32(data, cursor + 4))
+                cursor += 8
+                guard n > 0, first >= previousEnd, first <= count, n <= count - first else { throw PatchRejected() }
+                let bytes = n * Slot.size
+                guard cursor <= data.count - bytes else { throw PatchRejected() }
+                let slice = data.subdata(in: cursor..<(cursor + bytes))
+                var decoded: [Slot] = []
+                decoded.reserveCapacity(n)
+                for index in 0..<n {
+                    let slot = Slot(slice, at: index)
+                    guard slot.present else { throw PatchRejected() }
+                    decoded.append(slot)
+                }
+                runs.append(SlotRun(first: first, slots: decoded))
+                previousEnd = first + n
+                cursor += bytes
+            }
+            guard cursor == data.count else { throw PatchRejected() }
+            return runs
+        }
+
+        private static func append(_ value: UInt32, to data: inout Data) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+        }
+
+        private static func readUInt32(_ data: Data, _ offset: Int) -> UInt32 {
+            var value: UInt32 = 0
+            for step in 0..<4 {
+                value |= UInt32(data[offset + step]) << (8 * step)
+            }
+            return value
+        }
+    }
+
+    private struct Slot: Equatable {
         static let size = 16
 
         var offset: UInt64

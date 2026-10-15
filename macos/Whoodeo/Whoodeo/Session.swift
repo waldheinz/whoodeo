@@ -858,6 +858,11 @@ final class Session: ObservableObject {
         status = facts == nil ? "Modell in der Seitenleiste wählen" : status
     }
 
+    /// Publish the open index before the process exits. Dropping the archive publishes as well.
+    func flushStore() {
+        store?.flush()
+    }
+
     /// Drop the pictures on screen. The archive on disk stays with its model.
     private func releaseArchive() {
         epoch += 1

@@ -7,6 +7,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.keys.contains(key)
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { Session.current?.flushStore() }
+    }
+
     @objc var scriptFrame: Int {
         get {
             MainActor.assumeIsolated {
