@@ -57,6 +57,10 @@ final class Session: ObservableObject {
     @Published var selection: URL?
     @Published var confirmDelete = false
     @Published var deleteName = ""
+    @Published var confirmRemove = false
+    @Published var removeName = ""
+    @Published private(set) var films: [OpenFilm] = []
+    @Published var filmSelection: String?
     @Published var loadingModel = false
     @Published private(set) var coverage = Coverage(count: 0)
     /// Newly scaled frames per second. Zero when nothing is computing.
@@ -113,6 +117,11 @@ final class Session: ObservableObject {
     private var honorPrefer = true
     private var recentDrop: (url: URL, at: Date)?
     private var sliderHoldingHundred = false
+    private var filmList = FilmList.empty
+    /// Digest of the film on screen. Nil when the viewer has no film.
+    private var shownFilmID: String?
+    private var removeTarget: String?
+    private var loadingFilmID: String?
     private static let fillCacheKey = "fillCache"
     private static let lastModelKey = "lastModel"
     private var didRestoreModel = false
@@ -121,11 +130,22 @@ final class Session: ObservableObject {
         let stored = UserDefaults.standard.object(forKey: Self.fillCacheKey) as? Bool
         fillCache = stored ?? true
         Session.current = self
+        reloadFilms()
+        DispatchQueue.global(qos: .utility).async {
+            FrameStore.pruneCaches { id in
+                FilmLibrary.load().films.contains { $0.id == id }
+            }
+        }
         startLibraryWatch()
         if !AppDelegate.pendingFilms.isEmpty {
             let pending = AppDelegate.pendingFilms
             AppDelegate.pendingFilms = []
             _ = openFilms(pending)
+        } else if let film = filmList.films.first(where: { $0.id == filmList.current }) {
+            filmSelection = film.id
+            if FileManager.default.fileExists(atPath: film.path) {
+                loadFilm(URL(fileURLWithPath: film.path), id: film.id)
+            }
         }
     }
 
@@ -192,8 +212,10 @@ final class Session: ObservableObject {
         return model.detail
     }
 
-    /// POSIX path of the file the user opened. Empty when no film is open.
-    var scriptFilmPath: String { facts?.url.path ?? "" }
+    /// ID of the film on screen. Empty when none is shown.
+    var scriptCurrentFilmID: String { shownFilmID ?? "" }
+
+    func scriptFilmRecords() -> [OpenFilm] { films }
 
     var scriptModelNames: [String] { library.map(\.detail) }
 
@@ -223,13 +245,108 @@ final class Session: ObservableObject {
         return nil
     }
 
-    /// Open a film from a path. Returns a message when the file cannot be opened.
-    func openFilm(at path: String) -> String? {
+    /// Add a film and show it. The same path keeps its id. Nil means it was not added; `failure` says why.
+    @discardableResult
+    func addFilm(at path: String) -> String? {
         let expanded = (path as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded).standardizedFileURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return "Die Datei fehlt." }
-        guard openFilms([url]) else { return "Das ist kein Film." }
+        let url = URL(fileURLWithPath: expanded)
+        let id: String
+        do {
+            id = try FilmLibrary.mutate { list in
+                try FilmLibrary.insert(url, into: &list)
+            }
+        } catch {
+            let text = error.localizedDescription
+            failure = text
+            status = text
+            return nil
+        }
+        reloadFilms()
+        if let problem = showFilm(id: id) {
+            failure = problem
+            status = problem
+            return nil
+        }
+        return id
+    }
+
+    /// Show a film that is already in the list. Does not add or remove.
+    func showFilm(id: String) -> String? {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "Die Film-ID ist leer." }
+        var known = false
+        do {
+            try FilmLibrary.mutate { list in
+                guard list.films.contains(where: { $0.id == trimmed }) else { return }
+                known = true
+                list.current = trimmed
+            }
+        } catch {
+            let text = error.localizedDescription
+            failure = text
+            status = text
+            return text
+        }
+        guard known else { return "Kein Film mit dieser ID." }
+        reloadFilms()
+        filmSelection = trimmed
+        guard let film = films.first(where: { $0.id == trimmed }) else { return "Kein Film mit dieser ID." }
+        if shownFilmID == trimmed, facts != nil || busy { return nil }
+        loadFilm(URL(fileURLWithPath: film.path), id: trimmed)
         return nil
+    }
+
+    /// Drop one film and delete its cache. The movie file stays. A message means it is still in the list.
+    func removeFilm(id: String) -> String? {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard FilmLibrary.load().films.contains(where: { $0.id == trimmed }) else {
+            return "Kein Film mit dieser ID."
+        }
+        if exporting && shownFilmID == trimmed { return "Ein Export läuft schon." }
+        if shownFilmID == trimmed {
+            closeShownFilm()
+            let gate = DispatchSemaphore(value: 0)
+            engine.settle { gate.signal() }
+            gate.wait()
+        }
+        do {
+            try FrameStore.removeCache(id: trimmed)
+            try FilmLibrary.mutate { list in
+                list.films.removeAll { $0.id == trimmed }
+                if list.current == trimmed { list.current = "" }
+            }
+        } catch {
+            reloadFilms()
+            let text = error.localizedDescription
+            failure = text
+            status = text
+            return text
+        }
+        reloadFilms()
+        if filmSelection == trimmed { filmSelection = nil }
+        return nil
+    }
+
+    func askRemoveFilm(_ id: String? = nil) {
+        guard let id = id ?? filmSelection else { return }
+        guard let film = films.first(where: { $0.id == id }) else { return }
+        if exporting && shownFilmID == id {
+            failure = "Ein Export läuft schon."
+            status = failure!
+            return
+        }
+        removeTarget = id
+        removeName = film.name
+        confirmRemove = true
+    }
+
+    func removeSelectedFilm() {
+        guard let id = removeTarget else { return }
+        removeTarget = nil
+        if let problem = removeFilm(id: id) {
+            failure = problem
+            status = problem
+        }
     }
 
     func play() {
@@ -458,8 +575,7 @@ final class Session: ObservableObject {
             return true
         }
         recentDrop = (key, Date())
-        loadFilm(url)
-        return true
+        return addFilm(at: key.path) != nil
     }
 
     func pickFilm() {
@@ -468,7 +584,7 @@ final class Session: ObservableObject {
         panel.allowedContentTypes = FilmDrop.contentTypes
         panel.prompt = "Öffnen"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        loadFilm(url)
+        _ = addFilm(at: url.path)
     }
 
     func pickExport() {
@@ -632,18 +748,22 @@ final class Session: ObservableObject {
         }
     }
 
-    private func loadFilm(_ url: URL) {
-        releaseArchive()
+    private func loadFilm(_ url: URL, id: String) {
+        if shownFilmID == id, busy { return }
+        facts = nil
+        frameCount = 0
+        shownFilmID = id
+        loadingFilmID = id
         busy = true
         failure = nil
-        frameCount = 0
-        coverage = Coverage(count: 0)
+        releaseArchive()
         status = "öffnet \(url.lastPathComponent)"
-        engine.openFilm(url) { [weak self] result in
+        engine.openFilm(url, filmID: id) { [weak self] result in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.loadingFilmID == id else { return }
                 switch result {
                 case .success(let facts):
+                    self.loadingFilmID = nil
                     self.facts = facts
                     self.frameCount = facts.count
                     self.index = 0
@@ -652,14 +772,47 @@ final class Session: ObservableObject {
                     self.busy = false
                     self.failure = nil
                     self.status = "\(facts.width)×\(facts.height) · \(facts.count) Bilder"
+                    self.rememberShownFacts(facts, id: id)
                     self.showCurrent()
                 case .failure(let error):
+                    self.loadingFilmID = nil
                     self.busy = false
                     self.failure = error.localizedDescription
                     self.status = self.failure!
                 }
             }
         }
+    }
+
+    private func reloadFilms() {
+        filmList = FilmLibrary.load()
+        films = filmList.films
+    }
+
+    private func rememberShownFacts(_ facts: FilmFacts, id: String) {
+        do {
+            try FilmLibrary.mutate { list in
+                FilmLibrary.remember(id, width: facts.width, height: facts.height, frames: facts.count, in: &list)
+            }
+        } catch {
+            Log.fill.error("Filmliste nicht geschrieben: \(error.localizedDescription, privacy: .public)")
+        }
+        reloadFilms()
+    }
+
+    /// Drop the picture. The list entry and the cache stay.
+    private func closeShownFilm() {
+        shownFilmID = nil
+        loadingFilmID = nil
+        facts = nil
+        frameCount = 0
+        index = 0
+        inPoint = 0
+        outPoint = 0
+        busy = false
+        failure = nil
+        releaseArchive()
+        status = modelURL == nil ? "Modell in der Seitenleiste wählen" : "Film öffnen"
     }
 
     private func startLibraryWatch() {
@@ -726,9 +879,9 @@ final class Session: ObservableObject {
     }
 
     private func adoptStore() {
-        guard store == nil, let facts, let modelURL, facts.count > 0 else { return }
+        guard store == nil, let facts, let modelURL, let shownFilmID, facts.count > 0 else { return }
         do {
-            let opened = try FrameStore.open(film: facts.url, model: modelURL, unit: unit, count: facts.count)
+            let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, unit: unit, count: facts.count)
             store = opened
             coverage = opened.coverage()
         } catch {

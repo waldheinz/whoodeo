@@ -46,9 +46,9 @@ nonisolated final class Film {
     private var pixelFormat: OSType
 
     @concurrent
-    static func load(_ url: URL) async throws -> Film {
+    static func load(_ url: URL, filmID: String) async throws -> Film {
         // AVFoundation does not read Matroska. A stream copy keeps the pictures.
-        let media = try await readableVideo(url)
+        let media = try await readableVideo(url, filmID: filmID)
         let asset = AVURLAsset(url: media, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
         let videos = try await asset.loadTracks(withMediaType: .video)
         guard let video = videos.first else { throw CLIError("kein Bild in \(url.lastPathComponent)") }
@@ -146,24 +146,18 @@ nonisolated final class Film {
         self.pixelFormat = pixelFormat
     }
 
-    /// The file AVFoundation can actually read. Matroska is copied into a QuickTime cache.
+    /// The file AVFoundation can actually read. Otherwise a stream copy at `Cache/<filmID>/source.mov`.
     @concurrent
-    private static func readableVideo(_ url: URL) async throws -> URL {
+    private static func readableVideo(_ url: URL, filmID: String) async throws -> URL {
         if await hasVideo(url) { return url }
         guard let ffmpeg = ffmpegURL() else {
             throw CLIError("AVFoundation öffnet \(url.pathExtension) nicht, und ffmpeg ist nicht installiert.")
         }
-        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("whoodeo", isDirectory: true)
-        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
-        let values = try url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        let size = values.fileSize ?? 0
-        let stamp = Int(values.contentModificationDate?.timeIntervalSince1970 ?? 0)
-        let base = safeName(url.deletingPathExtension().lastPathComponent)
-        let dest = cache.appendingPathComponent("\(base)-\(size)-\(stamp).mov")
+        let dest = FrameStore.remuxURL(filmID: filmID)
+        try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
         if FileManager.default.fileExists(atPath: dest.path) { return dest }
         // The extension has to be .mov. ffmpeg refuses a file that ends in .partial.
-        let partial = cache.appendingPathComponent(".\(base)-\(size)-\(stamp).partial.mov")
+        let partial = dest.deletingLastPathComponent().appendingPathComponent(".source.partial.mov")
         if try ffmpegCopy(ffmpeg, url: url, output: partial, audio: true) != nil {
             if let reason = try ffmpegCopy(ffmpeg, url: url, output: partial, audio: false) {
                 throw CLIError("ffmpeg konnte \(url.lastPathComponent) nicht nach QuickTime umpacken. \(reason)")
@@ -185,17 +179,6 @@ nonisolated final class Film {
         } catch {
             return false
         }
-    }
-
-    private static func safeName(_ name: String) -> String {
-        let scalars = name.unicodeScalars.map { scalar -> Character in
-            if CharacterSet.alphanumerics.contains(scalar) || scalar == "-" || scalar == "_" {
-                return Character(scalar)
-            }
-            return "-"
-        }
-        let cleaned = String(scalars)
-        return cleaned.isEmpty ? "film" : cleaned
     }
 
     private static func ffmpegURL() -> URL? {

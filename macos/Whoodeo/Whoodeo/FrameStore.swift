@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import CryptoKit
 import Foundation
+import os
 import VideoToolbox
 
 /// Which frames of one film, model, and compute unit are already encoded.
@@ -115,14 +116,81 @@ nonisolated final class FrameStore: @unchecked Sendable {
     private var transfer: ColorTransfer?
     private var stamp: CMTimeValue = 0
 
-    static func open(film: URL, model: URL, unit: Compute, count: Int) throws -> FrameStore {
-        guard count > 0 else { throw CLIError("der Film hat keine Bilder") }
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// Cache gate, taken after the film-list lock. Held only around directory claims, not while a large folder is deleted.
+    private static let gate = NSLock()
+
+    static var cacheRoot: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Whoodeo/Cache", isDirectory: true)
-            .appendingPathComponent(digest(identity(film)))
+    }
+
+    /// Stream copy for a film AVFoundation cannot read. It sits next to the model archives and goes away with them.
+    static func remuxURL(filmID: String) -> URL {
+        cacheRoot
+            .appendingPathComponent(filmID, isDirectory: true)
+            .appendingPathComponent("source.mov")
+    }
+
+    /// Digest of the file as it is now. Call this once, when the film is added, and store the result.
+    static func filmDigest(of url: URL) -> String {
+        digest(identity(url))
+    }
+
+    /// `filmID` is the digest stored on the film. Opening does not hash the file again.
+    static func open(filmID: String, model: URL, unit: Compute, count: Int) throws -> FrameStore {
+        guard count > 0 else { throw CLIError("der Film hat keine Bilder") }
+        let root = cacheRoot
+            .appendingPathComponent(filmID, isDirectory: true)
             .appendingPathComponent("\(digest(identity(model)))-\(unit.rawValue)", isDirectory: true)
+        gate.lock()
+        defer { gate.unlock() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return try FrameStore(directory: root, count: count)
+    }
+
+    /// Deletes one film directory: every model archive and `source.mov`.
+    static func removeCache(id: String) throws {
+        let directory = cacheRoot.appendingPathComponent(id, isDirectory: true)
+        gate.lock()
+        defer { gate.unlock() }
+        var directoryFlag: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &directoryFlag),
+              directoryFlag.boolValue else { return }
+        try FileManager.default.removeItem(at: directory)
+    }
+
+    /// Folders whose name is not a film id are renamed aside and then deleted.
+    /// The rename is the claim. The delete happens without the gate, so opening another film does not wait on it.
+    static func pruneCaches(isKept: @Sendable (String) -> Bool) {
+        let root = cacheRoot
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        guard let children = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for url in children {
+            let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+            guard values?.isDirectory != false else { continue }
+            let name = url.lastPathComponent
+            if name.hasSuffix(".deleting") {
+                try? FileManager.default.removeItem(at: url)
+                continue
+            }
+            gate.lock()
+            var doomed: URL?
+            if !isKept(name) {
+                let dest = root.appendingPathComponent(name + ".deleting")
+                try? FileManager.default.removeItem(at: dest)
+                if (try? FileManager.default.moveItem(at: url, to: dest)) != nil {
+                    doomed = dest
+                }
+            }
+            gate.unlock()
+            guard let doomed else { continue }
+            try? FileManager.default.removeItem(at: doomed)
+            Log.fill.info("Cache ohne Film entfernt")
+        }
     }
 
     func coverage() -> Coverage {

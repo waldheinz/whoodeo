@@ -102,8 +102,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated { Session.current?.exporting ?? false }
     }
 
-    @objc var scriptFilmPath: String {
-        MainActor.assumeIsolated { Session.current?.scriptFilmPath ?? "" }
+    @objc var scriptCurrentFilm: String {
+        get { MainActor.assumeIsolated { Session.current?.scriptCurrentFilmID ?? "" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let problem = Session.current?.showFilm(id: newValue) else { return }
+                NSScriptCommand.current()?.scriptErrorNumber = errAENoSuchObject
+                NSScriptCommand.current()?.scriptErrorString = problem
+            }
+        }
+    }
+
+    @objc var scriptFilms: [WhoodeoFilm] {
+        MainActor.assumeIsolated {
+            Session.current?.scriptFilmRecords().map(WhoodeoFilm.init(film:)) ?? []
+        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -123,8 +136,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
         "scriptCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",
-        "scriptFilmPath",
+        "scriptCurrentFilm", "scriptFilms",
     ]
+}
+
+/// One list entry for AppleScript. The object specifier is the digest, not the row position.
+@objc(WhoodeoFilm)
+final class WhoodeoFilm: NSObject {
+    @objc let scriptID: String
+    @objc let scriptPath: String
+    @objc let scriptName: String
+    @objc let scriptWidth: Int
+    @objc let scriptHeight: Int
+    @objc let scriptFrameCount: Int
+
+    nonisolated init(film: OpenFilm) {
+        scriptID = film.id
+        scriptPath = film.path
+        scriptName = film.name
+        scriptWidth = film.width
+        scriptHeight = film.height
+        scriptFrameCount = film.frames
+    }
+
+    override var objectSpecifier: NSScriptObjectSpecifier? {
+        guard let description = NSApp.classDescription as? NSScriptClassDescription else { return nil }
+        return NSUniqueIDSpecifier(
+            containerClassDescription: description,
+            containerSpecifier: nil,
+            key: "scriptFilms",
+            uniqueID: scriptID
+        )
+    }
+}
+
+private func scriptText(_ command: NSScriptCommand) -> String? {
+    if let text = command.directParameter as? String { return text }
+    if let url = command.directParameter as? URL { return url.path }
+    if let url = command.directParameter as? NSURL { return url.path }
+    return nil
 }
 
 @objc(WhoodeoPlayCommand)
@@ -163,26 +213,45 @@ final class WhoodeoSeekCommand: NSScriptCommand {
     }
 }
 
-@objc(WhoodeoOpenFilmCommand)
-final class WhoodeoOpenFilmCommand: NSScriptCommand {
+@objc(WhoodeoAddFilmCommand)
+final class WhoodeoAddFilmCommand: NSScriptCommand {
     override func performDefaultImplementation() -> Any? {
-        let path: String?
-        if let text = directParameter as? String {
-            path = text
-        } else if let url = directParameter as? URL {
-            path = url.path
-        } else if let url = directParameter as? NSURL {
-            path = url.path
-        } else {
-            path = nil
+        guard let path = scriptText(self) else {
+            scriptErrorNumber = errAECoercionFail
+            return nil
         }
-        guard let path else {
+        var result: String?
+        var problem: String?
+        MainActor.assumeIsolated {
+            guard let session = Session.current else {
+                problem = "Whoodeo ist nicht bereit."
+                return
+            }
+            if let id = session.addFilm(at: path) {
+                result = id
+            } else {
+                problem = session.failure ?? "Der Film wurde nicht aufgenommen."
+            }
+        }
+        if let problem {
+            scriptErrorNumber = errAENoSuchObject
+            scriptErrorString = problem
+            return nil
+        }
+        return result
+    }
+}
+
+@objc(WhoodeoRemoveFilmCommand)
+final class WhoodeoRemoveFilmCommand: NSScriptCommand {
+    override func performDefaultImplementation() -> Any? {
+        guard let id = scriptText(self) else {
             scriptErrorNumber = errAECoercionFail
             return nil
         }
         var problem: String?
         MainActor.assumeIsolated {
-            problem = Session.current?.openFilm(at: path)
+            problem = Session.current?.removeFilm(id: id)
         }
         if let problem {
             scriptErrorNumber = errAENoSuchObject

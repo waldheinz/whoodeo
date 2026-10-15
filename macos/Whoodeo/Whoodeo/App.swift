@@ -101,7 +101,8 @@ nonisolated enum CLI {
 
     private static func decode(_ args: [String]) throws {
         guard args.count == 3, let index = Int(args[1]), index >= 0 else { throw CLIError(usage) }
-        let film = try wait { try await Film.load(URL(fileURLWithPath: args[0])) }
+        let (url, id) = try filmID(for: args[0])
+        let film = try wait { try await Film.load(url, filmID: id) }
         let frame = try film.frame(at: index)
         try TensorFile.write(
             URL(fileURLWithPath: args[2]),
@@ -117,7 +118,8 @@ nonisolated enum CLI {
         guard paths.count == 2 else { throw CLIError(usage) }
         let count = frames > 0 ? frames : 8
         let predictor = try Predictor(url: URL(fileURLWithPath: paths[0]), unit: unit)
-        let film = try wait { try await Film.load(URL(fileURLWithPath: paths[1])) }
+        let (url, id) = try filmID(for: paths[1])
+        let film = try wait { try await Film.load(url, filmID: id) }
         let last = min(count + 2, film.facts.count)
         for index in 0..<last {
             let decodeStart = CFAbsoluteTimeGetCurrent()
@@ -147,8 +149,17 @@ nonisolated enum CLI {
         guard paths.count == 3 else { throw CLIError(usage) }
         let modelURL = URL(fileURLWithPath: paths[0])
         let predictor = try Predictor(url: modelURL, unit: unit)
-        let film = try wait { try await Film.load(URL(fileURLWithPath: paths[1])) }
-        let store = try FrameStore.open(film: film.facts.url, model: modelURL, unit: unit, count: film.facts.count)
+        let video = URL(fileURLWithPath: paths[1]).standardizedFileURL
+        let id = try FilmLibrary.mutate { list in
+            let id = try FilmLibrary.insert(video, into: &list)
+            if list.current.isEmpty { list.current = id }
+            return id
+        }
+        let film = try wait { try await Film.load(video, filmID: id) }
+        try FilmLibrary.mutate { list in
+            FilmLibrary.remember(id, width: film.facts.width, height: film.facts.height, frames: film.facts.count, in: &list)
+        }
+        let store = try FrameStore.open(filmID: id, model: modelURL, unit: unit, count: film.facts.count)
         let count = frames > 0 ? min(frames, film.facts.count) : film.facts.count
         try Export.write(
             film: film,
@@ -162,6 +173,19 @@ nonisolated enum CLI {
             cancelled: { false }
         )
         fputs("\nwrote \(count) \(paths[2])\n", stdout)
+    }
+
+    /// Listed films keep the id they already have. Anything else uses the digest it would get when added.
+    /// A remux for an id that is not in the list is pruned the next time the app starts.
+    private static func filmID(for path: String) throws -> (URL, String) {
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL
+        if let existing = FilmLibrary.load().films.first(where: { $0.path == url.path }) {
+            return (url, existing.id)
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw CLIError("Die Datei fehlt.")
+        }
+        return (url, FrameStore.filmDigest(of: url))
     }
 
     private static func flags(_ args: [String]) throws -> ([String], Compute, Int, Codec) {

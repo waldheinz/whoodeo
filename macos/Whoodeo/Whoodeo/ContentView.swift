@@ -38,6 +38,18 @@ struct ContentView: View {
         } message: {
             Text("Das Modell bleibt im Papierkorb, bis du es dort löschst.")
         }
+        .confirmationDialog(
+            "„\(session.removeName)“ aus der Liste entfernen?",
+            isPresented: $session.confirmRemove,
+            titleVisibility: .visible
+        ) {
+            Button("Entfernen", role: .destructive) {
+                session.removeSelectedFilm()
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: {
+            Text("Der Bildercache dieses Films wird gelöscht. Die Filmedatei bleibt.")
+        }
     }
 
     private var sidebar: some View {
@@ -64,6 +76,7 @@ struct ContentView: View {
                 }
             }
             .listStyle(.sidebar)
+            filmsList
             ScaleMeter(
                 rate: session.scaleRate,
                 realtime: session.realtimeRate,
@@ -72,7 +85,7 @@ struct ContentView: View {
             )
         }
         .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
-        .navigationTitle("Modelle")
+        .navigationTitle("Whoodeo")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -86,6 +99,55 @@ struct ContentView: View {
                     Label("In den Papierkorb legen", systemImage: "trash")
                 }
                 .disabled(session.selection == nil)
+            }
+        }
+    }
+
+    private var filmsList: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Filme")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    session.askRemoveFilm()
+                } label: {
+                    Image(systemName: "minus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(session.filmSelection == nil)
+                .help("Aus der Liste entfernen")
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            List(selection: $session.filmSelection) {
+                ForEach(session.films) { film in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(film.name)
+                            .lineLimit(1)
+                        Text(film.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .tag(film.id as String?)
+                    .contextMenu {
+                        Button("Aus der Liste entfernen", role: .destructive) {
+                            session.askRemoveFilm(film.id)
+                        }
+                    }
+                }
+            }
+            .listStyle(.sidebar)
+            .frame(minHeight: 72)
+            .onChange(of: session.filmSelection) { _, id in
+                guard let id else { return }
+                _ = session.showFilm(id: id)
+            }
+            .onDeleteCommand {
+                session.askRemoveFilm()
             }
         }
     }

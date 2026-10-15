@@ -12,9 +12,14 @@
             <cocoa class="WhoodeoSeekCommand"/>
             <direct-parameter type="integer" description="Bildnummer, beginnend bei 1."/>
         </command>
-        <command name="open film" code="WhooOpnF" description="Einen Film öffnen. Der Parameter ist ein Dateipfad.">
-            <cocoa class="WhoodeoOpenFilmCommand"/>
-            <direct-parameter type="text" description="Pfad zur Filmedatei."/>
+        <command name="add film" code="WhooAddF" description="Nimmt eine Datei in die Liste auf und zeigt sie. Ist der Pfad schon drin, bleibt die ID. Das Ergebnis ist die ID.">
+            <cocoa class="WhoodeoAddFilmCommand"/>
+            <direct-parameter type="text" description="POSIX-Pfad der Filmedatei."/>
+            <result type="text" description="ID des Films, der Digest vom Hinzufügen."/>
+        </command>
+        <command name="remove film" code="WhooRemF" description="Entfernt den Film mit dieser ID und löscht seinen Bildercache. Die Datei bleibt.">
+            <cocoa class="WhoodeoRemoveFilmCommand"/>
+            <direct-parameter type="text" description="ID des Films."/>
         </command>
         <command name="export film" code="WhooExpt" description="Den Bereich zwischen In- und Out-Punkt schreiben. Der Codec steht in der Eigenschaft codec. Der Befehl kehrt sofort zurück.">
             <cocoa class="WhoodeoExportCommand"/>
@@ -65,8 +70,34 @@
             <property name="exporting" code="Wexp" type="boolean" access="r" description="Ein Export läuft.">
                 <cocoa key="scriptExporting"/>
             </property>
-            <property name="film" code="Wpth" type="text" access="r" description="Pfad der geöffneten Datei. Leer, wenn kein Film offen ist.">
-                <cocoa key="scriptFilmPath"/>
+            <property name="current film" code="Wcur" type="text" access="rw" description="ID des gezeigten Films. Leer, wenn keiner gezeigt wird. Setzen zeigt diese ID und fügt keinen Film hinzu.">
+                <cocoa key="scriptCurrentFilm"/>
+            </property>
+            <element type="film">
+                <cocoa key="scriptFilms"/>
+                <accessor style="index"/>
+                <accessor style="id"/>
+            </element>
+        </class>
+        <class name="film" code="Wflm" plural="films" description="Ein Film in der Liste.">
+            <cocoa class="WhoodeoFilm"/>
+            <property name="id" code="ID  " type="text" access="r" description="Digest, beim Hinzufügen vergeben.">
+                <cocoa key="scriptID"/>
+            </property>
+            <property name="path" code="Wpth" type="text" access="r" description="POSIX-Pfad der Datei.">
+                <cocoa key="scriptPath"/>
+            </property>
+            <property name="name" code="pnam" type="text" access="r" description="Dateiname.">
+                <cocoa key="scriptName"/>
+            </property>
+            <property name="width" code="Wfwd" type="integer" access="r" description="Breite in Bildpunkten. 0, bis der Film einmal geladen wurde.">
+                <cocoa key="scriptWidth"/>
+            </property>
+            <property name="height" code="Wfht" type="integer" access="r" description="Höhe in Bildpunkten. 0, bis der Film einmal geladen wurde.">
+                <cocoa key="scriptHeight"/>
+            </property>
+            <property name="frame count" code="Wffc" type="integer" access="r" description="Anzahl der Bilder. 0, bis der Film einmal geladen wurde.">
+                <cocoa key="scriptFrameCount"/>
             </property>
         </class>
     </suite>

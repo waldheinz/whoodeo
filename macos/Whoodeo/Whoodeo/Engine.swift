@@ -42,10 +42,10 @@ nonisolated final class Engine: @unchecked Sendable {
     private var predictor: Predictor?
     private var cancelExport = false
 
-    func openFilm(_ url: URL, done: @escaping (Result<FilmFacts, Error>) -> Void) {
+    func openFilm(_ url: URL, filmID: String, done: @escaping (Result<FilmFacts, Error>) -> Void) {
         queue.async {
             do {
-                let film = try Self.wait { try await Film.load(url) }
+                let film = try Self.wait { try await Film.load(url, filmID: filmID) }
                 self.film = film
                 done(.success(film.facts))
             } catch {
@@ -145,6 +145,30 @@ nonisolated final class Engine: @unchecked Sendable {
         lock.lock()
         cancelExport = true
         lock.unlock()
+    }
+
+    /// Forget the frame store and return once both queues have finished work that already holds one.
+    /// `done` runs on the engine queue.
+    func settle(done: @escaping () -> Void) {
+        lock.lock()
+        let displaced = handler
+        wanted = nil
+        handler = nil
+        store = nil
+        lock.unlock()
+        displaced?(.failure(CancellationError()))
+        playback.async { [weak self] in
+            guard let self else {
+                done()
+                return
+            }
+            self.queue.async {
+                self.lock.lock()
+                self.store = nil
+                self.lock.unlock()
+                done()
+            }
+        }
     }
 
     private func drain() {
