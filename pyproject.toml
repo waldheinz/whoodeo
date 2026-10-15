@@ -19,6 +19,7 @@ whoodeo-train = "whoodeo.train:main"
 whoodeo-apply = "whoodeo.apply:main"
 whoodeo-make-low = "whoodeo.make_low:main"
 whoodeo-board = "whoodeo.board:main"
+whoodeo-coreml = "whoodeo.coreml:main"
 
 [build-system]
 requires = ["hatchling"]

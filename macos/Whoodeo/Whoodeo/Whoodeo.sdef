@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary title="Whoodeo">
+    <suite name="Whoodeo" code="Whoo" description="Whoodeo-Vorschau und Cache.">
+        <command name="play" code="WhooPlay" description="Wiedergabe ab dem Bild unter dem Regler starten.">
+            <cocoa class="WhoodeoPlayCommand"/>
+        </command>
+        <command name="pause" code="WhooPaus" description="Wiedergabe anhalten. Das Bild bleibt, wo der Regler steht.">
+            <cocoa class="WhoodeoPauseCommand"/>
+        </command>
+        <command name="seek" code="WhooSeek" description="Zu einem Bild gehen. Die Nummer beginnt bei 1.">
+            <cocoa class="WhoodeoSeekCommand"/>
+            <direct-parameter type="integer" description="Bildnummer, beginnend bei 1."/>
+        </command>
+        <command name="open film" code="WhooOpnF" description="Einen Film öffnen. Der Parameter ist ein Dateipfad.">
+            <cocoa class="WhoodeoOpenFilmCommand"/>
+            <direct-parameter type="text" description="Pfad zur Filmedatei."/>
+        </command>
+        <command name="export film" code="WhooExpt" description="Den Bereich zwischen In- und Out-Punkt schreiben. Der Codec steht in der Eigenschaft codec. Der Befehl kehrt sofort zurück.">
+            <cocoa class="WhoodeoExportCommand"/>
+            <direct-parameter type="text" description="Pfad zur Zieldatei. Eine vorhandene Datei wird ersetzt."/>
+        </command>
+        <class name="application" code="capp" description="Whoodeo">
+            <cocoa class="NSApplication"/>
+            <property name="frame" code="Wfrm" type="integer" access="rw" description="Bild unter dem Regler, beginnend bei 1.">
+                <cocoa key="scriptFrame"/>
+            </property>
+            <property name="frame count" code="Wfrc" type="integer" access="r" description="Anzahl der Bilder im Film.">
+                <cocoa key="scriptFrameCount"/>
+            </property>
+            <property name="playing" code="Wply" type="boolean" access="rw" description="Die Wiedergabe läuft.">
+                <cocoa key="scriptPlaying"/>
+            </property>
+            <property name="fill enabled" code="Wfil" type="boolean" access="rw" description="Fehlende Bilder im Hintergrund rechnen und speichern.">
+                <cocoa key="scriptFillEnabled"/>
+            </property>
+            <property name="status" code="Wsta" type="text" access="r" description="Untertitel des Fensters.">
+                <cocoa key="scriptStatus"/>
+            </property>
+            <property name="fill error" code="Werr" type="text" access="r" description="Letzter Fehler des Hintergrundfüllens. Leer, wenn keiner offen ist.">
+                <cocoa key="scriptFillError"/>
+            </property>
+            <property name="cached frames" code="Wcsh" type="integer" access="r" description="Bilder, die schon im Archiv liegen.">
+                <cocoa key="scriptCachedFrames"/>
+            </property>
+            <property name="filling" code="Wflg" type="integer" access="r" description="Bild, das der Hintergrund gerade rechnet. 0, wenn er steht.">
+                <cocoa key="scriptFilling"/>
+            </property>
+            <property name="model" code="Wmod" type="text" access="rw" description="Das gewählte Modell, zum Beispiel „Schritt 21250 · flexibel“. Leer, wenn keins gewählt ist. Die Wahl bleibt nach einem Neustart erhalten.">
+                <cocoa key="scriptModel"/>
+            </property>
+            <property name="models" code="Wmds" access="r" description="Die Modelle in der Seitenleiste.">
+                <cocoa key="scriptModels"/>
+                <type type="text" list="yes"/>
+            </property>
+            <property name="codec" code="Wcod" type="text" access="rw" description="hevc, prores oder prores4444. Voreinstellung ist hevc.">
+                <cocoa key="scriptCodec"/>
+            </property>
+            <property name="in point" code="Winp" type="integer" access="rw" description="Erstes Bild des Exports, beginnend bei 1.">
+                <cocoa key="scriptInPoint"/>
+            </property>
+            <property name="out point" code="Wout" type="integer" access="rw" description="Letztes Bild des Exports, beginnend bei 1.">
+                <cocoa key="scriptOutPoint"/>
+            </property>
+            <property name="exporting" code="Wexp" type="boolean" access="r" description="Ein Export läuft.">
+                <cocoa key="scriptExporting"/>
+            </property>
+            <property name="film" code="Wpth" type="text" access="r" description="Pfad der geöffneten Datei. Leer, wenn kein Film offen ist.">
+                <cocoa key="scriptFilmPath"/>
+            </property>
+        </class>
+    </suite>
+</dictionary>
