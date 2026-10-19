@@ -38,7 +38,12 @@ def get_device():
 
 
 def load_checkpoint(path, device):
-    return build_generator(load_generator(path), device)
+    spec = load_generator(path)
+    if spec.architecture.get("arch") == "vae":
+        raise SystemExit(
+            f"{path}: a vae checkpoint reconstructs frames. whoodeo-apply upscales video"
+        )
+    return build_generator(spec, device)
 
 
 def iter_reconstructions(model, frames, radius, device):

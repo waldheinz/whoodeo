@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from whoodeo.models.common import ResidualBlock, bilinear_plus, zero_conv
+from whoodeo.models.common import ResidualBlock, bilinear_plus, pad_to, zero_conv
 
 
 # One code covers this many low-resolution pixels on each side, 8 on the master.
@@ -26,17 +26,6 @@ DECAY = 0.99
 # replaced by a feature from the batch. Without that, the first lookup keeps
 # every position on the one or two shortest codes.
 DEAD = 0.1
-
-
-def _pad_to(image, factor):
-    """Pad the bottom and right so both sides divide by `factor`. Reflect when it fits."""
-    height, width = image.shape[-2:]
-    pad_h = (factor - height % factor) % factor
-    pad_w = (factor - width % factor) % factor
-    if pad_h == 0 and pad_w == 0:
-        return image, height, width
-    mode = "reflect" if height > pad_h and width > pad_w else "replicate"
-    return F.pad(image, (0, pad_w, 0, pad_h), mode=mode), height, width
 
 
 class Codebook(nn.Module):
@@ -121,7 +110,7 @@ class VQESPCN(nn.Module):
         self.align_loss = None
         features = F.relu(self.initial_conv(x))
         features = self.res_blocks(features)
-        padded, height, width = _pad_to(features, self.patch)
+        padded, height, width = pad_to(features, self.patch)
         quantized, self.align_loss = self.codebook(self.down(padded))
         restored = F.interpolate(quantized, scale_factor=self.patch, mode="nearest")
         restored = self.up(restored)[:, :, :height, :width]

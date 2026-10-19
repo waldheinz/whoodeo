@@ -12,6 +12,10 @@ when it has fewer, so a lone size still fills whole batches. Each film draws
 one variant per sample it received, with the same rule. Two spans of frames
 are held out for validation.
 
+`arch: vae` reconstructs master frames and does not read a low variant.
+Without crop each sample is the whole frame, and a batch stays inside one
+master size. With crop every sample is that window, so sizes can share a batch.
+
 Training batches are decoded on one side thread into a queue of three CPU
 batches. A frame read opens the video and closes it before the next read.
 An unreadable training clip is logged and the loader draws a new batch.
@@ -37,7 +41,8 @@ of disc_lr.
 A fresh run validates once at step 0, before any update. Where the last
 layer starts at zero, that pass is the bilinear upscale. Modified leaves
 that layer at the default initialization, so step 0 already includes a
-correction. A fine-tune's step 0 is the generator that was loaded.
+correction. A fine-tune's step 0 is the generator that was loaded. A vae
+has no bilinear base, so that first pass is the untrained reconstruction.
 
 A gan term adds a U-Net discriminator. Each checkpoint is a directory
 checkpoints/<step>/ holding two files. model.pt is the generator and the
@@ -48,7 +53,13 @@ those directories, and latest in the runs directory follows the newest
 checkpoint written. The run directory also gets a TensorBoard event file for the losses.
 The vote model adds neighbor/weight and neighbor/grad on each step, and
 neighbor/image when validation runs. weight and grad cover every kernel
-in the shared vote.
+in the shared vote. A vae adds train/kl and val/kl. The step loss includes
+beta times that KL. The validation loss the plateau reads is the pixel and
+VGG objective. It also records latent/mu_mean, latent/mu_std, latent/sigma_mean
+and latent/spread for the batch, the same four on the validation set, and the
+per-channel pair under latent/channel/<i>. spread is the square root of
+var(μ) + mean(σ²) and sits near 1 when the code matches the unit Gaussian.
+The validation histogram is latent/mu.
 whoodeo-board serves every run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
@@ -68,12 +79,11 @@ still present has to match the file.
 import argparse
 import queue
 import random
-import re
 import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -81,19 +91,22 @@ import av
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
-from whoodeo.library import load_catalog, master_filename, titles_of
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import (
     architecture_dict, assert_resume_matches, cosine_learning_rate, load_config,
     restore_plateau, shape_text,
 )
+from whoodeo.films import (
+    UnreadableSample, draw_indexes, load_films, load_masters, require_films,
+    require_masters, sample_index, unreadable,
+)
 from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
+from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
+from whoodeo.models.vae import LatentTally, latent_scalars
 from whoodeo.objective import Objective, pixel_loss
-from whoodeo.video import frame_tensor, png_bytes, rgb_image
-
-SCALE = 2
+from whoodeo.video import png_bytes, rgb_image
 
 
 def get_device():
@@ -104,272 +117,18 @@ def get_device():
     return torch.device("cpu")
 
 
-def holdout_ranges(count, fraction):
-    span = count * fraction / 2
-    ranges = []
-    for start in (0.30 * count, 0.70 * count):
-        end = min(count, start + span)
-        if end > start:
-            ranges.append((start, end))
-    return ranges
-
-
-def in_ranges(index, ranges):
-    return any(start <= index < end for start, end in ranges)
-
-
-def frame_index(stamp, rate):
-    """Display index of a presentation time at this frame rate."""
-    return round(stamp * float(rate))
-
-
-class Clip:
-    """A video named in the catalog. Nothing stays open between reads."""
-
-    def __init__(self, path, width, height, frames):
-        self.path = Path(path)
-        self.width = width
-        self.height = height
-        self.frames = frames
-
-    def frames_around(self, index, radius):
-        """Frames centered on this display index.
-
-        The seek timestamp only reaches a keyframe. The index is the frame
-        rate times the presentation time, and each kept step has to be one
-        frame. A gap, or a landing past the requested index, stops the read.
-        """
-        if index < 0 or index >= self.frames:
-            raise RuntimeError(
-                f"{self.path.name}: frame {index} outside 0..{self.frames - 1}"
-            )
-        container = av.open(str(self.path))
-        try:
-            stream = container.streams.video[0]
-            width = stream.codec_context.width
-            height = stream.codec_context.height
-            if (width, height) != (self.width, self.height):
-                raise RuntimeError(
-                    f"{self.path.name} is {width}x{height}, "
-                    f"catalog says {self.width}x{self.height}"
-                )
-            rate = stream.average_rate
-            if not rate:
-                raise RuntimeError(f"no frame rate: {self.path}")
-            first = max(0, index - radius)
-            last = min(self.frames - 1, index + radius)
-            hint = max(0.0, (first - 1) / float(rate))
-            container.seek(int(hint * av.time_base), backward=True, any_frame=False)
-            found = {}
-            previous = None
-            for frame in container.decode(stream):
-                if frame.time is None:
-                    raise RuntimeError(f"no timestamp: {self.path.name}")
-                current = frame_index(frame.time, rate)
-                if previous is None:
-                    if current > first:
-                        raise RuntimeError(
-                            f"{self.path.name}: seek landed on frame {current}, "
-                            f"needed {first}"
-                        )
-                elif current != previous + 1:
-                    raise RuntimeError(
-                        f"{self.path.name}: frame {previous} is followed by {current}"
-                    )
-                previous = current
-                if current < first:
-                    continue
-                found[current] = frame_tensor(frame)
-                if current >= last:
-                    break
-            if first not in found or last not in found:
-                raise RuntimeError(f"no frame {index} in {self.path.name}")
-            return [
-                found[min(max(index + delta, 0), self.frames - 1)]
-                for delta in range(-radius, radius + 1)
-            ]
-        finally:
-            container.close()
-
-
-@dataclass
-class Variant:
-    name: str
-    low: Clip
-
-
-@dataclass
-class Film:
-    name: str
-    orig: Clip
-    frames: int
-    holdouts: list
-    variants: list = field(default_factory=list)
-
-
-@dataclass
-class FoundFilms:
-    """Pairs named in the catalog. A master with no low is left out."""
-
-    films: list
-    total: int
-    kept: int
-    problems: list
-
-
-def _number(record, key, label):
-    value = record.get(key) if isinstance(record, dict) else None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise SystemExit(f"{label}: missing {key}")
-    return value
-
-
-def _count(record, key, label):
-    value = record.get(key) if isinstance(record, dict) else None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise SystemExit(f"{label}: missing {key}")
-    return value
-
-
-def load_films(root, holdout, variants=None):
-    """Pairs from catalog.json. No video is opened."""
-    orig_dir = root / "orig"
-    low_dir = root / "low"
-    if not orig_dir.is_dir():
-        raise SystemExit(f"no orig folder: {orig_dir}")
-    if not low_dir.is_dir():
-        raise SystemExit(f"no low folder: {low_dir}")
-    catalog = load_catalog(root)
-    titles = titles_of(catalog, root / "catalog.json")
-    pattern = re.compile(variants) if variants is not None else None
-    total = 0
-    kept = 0
-    problems = []
-    ordered = []
-    for title in titles:
-        entry = titles[title]
-        masters = entry.get("masters") if isinstance(entry, dict) else None
-        if not isinstance(masters, dict):
-            problems.append(f"skip {title}: no masters")
-            continue
-        frames = _count(entry, "frames", title)
-        holdouts = holdout_ranges(frames, holdout)
-        for rung, master in masters.items():
-            name = master_filename(title, rung)
-            orig_path = orig_dir / name
-            if not isinstance(master, dict):
-                problems.append(f"skip {name}: bad catalog entry")
-                continue
-            if not orig_path.is_file():
-                problems.append(f"skip {name}: no master file")
-                continue
-            orig_w = int(_number(master, "width", name))
-            orig_h = int(_number(master, "height", name))
-            lows = master.get("low")
-            if not isinstance(lows, list):
-                problems.append(f"skip {name}: no lows")
-                continue
-            names = []
-            for variant_name in lows:
-                if (
-                    not isinstance(variant_name, str)
-                    or not variant_name
-                    or "/" in variant_name
-                    or variant_name in {".", ".."}
-                ):
-                    problems.append(f"skip {name}: bad variant name")
-                    continue
-                if variant_name not in names:
-                    names.append(variant_name)
-            low_w = orig_w // SCALE
-            low_h = orig_h // SCALE
-            variants_here = []
-            for variant_name in sorted(names):
-                rel = f"{variant_name}/{name}"
-                low_path = low_dir / variant_name / name
-                if not low_path.is_file():
-                    problems.append(f"skip {rel}: file missing")
-                    continue
-                total += 1
-                if pattern is not None and pattern.search(rel) is None:
-                    continue
-                if orig_w % SCALE or orig_h % SCALE:
-                    raise SystemExit(
-                        f"{name} is {orig_w}x{orig_h}, "
-                        f"both sides must be divisible by {SCALE}"
-                    )
-                kept += 1
-                variants_here.append(Variant(
-                    name=variant_name,
-                    low=Clip(low_path, low_w, low_h, frames),
-                ))
-            if not variants_here:
-                continue
-            film = Film(
-                name=f"{title}.{rung}",
-                orig=Clip(orig_path, orig_w, orig_h, frames),
-                frames=frames,
-                holdouts=holdouts,
-                variants=variants_here,
-            )
-            ordered.append((f"{title}.mkv", orig_w * orig_h, film))
-    ordered.sort(key=lambda item: (item[0], -item[1]))
-    films = [item[2] for item in ordered]
-    return FoundFilms(films, total, kept, problems)
-
-
-def require_films(found, root, variants):
-    if found.kept:
-        return
-    if variants:
-        raise SystemExit(
-            f"no pairs match {variants!r}: {found.kept} of {found.total}"
-        )
-    raise SystemExit(f"no video pairs in {root / 'orig'} and {root / 'low'}")
-
-
-def sample_index(rng, film, split):
-    for _ in range(10000):
-        index = rng.randrange(film.frames)
-        inside = in_ranges(index, film.holdouts)
-        if split == "val" and inside:
-            return index
-        if split == "train" and not inside:
-            return index
-    raise RuntimeError(f"could not sample a {split} frame in {film.name}")
-
-
-class UnreadableSample(RuntimeError):
-    """A training clip could not be read. The loader draws another batch."""
-
-
-def _unreadable(where, index, exc):
-    return UnreadableSample(f"{where} frame {index}: {exc}")
-
-
 def load_sample(film, variant, index, radius):
     try:
         low_frames = variant.low.frames_around(index, radius)
     except (RuntimeError, OSError, av.error.FFmpegError) as exc:
         where = f"low {variant.name}/{variant.low.path.name}"
-        raise _unreadable(where, index, exc) from exc
+        raise unreadable(where, index, exc) from exc
     try:
         hr = film.orig.frames_around(index, radius)[radius]
     except (RuntimeError, OSError, av.error.FFmpegError) as exc:
-        raise _unreadable(f"master {film.orig.path.name}", index, exc) from exc
+        raise unreadable(f"master {film.orig.path.name}", index, exc) from exc
     stacked = torch.cat(low_frames, dim=0)
     return stacked, hr
-
-
-def draw_indexes(rng, available, count):
-    """count indexes into a collection of `available` items.
-
-    The draw is without replacement when there are at least count items, and
-    with replacement when there are fewer.
-    """
-    if count > available:
-        return rng.choices(range(available), k=count)
-    return rng.sample(range(available), count)
 
 
 def frame_size(film):
@@ -456,12 +215,8 @@ class BatchLoader:
     loader.
     """
 
-    def __init__(self, rng, films, batch, radius, crop):
-        self._rng = rng
-        self._films = films
-        self._batch = batch
-        self._radius = radius
-        self._crop = crop
+    def __init__(self, produce):
+        self._produce = produce
         self._queue = queue.Queue(maxsize=_QUEUE_DEPTH)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="whoodeo-batch", daemon=False)
@@ -496,15 +251,11 @@ class BatchLoader:
         return False
 
     def _run(self):
-        films = self._films
         failed = 0
         try:
             while not self._stop.is_set():
-                specs = make_batch_specs(self._rng, films, "train", self._batch)
-                film_index, variant_index, _index = specs[0]
-                variant = films[film_index].variants[variant_index]
                 try:
-                    low, high = batch_from_specs(films, specs, self._radius)
+                    prepared = self._produce()
                 except UnreadableSample as exc:
                     failed += 1
                     print(f"skip batch: {exc}", file=sys.stderr, flush=True)
@@ -514,23 +265,13 @@ class BatchLoader:
                         ) from exc
                     continue
                 failed = 0
-                box = None
-                if self._crop is not None:
-                    box = sample_box(high, self._crop, self._rng)
-                prepared = PreparedBatch(
-                    low=low,
-                    high=high,
-                    width=variant.low.width,
-                    height=variant.low.height,
-                    box=box,
-                )
                 if not self._put(prepared):
                     return
         except BaseException as exc:
             self._put(exc)
 
 
-def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr):
+def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, extras=None):
     """One TensorBoard point per value that this step actually has."""
     def emit(tag, value):
         if value is not None:
@@ -551,6 +292,9 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, us
         emit("neighbor/weight", usage.get("weight"))
         emit("neighbor/grad", usage.get("grad"))
     emit("neighbor/image", neighbor_image)
+    if extras:
+        for tag, value in extras.items():
+            emit(tag, value)
     writer.flush()
 
 
@@ -559,6 +303,20 @@ def move_optimizer(optimizer, device):
         for key, value in state.items():
             if torch.is_tensor(value):
                 state[key] = value.to(device)
+
+
+def exact_box(image, size, rng):
+    """A window of exactly `size` on each side. `rng` None keeps the center."""
+    _batch, _channels, height, width = image.shape
+    if height < size or width < size:
+        raise SystemExit(f"frame {width}x{height} is smaller than a {size} crop")
+    if rng is None:
+        top = (height - size) // 2
+        left = (width - size) // 2
+    else:
+        top = rng.randrange(0, height - size + 1)
+        left = rng.randrange(0, width - size + 1)
+    return top, left, size, size
 
 
 def sample_box(image, size, rng):
@@ -665,15 +423,24 @@ def measure_raw_means(model, films, specs, radius, batch_size, device, cfg, obje
     return layer_means, term_means
 
 
+def save_still(folder, name, tensor):
+    """Write a reference image once. A later step leaves the file in place."""
+    path = folder / f"{name}.png"
+    if not path.is_file():
+        path.write_bytes(png_bytes(rgb_image(tensor)))
+
+
+def save_step_image(folder, stem, step, tensor):
+    (folder / f"{stem}-{step:06d}.png").write_bytes(png_bytes(rgb_image(tensor)))
+
+
 def save_val_images(directory, step, index, low, pred, high, width):
     """Write one validation sample. low and master stay; the upscale is per step."""
     folder = directory / f"{index:0{width}d}"
     folder.mkdir(parents=True, exist_ok=True)
-    for name, tensor in (("low", low), ("master", high)):
-        path = folder / f"{name}.png"
-        if not path.is_file():
-            path.write_bytes(png_bytes(rgb_image(tensor)))
-    (folder / f"upscale-{step:06d}.png").write_bytes(png_bytes(rgb_image(pred)))
+    save_still(folder, "low", low)
+    save_still(folder, "master", high)
+    save_step_image(folder, "upscale", step, pred)
 
 
 def neighbor_image_effect(model, low, pred):
@@ -805,7 +572,208 @@ def describe_schedule(cfg, plateau, note):
     print(line, flush=True)
 
 
-def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
+def master_size(film):
+    return film.orig.width, film.orig.height
+
+
+def make_vae_specs(rng, films, split, count, crop):
+    """count (film, frame) pairs.
+
+    With a crop any master can share the batch, because every window is the
+    same size. Without one, a film picks the master size and the batch stays
+    inside that size.
+    """
+    if crop is not None:
+        film_indexes = draw_indexes(rng, len(films), count)
+    else:
+        anchor = rng.randrange(len(films))
+        size = master_size(films[anchor])
+        group = [index for index, film in enumerate(films) if master_size(film) == size]
+        film_indexes = [group[pick] for pick in draw_indexes(rng, len(group), count)]
+    return [
+        (film_index, sample_index(rng, films[film_index], split))
+        for film_index in film_indexes
+    ]
+
+
+def load_master(film, index):
+    try:
+        return film.orig.frames_around(index, 0)[0]
+    except (RuntimeError, OSError, av.error.FFmpegError) as exc:
+        raise unreadable(f"master {film.orig.path.name}", index, exc) from exc
+
+
+def vae_batch(films, specs, crop, rng):
+    """Stack master frames. The crop is drawn only after every frame is read."""
+    frames = [load_master(films[film_index], index) for film_index, index in specs]
+    if crop is not None:
+        cropped = []
+        for frame in frames:
+            batched = frame.unsqueeze(0)
+            cropped.append(take(batched, exact_box(batched, crop, rng))[0])
+        frames = cropped
+    image = torch.stack(frames)
+    return FrameBatch(image, int(image.shape[-1]), int(image.shape[-2]))
+
+
+def prior_image(model, image):
+    """One decode from the unit Gaussian at this frame's latent size.
+
+    Goes through `decode`, so the KL stored by `forward` stays put.
+    """
+    padded, height, width = pad_to(image, model.factor)
+    latent_h = padded.shape[-2] // model.factor
+    latent_w = padded.shape[-1] // model.factor
+    draw = torch.randn(
+        1, model.latent, latent_h, latent_w, device=image.device, dtype=image.dtype,
+    )
+    with torch.no_grad():
+        recon = model.decode(draw)
+    return recon[0, :, :height, :width]
+
+
+def measure_vae(model, films, specs, crop, batch_size, device, cfg, objective):
+    """Raw term means on master frames, for the loss scales."""
+    model.eval()
+    count = 0
+    pixel_acc = 0.0
+    layer_acc = {name: 0.0 for name in objective.vgg_layers}
+    pixel = cfg.term("pixel")
+    with torch.no_grad():
+        for start in range(0, len(specs), batch_size):
+            chunk = specs[start:start + batch_size]
+            image = vae_batch(films, chunk, crop, None).image.to(device)
+            pred = model(image)
+            frames = len(chunk)
+            if pixel is not None:
+                pixel_acc += pixel_loss(pred, image, pixel.kind).item() * frames
+            if objective.vgg is not None:
+                for name, loss in objective.vgg.layer_losses(pred, image).items():
+                    layer_acc[name] += loss.item() * frames
+            count += frames
+    model.train()
+    term_means = {}
+    if pixel is not None:
+        term_means["pixel"] = pixel_acc / count
+    layer_means = {name: value / count for name, value in layer_acc.items()}
+    return layer_means, term_means
+
+
+def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, image_dir=None, step=None):
+    """Mean of the weighted objective. The KL is returned beside it.
+
+    master.png is written once. recon-<step>.png is the reconstruction.
+    """
+    model.eval()
+    loss_acc = 0.0
+    pixel_acc = 0.0
+    vgg_acc = 0.0
+    kl_acc = 0.0
+    count = 0
+    saved = 0
+    tally = LatentTally()
+    width = max(2, len(str(max(len(specs) - 1, 0))))
+    with torch.no_grad():
+        for start in range(0, len(specs), batch_size):
+            chunk = specs[start:start + batch_size]
+            image = vae_batch(films, chunk, crop, None).image.to(device)
+            pred = model(image)
+            tally.add(model.mu, model.logvar, sample=True)
+            if image_dir is not None:
+                for offset in range(len(chunk)):
+                    folder = image_dir / f"{saved + offset:0{width}d}"
+                    folder.mkdir(parents=True, exist_ok=True)
+                    save_still(folder, "master", image[offset])
+                    save_step_image(folder, "recon", step, pred[offset])
+                saved += len(chunk)
+            raw, _layer_raw = raw_terms(objective, cfg, pred, image, None, None)
+            total, weighted = objective.combine(raw)
+            frames = len(chunk)
+            loss_acc += total.item() * frames
+            if "pixel" in weighted:
+                pixel_acc += weighted["pixel"].item() * frames
+            if "vgg" in weighted:
+                vgg_acc += weighted["vgg"].item() * frames
+            kl_acc += float(model.kl) * frames
+            count += frames
+    model.train()
+    pixel_mean = pixel_acc / count if cfg.term("pixel") is not None else None
+    vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
+    return EvalResult(
+        loss_acc / count,
+        (pixel_mean, vgg_mean, None, None),
+        None,
+        kl_acc / count,
+        tally.report(),
+    )
+
+
+@dataclass
+class FrameBatch:
+    image: torch.Tensor
+    width: int
+    height: int
+
+
+@dataclass
+class StepOut:
+    raw: dict
+    layer_raw: dict
+    d_value: float | None
+    images: dict | None
+    width: int
+    height: int
+
+
+@dataclass
+class EvalResult:
+    loss: float
+    parts: tuple
+    neighbor: float | None
+    kl: float | None
+    latent: dict | None = None
+
+
+def _scalar(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return float(value.detach())
+    return float(value)
+
+
+@dataclass
+class Run:
+    cfg: object
+    out_dir: Path
+    device: torch.device
+    rng: random.Random
+    model: torch.nn.Module
+    optimizer: torch.optim.Optimizer
+    start_step: int
+    plateau: object
+    plateau_note: str | None
+    train_state: object
+    films: list
+    discriminator: torch.nn.Module | None
+    disc_optimizer: torch.optim.Optimizer | None
+    gan: object
+
+    def apply_rate(self, at_step):
+        rate = learning_rate(self.cfg, at_step, self.plateau)
+        apply_learning_rate(self.optimizer, rate)
+        if self.disc_optimizer is not None:
+            apply_learning_rate(
+                self.disc_optimizer, self.gan.disc_lr * rate / self.cfg.lr,
+            )
+        return rate
+
+
+def open_run(cfg, resume, finetune, load):
+    """Device, films, model, and optimizer. None when a cosine run is already over.
+
+    `load` prints its film report and returns the films.
+    """
     if resume is not None and finetune is not None:
         raise SystemExit("pass either --resume or --model")
     generator = finetune
@@ -819,7 +787,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 f"{train_state.path} is step {train_state.step}",
                 flush=True,
             )
-            return
+            return None
 
     out_dir = cfg.out
     if out_dir is None and train_state is not None:
@@ -838,22 +806,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
     rng = random.Random(cfg.seed)
     torch.manual_seed(cfg.seed)
-    radius = cfg.in_frames // 2
     device = get_device()
-    root = data_root()
-
-    found = load_films(root, cfg.holdout, cfg.variants)
     print(f"device {device}", flush=True)
     print(f"config {cfg.source}", flush=True)
     print(f"network {shape_text(*cfg.arch_key())}", flush=True)
     if generator is not None and train_state is None:
         shown = "unknown" if generator.step is None else str(generator.step)
         print(f"fine-tune {generator.path}  loaded step {shown}", flush=True)
-    for problem in found.problems:
-        print(problem, flush=True)
-    require_films(found, root, cfg.variants)
-    print(f"pairs {found.kept} of {found.total}", flush=True)
-    films = found.films
+    films = load()
 
     out_dir.mkdir(parents=True, exist_ok=True)
     copied = out_dir / "config.yaml"
@@ -880,6 +840,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
         levels=cfg.levels, bilinear=cfg.bilinear, codes=cfg.codes, patch=cfg.patch,
         res_scale=cfg.res_scale, vote=cfg.vote,
+        latent=cfg.latent, factor=cfg.factor, beta=cfg.beta,
     )
     model = model.train().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -920,61 +881,76 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
         else:
             plateau, plateau_note = restore_plateau(cfg, train_state.schedule, train_state.path)
 
-    def apply_rate(at_step):
-        rate = learning_rate(cfg, at_step, plateau)
-        apply_learning_rate(optimizer, rate)
-        if disc_optimizer is not None:
-            apply_learning_rate(disc_optimizer, gan.disc_lr * rate / cfg.lr)
-        return rate
+    run = Run(
+        cfg, out_dir, device, rng, model, optimizer, start_step, plateau, plateau_note,
+        train_state, films, discriminator, disc_optimizer, gan,
+    )
+    run.apply_rate(start_step)
+    return run
 
-    apply_rate(start_step)
 
-    objective = Objective(cfg, device)
-    val_specs = []
-    while len(val_specs) < cfg.val_count:
-        need = min(cfg.batch, cfg.val_count - len(val_specs))
-        val_specs.extend(make_batch_specs(rng, films, "val", need))
+def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_step, evaluate_split):
+    """Loss scales, the live page, and the step loop.
+
+    Validation specs are drawn before the loader starts. The plateau follows
+    the objective from `evaluate_split`. Commitment and KL are added on the
+    training step and logged beside that objective.
+    """
+    cfg = run.cfg
+    objective = Objective(cfg, run.device)
+    val_specs = make_val_specs()
     loader = None
     live = None
     writer = None
     try:
-        loader = BatchLoader(
-            rng,
-            films,
-            cfg.batch,
-            radius,
-            None if gan is None else gan.crop,
-        )
+        loader = make_loader()
         loader.start()
-        if train_state is not None:
-            objective.load_state_dict(train_state.objective)
+        if run.train_state is not None:
+            objective.load_state_dict(run.train_state.objective)
             print("loss scales from checkpoint", flush=True)
         else:
-            layer_means, term_means = measure_raw_means(
-                model, films, val_specs, radius, cfg.batch, device, cfg, objective, discriminator,
-            )
+            layer_means, term_means = measure(objective, val_specs)
             objective.calibrate(layer_means, term_means)
         describe_loss(cfg, objective)
-        describe_schedule(cfg, plateau, plateau_note)
+        describe_schedule(cfg, run.plateau, run.plateau_note)
 
         live = open_live(live_bind, preview)
-        writer = SummaryWriter(log_dir=out_dir)
-        has_pixel = cfg.term("pixel") is not None
-        has_vgg = cfg.term("vgg") is not None
+        writer = SummaryWriter(log_dir=run.out_dir)
 
-        def logged_parts(pixel, vgg, gan_value, d_value):
+        def logged_parts(weighted, d_value):
             return (
-                pixel if has_pixel else None,
-                vgg if has_vgg else None,
-                gan_value if gan is not None else None,
-                d_value if gan is not None else None,
+                weighted["pixel"].item() if cfg.term("pixel") is not None else None,
+                weighted["vgg"].item() if cfg.term("vgg") is not None else None,
+                weighted["gan"].item() if run.gan is not None else None,
+                d_value if run.gan is not None else None,
             )
 
-        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr):
+        def batch_latent():
+            mu = getattr(run.model, "mu", None)
+            if mu is None:
+                return None
+            tally = LatentTally()
+            tally.add(mu, run.model.logvar)
+            return tally.report()
+
+        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, train_kl, val_kl, train_latent, val_latent):
+            extras = {}
+            if train_kl is not None:
+                extras["train/kl"] = train_kl
+            if val_kl is not None:
+                extras["val/kl"] = val_kl
+            if train_latent is not None:
+                extras.update(latent_scalars(train_latent, ""))
+            if val_latent is not None:
+                extras.update(latent_scalars(val_latent, "val/"))
             write_scalars(
                 writer, step, train_loss, val_loss, train_parts, val_parts, usage,
-                neighbor_image, lr,
+                neighbor_image, lr, extras or None,
             )
+            hist = None if val_latent is None else val_latent.get("hist")
+            if hist is not None:
+                writer.add_histogram("latent/mu", hist, step)
+                writer.flush()
             if val_loss is None:
                 return
             message = f"step {step:06d}  val {val_loss:.6f}  lr {lr:.4g}"
@@ -986,6 +962,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
                 message += f"  weight {usage['weight']:.5f}"
                 if usage.get("grad") is not None:
                     message += f"  grad {usage['grad']:.4f}"
+            if val_kl is not None:
+                message += f"  kl {val_kl:.6f}"
+            if val_latent is not None:
+                message += (
+                    f"  mu {val_latent['mu_mean']:+.3f} ± {val_latent['mu_std']:.3f}"
+                    f"  sigma {val_latent['sigma_mean']:.3f}"
+                    f"  spread {val_latent['spread']:.3f}"
+                )
             print(message, flush=True)
             if live is not None:
                 live.status(message)
@@ -994,14 +978,14 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
         def checkpoint():
             nonlocal saved_at
-            schedule_state = None if plateau is None else plateau.state_dict(cfg.lr)
+            schedule_state = None if run.plateau is None else run.plateau.state_dict(cfg.lr)
             saved_at = save_run(
-                out_dir, model, architecture_dict(cfg), step, optimizer,
+                run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
                 cfg.loss_recipe(), objective.state_dict(),
-                discriminator, disc_optimizer, schedule_state,
+                run.discriminator, run.disc_optimizer, schedule_state,
             )
 
-        step = start_step
+        step = run.start_step
         steps_done = 0
 
         def updates_done():
@@ -1015,26 +999,22 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
 
         def validate():
             """Validation loss, images, and a checkpoint at the current step."""
-            loss, pixel, vgg, gan_value, d_value, neighbor_image = evaluate(
-                model, films, val_specs, radius, cfg.batch, device,
-                cfg, objective, discriminator,
-                image_dir=out_dir / "val", step=step,
-            )
-            old = None if plateau is None else plateau.lr
-            decision = None if plateau is None else plateau.observe(loss)
+            result = evaluate_split(objective, val_specs, run.out_dir / "val", step)
+            old = None if run.plateau is None else run.plateau.lr
+            decision = None if run.plateau is None else run.plateau.observe(result.loss)
             if decision == "drop":
-                apply_rate(step)
+                run.apply_rate(step)
             checkpoint()
-            return loss, logged_parts(pixel, vgg, gan_value, d_value), neighbor_image, decision, old
+            return result, decision, old
 
         def note_plateau(decision, old):
             if decision == "drop":
-                print(f"step {step:06d}  lr {old:.4g} -> {plateau.lr:.4g}", flush=True)
+                print(f"step {step:06d}  lr {old:.4g} -> {run.plateau.lr:.4g}", flush=True)
                 return False
             if decision == "stop":
                 print(
-                    f"step {step:06d}  stop  validation stood still at lr {plateau.lr:.4g}"
-                    f"  min_lr {cfg.schedule.min_lr:.4g}  best val {plateau.best:.6f}",
+                    f"step {step:06d}  stop  validation stood still at lr {run.plateau.lr:.4g}"
+                    f"  min_lr {cfg.schedule.min_lr:.4g}  best val {run.plateau.best:.6f}",
                     flush=True,
                 )
                 return True
@@ -1044,79 +1024,73 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             # A new run validates before any update. A fine-tune's step 0 is
             # the generator that was loaded.
             stopped = False
-            if train_state is None:
-                val_loss, val_parts, neighbor_image, decision, old_lr = validate()
+            if run.train_state is None:
+                result, decision, old_lr = validate()
                 log(
-                    step, None, val_loss, None, val_parts, None, neighbor_image,
-                    learning_rate(cfg, step, plateau),
+                    step, None, result.loss, None, result.parts, None, result.neighbor,
+                    learning_rate(cfg, step, run.plateau), None, result.kl, None, result.latent,
                 )
                 stopped = note_plateau(decision, old_lr)
             while not stopped and not updates_done():
                 step += 1
                 steps_done += 1
-                lr = apply_rate(step)
+                lr = run.apply_rate(step)
                 started = time.perf_counter()
-                prepared = loader.get()
-                low = prepared.low.to(device)
-                high = prepared.high.to(device)
-                pred = model(low)
-                box = prepared.box
-                d_value = None
-                if gan is not None:
-                    d_loss = 0.5 * (
-                        gan_bce(discriminator(take(high, box)), True)
-                        + gan_bce(discriminator(take(pred.detach(), box)), False)
-                    )
-                    disc_optimizer.zero_grad(set_to_none=True)
-                    d_loss.backward()
-                    disc_optimizer.step()
-                    d_value = d_loss.item()
-                    for parameter in discriminator.parameters():
-                        parameter.requires_grad_(False)
-                raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
-                loss, weighted = objective.combine(raw)
-                align_loss = getattr(model, "align_loss", None)
+                work = one_step(loader, objective, live is not None)
+                train_kl = _scalar(getattr(run.model, "kl", None))
+                train_latent = batch_latent()
+                loss, weighted = objective.combine(work.raw)
+                align_loss = getattr(run.model, "align_loss", None)
                 if align_loss is not None:
                     loss = loss + align_loss
-                optimizer.zero_grad(set_to_none=True)
+                kl_loss = getattr(run.model, "kl_loss", None)
+                if kl_loss is not None:
+                    loss = loss + kl_loss
+                run.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                usage = model.neighbor_usage() if hasattr(model, "neighbor_usage") else None
-                optimizer.step()
-                if discriminator is not None:
-                    for parameter in discriminator.parameters():
+                usage = run.model.neighbor_usage() if hasattr(run.model, "neighbor_usage") else None
+                run.optimizer.step()
+                if run.discriminator is not None:
+                    for parameter in run.discriminator.parameters():
                         parameter.requires_grad_(True)
-                objective.observe(layer_raw, {name: value.detach() for name, value in raw.items()})
-                batch_parts = logged_parts(
-                    weighted["pixel"].item() if has_pixel else None,
-                    weighted["vgg"].item() if has_vgg else None,
-                    weighted["gan"].item() if gan is not None else None,
-                    d_value,
+                objective.observe(
+                    work.layer_raw, {name: value.detach() for name, value in work.raw.items()},
                 )
+                batch_parts = logged_parts(weighted, work.d_value)
                 line = (
                     f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
                     f"lr {lr:.4g}  loss {loss.item():.6f}  {part_text(*batch_parts)}  "
-                    f"{prepared.width}x{prepared.height}"
+                    f"{work.width}x{work.height}"
                 )
+                if train_kl is not None:
+                    line += f"  kl {train_kl:.6f}"
                 print(line, flush=True)
 
                 if live is not None:
-                    center = radius * 3
                     live.status(line)
-                    live.show({
-                        "low": rgb_image(low[0, center:center + 3]),
-                        "upscale": rgb_image(pred[0]),
-                        "master": rgb_image(high[0]),
-                    })
+                    if work.images is not None:
+                        live.show({
+                            name: rgb_image(tensor) for name, tensor in work.images.items()
+                        })
 
                 finished = updates_done()
-                val_loss = None
-                val_parts = None
-                neighbor_image = None
+                result = None
                 decision = None
                 old_lr = None
                 if step % cfg.val_every == 0 or finished:
-                    val_loss, val_parts, neighbor_image, decision, old_lr = validate()
-                log(step, loss.item(), val_loss, batch_parts, val_parts, usage, neighbor_image, lr)
+                    result, decision, old_lr = validate()
+                log(
+                    step, loss.item(),
+                    None if result is None else result.loss,
+                    batch_parts,
+                    None if result is None else result.parts,
+                    usage,
+                    None if result is None else result.neighbor,
+                    lr, train_kl,
+                    None if result is None else result.kl,
+                    train_latent,
+                    None if result is None else result.latent,
+                )
                 if note_plateau(decision, old_lr):
                     break
         except KeyboardInterrupt:
@@ -1130,8 +1104,166 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             loader.close()
         if live is not None:
             live.close()
-    shown = saved_at / "model.pt" if saved_at is not None else out_dir / "model.pt"
+    shown = saved_at / "model.pt" if saved_at is not None else run.out_dir / "model.pt"
     print(f"done  {shown}", flush=True)
+
+
+def sr_hooks(run):
+    """Paired low and master batches, and the discriminator step."""
+    cfg = run.cfg
+    films = run.films
+    rng = run.rng
+    radius = cfg.in_frames // 2
+    gan = run.gan
+
+    def make_val_specs():
+        specs = []
+        while len(specs) < cfg.val_count:
+            need = min(cfg.batch, cfg.val_count - len(specs))
+            specs.extend(make_batch_specs(rng, films, "val", need))
+        return specs
+
+    def make_loader():
+        def produce():
+            specs = make_batch_specs(rng, films, "train", cfg.batch)
+            film_index, variant_index, _index = specs[0]
+            variant = films[film_index].variants[variant_index]
+            low, high = batch_from_specs(films, specs, radius)
+            box = None
+            if gan is not None:
+                box = sample_box(high, gan.crop, rng)
+            return PreparedBatch(low, high, variant.low.width, variant.low.height, box)
+
+        return BatchLoader(produce)
+
+    def measure(objective, specs):
+        return measure_raw_means(
+            run.model, films, specs, radius, cfg.batch, run.device, cfg, objective,
+            run.discriminator,
+        )
+
+    def one_step(loader, objective, show):
+        prepared = loader.get()
+        low = prepared.low.to(run.device)
+        high = prepared.high.to(run.device)
+        pred = run.model(low)
+        box = prepared.box
+        d_value = None
+        if gan is not None:
+            d_loss = 0.5 * (
+                gan_bce(run.discriminator(take(high, box)), True)
+                + gan_bce(run.discriminator(take(pred.detach(), box)), False)
+            )
+            run.disc_optimizer.zero_grad(set_to_none=True)
+            d_loss.backward()
+            run.disc_optimizer.step()
+            d_value = d_loss.item()
+            for parameter in run.discriminator.parameters():
+                parameter.requires_grad_(False)
+        raw, layer_raw = raw_terms(objective, cfg, pred, high, run.discriminator, box)
+        images = None
+        if show:
+            center = radius * 3
+            images = {
+                "low": low[0, center:center + 3],
+                "upscale": pred[0],
+                "master": high[0],
+            }
+        return StepOut(raw, layer_raw, d_value, images, prepared.width, prepared.height)
+
+    def evaluate_split(objective, specs, image_dir, step):
+        loss, pixel, vgg, gan_value, d_value, neighbor = evaluate(
+            run.model, films, specs, radius, cfg.batch, run.device, cfg, objective,
+            run.discriminator, image_dir=image_dir, step=step,
+        )
+        return EvalResult(loss, (pixel, vgg, gan_value, d_value), neighbor, None)
+
+    return make_val_specs, make_loader, measure, one_step, evaluate_split
+
+
+def vae_hooks(run):
+    """Master frames in, the same frames as the target."""
+    cfg = run.cfg
+    films = run.films
+    rng = run.rng
+
+    def make_val_specs():
+        specs = []
+        while len(specs) < cfg.val_count:
+            need = min(cfg.batch, cfg.val_count - len(specs))
+            specs.extend(make_vae_specs(rng, films, "val", need, cfg.crop))
+        return specs
+
+    def make_loader():
+        def produce():
+            specs = make_vae_specs(rng, films, "train", cfg.batch, cfg.crop)
+            return vae_batch(films, specs, cfg.crop, rng)
+
+        return BatchLoader(produce)
+
+    def measure(objective, specs):
+        return measure_vae(
+            run.model, films, specs, cfg.crop, cfg.batch, run.device, cfg, objective,
+        )
+
+    def one_step(loader, objective, show):
+        prepared = loader.get()
+        image = prepared.image.to(run.device)
+        pred = run.model(image)
+        raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None)
+        images = None
+        if show:
+            images = {
+                "sample": prior_image(run.model, image),
+                "recon": pred[0],
+                "master": image[0],
+            }
+        return StepOut(raw, layer_raw, None, images, prepared.width, prepared.height)
+
+    def evaluate_split(objective, specs, image_dir, step):
+        return evaluate_vae(
+            run.model, films, specs, cfg.crop, cfg.batch, run.device, cfg, objective,
+            image_dir=image_dir, step=step,
+        )
+
+    return make_val_specs, make_loader, measure, one_step, evaluate_split
+
+
+def load_sr(cfg):
+    root = data_root()
+    found = load_films(root, cfg.holdout, cfg.variants)
+    for problem in found.problems:
+        print(problem, flush=True)
+    require_films(found, root, cfg.variants)
+    print(f"pairs {found.kept} of {found.total}", flush=True)
+    return found.films
+
+
+def load_vae(cfg):
+    root = data_root()
+    found = load_masters(root, cfg.holdout, cfg.crop)
+    for problem in found.problems:
+        print(problem, flush=True)
+    require_masters(found, root)
+    print(f"masters {found.kept} of {found.total}", flush=True)
+    return found.films
+
+
+def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
+    if cfg.arch == "vae":
+        def load():
+            return load_vae(cfg)
+
+        hooks = vae_hooks
+    else:
+        def load():
+            return load_sr(cfg)
+
+        hooks = sr_hooks
+    run = open_run(cfg, resume, finetune, load)
+    if run is None:
+        return
+    drive(run, preview, live_bind, *hooks(run))
 
 
 def main():

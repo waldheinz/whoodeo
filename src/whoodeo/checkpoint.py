@@ -35,7 +35,7 @@ from whoodeo.models import build_model
 _ARCH_KEYS = (
     "arch", "blocks", "channels", "in_frames",
     "radius", "stem", "sharpness", "reject", "levels", "bilinear", "codes", "patch",
-    "res_scale", "vote",
+    "res_scale", "vote", "latent", "factor", "beta",
 )
 
 
@@ -181,12 +181,13 @@ def build_generator(spec, device):
     """The saved generator, eval mode, on `device`."""
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale, vote,
+        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
     ) = parse_model(spec.architecture, f"{spec.path}: architecture")
     model, label = build_model(
         arch, blocks, channels, in_frames,
         radius=radius, stem=stem, sharpness=sharpness, reject=reject, levels=levels,
         bilinear=bilinear, codes=codes, patch=patch, res_scale=res_scale, vote=vote,
+        latent=latent, factor=factor, beta=beta,
     )
     model.load_state_dict(spec.state_dict)
     model.eval().to(device)

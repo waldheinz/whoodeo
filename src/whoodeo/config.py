@@ -92,12 +92,17 @@ class TrainConfig:
     patch: int | None = None
     res_scale: float | None = None
     variants: str | None = None
+    latent: int | None = None
+    factor: int | None = None
+    beta: float | None = None
+    crop: int | None = None
 
     def arch_key(self):
         return model_key(
             self.arch, self.blocks, self.channels, self.in_frames,
             self.radius, self.stem, self.sharpness, self.reject, self.levels,
             self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
+            self.latent, self.factor, self.beta,
         )
 
     def loss_recipe(self):
@@ -136,12 +141,18 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"vote {blocks}x{channels} stem {stem} vote {vote} "
             f"res_scale {res_scale:g}"
         )
+    elif arch == "vae":
+        latent, factor, beta = extra
+        text = (
+            f"vae {blocks}x{channels} latent {latent} factor {factor} "
+            f"beta {float(beta):g}"
+        )
     return text
 
 
 def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-    bilinear, codes, patch, res_scale, vote,
+    bilinear, codes, patch, res_scale, vote, latent, factor, beta,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -154,13 +165,15 @@ def model_key(
         return key + (float(res_scale),)
     if arch == "vote":
         return key + (stem, vote, float(res_scale))
+    if arch == "vae":
+        return key + (latent, factor, float(beta))
     return key
 
 
 def architecture_dict(cfg):
     """The model mapping stored next to the generator weights."""
     item = {"arch": cfg.arch}
-    if cfg.arch != "vote":
+    if cfg.arch not in ("vote", "vae"):
         item["in_frames"] = cfg.in_frames
     if cfg.blocks is not None:
         item["blocks"] = cfg.blocks
@@ -185,6 +198,10 @@ def architecture_dict(cfg):
         item["stem"] = cfg.stem
         item["vote"] = cfg.vote
         item["res_scale"] = cfg.res_scale
+    elif cfg.arch == "vae":
+        item["latent"] = cfg.latent
+        item["factor"] = cfg.factor
+        item["beta"] = cfg.beta
     return item
 
 
@@ -214,7 +231,7 @@ def load_config(path, architecture=None, architecture_from=None):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale, vote = _take_model(
+    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale, vote, latent, factor, beta = _take_model(
         data, where, architecture, architecture_from,
     )
     batch = _take_int(data, "batch", where, positive=True)
@@ -228,7 +245,17 @@ def load_config(path, architecture=None, architecture_from=None):
     steps = _take_int(data, "steps", where, positive=True, default=None)
     out = _take_path(data, "out", where)
     variants = _take_variants(data, where)
+    crop = _take_crop(data, where)
     balance, terms = _take_loss(data, where)
+    if arch == "vae":
+        if variants is not None:
+            raise SystemExit(f"{where}: vae does not take variants")
+        if any(term.name == "gan" for term in terms):
+            raise SystemExit(f"{where}: vae does not take a gan term")
+        if crop is not None and crop % factor != 0:
+            raise SystemExit(f"{where}: crop must be a multiple of factor {factor}")
+    elif crop is not None:
+        raise SystemExit(f"{where}: only vae uses crop")
     schedule, schedule_steps = _take_schedule(data, where, lr)
     if schedule_steps is not None and steps is not None:
         raise SystemExit(f"{where}: steps is set twice, at the top and under schedule")
@@ -264,6 +291,10 @@ def load_config(path, architecture=None, architecture_from=None):
         res_scale=res_scale,
         vote=vote,
         variants=variants,
+        latent=latent,
+        factor=factor,
+        beta=beta,
+        crop=crop,
         schedule=schedule,
     )
 
@@ -304,6 +335,12 @@ def parse_model(model, where):
                 "and does not take in_frames"
             )
         in_frames = 3
+    elif arch == "vae":
+        if "in_frames" in model:
+            raise SystemExit(
+                f"{where}: vae reads one master frame and does not take in_frames"
+            )
+        in_frames = 1
     elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
         in_frames = 1
     else:
@@ -321,6 +358,7 @@ def parse_model(model, where):
     if arch == "pyramid":
         levels, stem, radius = _take_pyramid(model, where)
     bilinear, codes, patch = _take_vq(model, arch, where)
+    latent, factor, beta = _take_vae(model, arch, where)
     vote = None
     if arch == "vote":
         stem = _take_int(model, "stem", where)
@@ -340,7 +378,7 @@ def parse_model(model, where):
         raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale, vote,
+        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
     )
 
 
@@ -370,6 +408,31 @@ def _take_vq(data, arch, where):
     if patch > 16:
         raise SystemExit(f"{where}: patch must be from 1 to 16")
     return bilinear, codes, patch
+
+
+def _take_vae(data, arch, where):
+    if arch != "vae":
+        foreign = [name for name in ("latent", "factor", "beta") if name in data]
+        if foreign:
+            names = ", ".join(foreign)
+            raise SystemExit(f"{where}: only vae uses {names}")
+        return None, None, None
+    latent = _take_int(data, "latent", where, positive=True)
+    factor = _take_int(data, "factor", where, positive=True)
+    if factor < 2 or factor > 16 or factor & (factor - 1):
+        raise SystemExit(f"{where}: factor must be a power of two from 2 to 16")
+    beta = _take_float(data, "beta", where, positive=True)
+    return latent, factor, beta
+
+
+def _take_crop(data, where):
+    """A fixed window for a vae. Missing means the whole frame. Empty is an error."""
+    if "crop" not in data:
+        return None
+    value = data.pop("crop")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SystemExit(f"{where}: crop must be a positive integer")
+    return value
 
 
 def _take_shift(data, arch, where):

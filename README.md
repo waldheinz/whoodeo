@@ -93,3 +93,13 @@ The trunk is a stack of residual Swin Transformer blocks. Attention looks at an 
 `swinir_real` keeps the classical trunk and enlarges with a nearest-neighbor step followed by convolutions.
 
 The last convolution keeps PyTorch's ordinary initialization. Before the trunk runs, the DIV2K mean is subtracted, and that mean is added back onto the picture the network predicts.
+
+# The vae model
+
+`arch: vae` reconstructs a master frame. It does not read a low variant. The encoder is a stack of residual blocks and stride-2 convolutions. The last convolution yields the mean and the log variance of a diagonal Gaussian. `latent` is how many channels that Gaussian has. `factor` is the spatial shrink, a power of two from 2 to 16, so factor 8 turns a 256×256 window into a 32×32 latent. The decoder starts from that latent alone. There is no skip from the encoder.
+
+`beta` multiplies the mean KL divergence. The mean runs over the batch, the latent grid, and the channels, so a beta near 1 is a real weight. The step loss adds that term to the pixel and VGG objective. The validation loss the plateau reads is the objective. TensorBoard records the unweighted KL as `train/kl` and `val/kl`. `latent/mu_mean`, `latent/mu_std`, `latent/sigma_mean` and `latent/spread` describe the code, with the same four under `val/latent/` for the held-out frames and a per-channel pair under `latent/channel/<i>`. `spread` is the square root of var(μ) + mean(σ²) and sits near 1 when the code matches the unit Gaussian. The validation histogram is `latent/mu`.
+
+A side that `factor` does not divide is padded on the bottom and the right, and the reconstruction is cut back to the original size. Training draws a latent sample. Evaluation uses the mean, so a validation image stays put between two passes.
+
+`crop` is optional. Left out, each sample is the whole master frame, the batch stays inside one master size, and `configs/vae.yaml` asks for batch 1. Set to a positive multiple of `factor`, every sample is that window. A training window is placed at random. A validation window is the center, and it stays there, so `recon-<step>.png` can be compared across steps. `master.png` is written once. The live page shows a draw from the unit Gaussian (`sample`), the reconstruction (`recon`), and the master.

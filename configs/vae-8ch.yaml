@@ -1,0 +1,32 @@
+# Reconstruct master frames. No low variant is read.
+# Add crop: 256 to train on a fixed window instead of the whole frame.
+
+model:
+  arch: vae
+  blocks: 4
+  channels: 128
+  latent: 8
+  factor: 8
+  beta: 0.02
+
+batch: 2
+lr: 1.0e-4
+schedule:
+  kind: plateau
+  patience: 4        # validations, 4 x 250 = 1000 steps
+  factor: 0.5
+  min_delta: 0.01    # relative improvement over best that counts
+  min_lr: 1.0e-6
+holdout: 0.1
+val_every: 250
+val_count: 32
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 0.7
+      kind: l1
+    - name: vgg
+      weight: 0.3
+      layers: [relu2_2, relu3_4]
