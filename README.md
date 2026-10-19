@@ -103,3 +103,19 @@ The last convolution keeps PyTorch's ordinary initialization. Before the trunk r
 A side that `factor` does not divide is padded on the bottom and the right, and the reconstruction is cut back to the original size. Training draws a latent sample. Evaluation uses the mean, so a validation image stays put between two passes.
 
 `crop` is optional. Left out, each sample is the whole master frame, the batch stays inside one master size, and `configs/vae.yaml` asks for batch 1. Set to a positive multiple of `factor`, every sample is that window. A training window is placed at random. A validation window is the center, and it stays there, so `recon-<step>.png` can be compared across steps. `master.png` is written once. The live page shows a draw from the unit Gaussian (`sample`), the reconstruction (`recon`), and the master.
+
+# The vae2 model
+
+`arch: vae2` reconstructs a master frame like `vae`, with a network shaped for the Neural Engine. The layers are 3×3 convolutions, SiLU, additions, and nearest-neighbor doubling. There is no normalization and no attention. `channels` is the width at full resolution. The width doubles at half resolution and is four times `channels` from a quarter down, so `configs/vae2.yaml` runs 64, 128, 256, 256 from the frame to the latent. Full resolution has one residual block, each level below it two. `blocks` is the number of residual blocks at the latent, with dilations 1, 2, and 4 in turn. Encoder and decoder mirror each other. The last convolution of every residual branch starts at zero. That config has 22.2M parameters, and the decoder costs about 1.2 TFLOP for a 720p frame, against 3.2 for `vae` 4×128.
+
+`decode(latent, clamp=True)` limits the frame to [0, 1]. Training compares the unclamped output. `beta` 1e-4 keeps the KL near one part in a thousand of the objective. Each validation stores `latent_shift` and `latent_scale` in the model: (μ − shift) × scale has mean 0 and a spread near 1. A model that works on latents should see that scaled code and hand z / scale + shift back to the decoder. TensorBoard has both under `val/latent/`.
+
+The `color` loss term is L1 between 1/8 average-pooled YCbCr frames, Cb and Cr weighted twice. It is for color drift in flat areas, and `vae` takes it too.
+
+A vae2 may add a `gan` term with the U-Net discriminator. Its weight is not a share of the objective. The generator term is the latent diffusion adaptive weight, the gradient norm of the objective over that of the GAN loss at the last decoder convolution, times `weight`. The discriminator trains from the first step. The generator term joins at `start`. The validation objective leaves the GAN out. `freeze_encoder: true` trains the decoder alone. `configs/vae2-gan.yaml` combines the two as a fine-tune of a vae2 run:
+
+```
+uv run whoodeo-train configs/vae2-gan.yaml --model <run>/latest
+```
+
+`whoodeo-coreml` turns a vae2 checkpoint into its decoder: an fp16 latent in, the clamped fp16 frame out. The input takes the latent sizes 60×107, 90×160, and 135×240, which are 480p, 720p, and 1080p at factor 8. `--latent 90x160` gives one fixed size instead. The metadata carries the latent shift and scale.

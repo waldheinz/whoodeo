@@ -28,7 +28,10 @@ VGG_LAYERS = {
     "relu5_4": 35,
 }
 
-TERM_NAMES = ("pixel", "vgg", "gan")
+TERM_NAMES = ("pixel", "vgg", "gan", "color")
+
+# Architectures that reconstruct a master frame through a latent.
+VAE_ARCHS = ("vae", "vae2")
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class Term:
     layers: tuple[str, ...] = ()
     crop: int | None = None
     disc_lr: float | None = None
+    start: int | None = None
 
     def as_dict(self):
         # disc_lr stays off the matched recipe: a resume may change learning rates.
@@ -47,8 +51,10 @@ class Term:
             item["kind"] = self.kind
         elif self.name == "vgg":
             item["layers"] = list(self.layers)
-        else:
+        elif self.name == "gan":
             item["crop"] = self.crop
+            if self.start is not None:
+                item["start"] = self.start
         return item
 
 
@@ -96,6 +102,7 @@ class TrainConfig:
     factor: int | None = None
     beta: float | None = None
     crop: int | None = None
+    freeze_encoder: bool = False
 
     def arch_key(self):
         return model_key(
@@ -113,6 +120,17 @@ class TrainConfig:
             if item.name == name:
                 return item
         return None
+
+    def shared_terms(self):
+        """Terms whose weights are shares of the objective.
+
+        A vae2 gan term stands outside: its weight multiplies the adaptive
+        weight, and the validation objective leaves it out.
+        """
+        return tuple(
+            item for item in self.terms
+            if not (self.arch == "vae2" and item.name == "gan")
+        )
 
 
 def shape_text(arch, blocks, channels, in_frames, *extra):
@@ -141,10 +159,10 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"vote {blocks}x{channels} stem {stem} vote {vote} "
             f"res_scale {res_scale:g}"
         )
-    elif arch == "vae":
+    elif arch in VAE_ARCHS:
         latent, factor, beta = extra
         text = (
-            f"vae {blocks}x{channels} latent {latent} factor {factor} "
+            f"{arch} {blocks}x{channels} latent {latent} factor {factor} "
             f"beta {float(beta):g}"
         )
     return text
@@ -165,7 +183,7 @@ def model_key(
         return key + (float(res_scale),)
     if arch == "vote":
         return key + (stem, vote, float(res_scale))
-    if arch == "vae":
+    if arch in VAE_ARCHS:
         return key + (latent, factor, float(beta))
     return key
 
@@ -173,7 +191,7 @@ def model_key(
 def architecture_dict(cfg):
     """The model mapping stored next to the generator weights."""
     item = {"arch": cfg.arch}
-    if cfg.arch not in ("vote", "vae"):
+    if cfg.arch not in ("vote", *VAE_ARCHS):
         item["in_frames"] = cfg.in_frames
     if cfg.blocks is not None:
         item["blocks"] = cfg.blocks
@@ -198,7 +216,7 @@ def architecture_dict(cfg):
         item["stem"] = cfg.stem
         item["vote"] = cfg.vote
         item["res_scale"] = cfg.res_scale
-    elif cfg.arch == "vae":
+    elif cfg.arch in VAE_ARCHS:
         item["latent"] = cfg.latent
         item["factor"] = cfg.factor
         item["beta"] = cfg.beta
@@ -246,16 +264,23 @@ def load_config(path, architecture=None, architecture_from=None):
     out = _take_path(data, "out", where)
     variants = _take_variants(data, where)
     crop = _take_crop(data, where)
-    balance, terms = _take_loss(data, where)
-    if arch == "vae":
+    freeze_encoder = _take_flag(data, "freeze_encoder", where)
+    balance, terms = _take_loss(data, where, arch)
+    if arch in VAE_ARCHS:
         if variants is not None:
-            raise SystemExit(f"{where}: vae does not take variants")
-        if any(term.name == "gan" for term in terms):
+            raise SystemExit(f"{where}: {arch} does not take variants")
+        if arch == "vae" and any(term.name == "gan" for term in terms):
             raise SystemExit(f"{where}: vae does not take a gan term")
         if crop is not None and crop % factor != 0:
             raise SystemExit(f"{where}: crop must be a multiple of factor {factor}")
     elif crop is not None:
-        raise SystemExit(f"{where}: only vae uses crop")
+        raise SystemExit(f"{where}: only vae and vae2 use crop")
+    if arch not in VAE_ARCHS and any(term.name == "color" for term in terms):
+        raise SystemExit(f"{where}: only vae and vae2 use a color term")
+    if arch != "vae2" and any(term.start is not None for term in terms):
+        raise SystemExit(f"{where}: only a vae2 gan term takes start")
+    if freeze_encoder and arch != "vae2":
+        raise SystemExit(f"{where}: only vae2 takes freeze_encoder")
     schedule, schedule_steps = _take_schedule(data, where, lr)
     if schedule_steps is not None and steps is not None:
         raise SystemExit(f"{where}: steps is set twice, at the top and under schedule")
@@ -295,6 +320,7 @@ def load_config(path, architecture=None, architecture_from=None):
         factor=factor,
         beta=beta,
         crop=crop,
+        freeze_encoder=freeze_encoder,
         schedule=schedule,
     )
 
@@ -335,10 +361,10 @@ def parse_model(model, where):
                 "and does not take in_frames"
             )
         in_frames = 3
-    elif arch == "vae":
+    elif arch in VAE_ARCHS:
         if "in_frames" in model:
             raise SystemExit(
-                f"{where}: vae reads one master frame and does not take in_frames"
+                f"{where}: {arch} reads one master frame and does not take in_frames"
             )
         in_frames = 1
     elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
@@ -411,11 +437,11 @@ def _take_vq(data, arch, where):
 
 
 def _take_vae(data, arch, where):
-    if arch != "vae":
+    if arch not in VAE_ARCHS:
         foreign = [name for name in ("latent", "factor", "beta") if name in data]
         if foreign:
             names = ", ".join(foreign)
-            raise SystemExit(f"{where}: only vae uses {names}")
+            raise SystemExit(f"{where}: only vae and vae2 use {names}")
         return None, None, None
     latent = _take_int(data, "latent", where, positive=True)
     factor = _take_int(data, "factor", where, positive=True)
@@ -423,6 +449,13 @@ def _take_vae(data, arch, where):
         raise SystemExit(f"{where}: factor must be a power of two from 2 to 16")
     beta = _take_float(data, "beta", where, positive=True)
     return latent, factor, beta
+
+
+def _take_flag(data, key, where):
+    """An optional true or false. Missing means false."""
+    if key not in data:
+        return False
+    return _take_bool(data, key, where)
 
 
 def _take_crop(data, where):
@@ -605,7 +638,12 @@ def _take_schedule(data, where, lr):
     return Schedule(kind, patience, factor, min_delta, min_lr), steps
 
 
-def _take_loss(data, where):
+def _take_loss(data, where, arch=None):
+    """Loss terms. Their weights sum to 1, except a vae2 gan term, which stands apart.
+
+    color is L1 on 1/8 average-pooled YCbCr, for vae and vae2. A vae2 gan
+    term may name `start`, the first step whose generator loss includes it.
+    """
     if "loss" not in data:
         raise SystemExit(f"{where}: missing loss")
     loss = data.pop("loss")
@@ -637,14 +675,24 @@ def _take_loss(data, where):
         elif name == "vgg":
             layers = _take_layers(raw, label)
             terms.append(Term(name=name, weight=weight, layers=tuple(layers)))
+        elif name == "color":
+            terms.append(Term(name=name, weight=weight))
         else:
             crop = _take_int(raw, "crop", label, positive=True)
             if crop % 8 != 0:
                 raise SystemExit(f"{label}: crop must be a multiple of 8")
             disc_lr = _take_float(raw, "disc_lr", label, positive=True)
-            terms.append(Term(name=name, weight=weight, crop=crop, disc_lr=disc_lr))
+            start = _take_int(raw, "start", label, default=None)
+            if start is not None and start < 0:
+                raise SystemExit(f"{label}: start must be zero or positive")
+            terms.append(Term(
+                name=name, weight=weight, crop=crop, disc_lr=disc_lr, start=start,
+            ))
         _reject_unknown(raw, label)
-    total = sum(term.weight for term in terms)
+    shared = [term for term in terms if not (arch == "vae2" and term.name == "gan")]
+    if not shared:
+        raise SystemExit(f"{where}: vae2 needs a term beside gan")
+    total = sum(term.weight for term in shared)
     if abs(total - 1.0) > 1e-6:
         raise SystemExit(f"{where}: loss weights sum to {total:.6g}, expected 1")
     return balance, terms

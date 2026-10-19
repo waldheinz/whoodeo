@@ -15,6 +15,15 @@ are held out for validation.
 `arch: vae` reconstructs master frames and does not read a low variant.
 Without crop each sample is the whole frame, and a batch stays inside one
 master size. With crop every sample is that window, so sizes can share a batch.
+`arch: vae2` reads the same batches.
+
+A vae2 may add a gan term. Its discriminator trains from the first step. Its
+generator term joins at `start` with the adaptive weight of latent diffusion:
+the gradient norm of the objective over that of the gan loss, both at the last
+decoder convolution, times the term's weight. That term stays out of the
+validation objective. freeze_encoder: true trains the decoder alone, for a
+fine-tune from a vae2 checkpoint. A vae2 validation also stores the latent
+shift and scale in the model and logs val/latent/scale.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. A frame read opens the video and closes it before the next read.
@@ -93,8 +102,8 @@ from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
 from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
 from whoodeo.config import (
-    architecture_dict, assert_resume_matches, cosine_learning_rate, load_config,
-    restore_plateau, shape_text,
+    VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
+    load_config, restore_plateau, shape_text,
 )
 from whoodeo.films import (
     UnreadableSample, draw_indexes, load_films, load_masters, require_films,
@@ -105,7 +114,7 @@ from whoodeo.models import build_model
 from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.models.vae import LatentTally, latent_scalars
-from whoodeo.objective import Objective, pixel_loss
+from whoodeo.objective import Objective, color_loss, pixel_loss
 from whoodeo.video import png_bytes, rgb_image
 
 
@@ -356,6 +365,14 @@ def part_text(pixel, vgg, gan, d_loss):
 def describe_loss(cfg, objective):
     print(f"loss balance {cfg.balance}  anchor {cfg.terms[0].name}", flush=True)
     for term in cfg.terms:
+        if term.name not in objective.names:
+            start = 0 if term.start is None else term.start
+            print(
+                f"  {term.name} crop {term.crop}  weight {term.weight:.2f}  "
+                f"adaptive  from step {start}",
+                flush=True,
+            )
+            continue
         raw = objective.term_ref[term.name]
         scale = objective.scale[term.name]
         weighted = scale * raw
@@ -363,6 +380,8 @@ def describe_loss(cfg, objective):
             detail = term.kind
         elif term.name == "vgg":
             detail = "+".join(term.layers)
+        elif term.name == "color":
+            detail = "ycbcr/8"
         else:
             detail = f"crop {term.crop}"
         print(
@@ -380,7 +399,9 @@ def raw_terms(objective, cfg, pred, high, discriminator, box):
         raw["pixel"] = pixel_loss(pred, high, pixel.kind)
     if cfg.term("vgg") is not None:
         raw["vgg"], layer_raw = objective.vgg_raw(pred, high)
-    if cfg.term("gan") is not None:
+    if cfg.term("color") is not None:
+        raw["color"] = color_loss(pred, high)
+    if "gan" in objective.names:
         raw["gan"] = gan_bce(discriminator(take(pred, box)), True)
     return raw, layer_raw
 
@@ -637,8 +658,10 @@ def measure_vae(model, films, specs, crop, batch_size, device, cfg, objective):
     model.eval()
     count = 0
     pixel_acc = 0.0
+    color_acc = 0.0
     layer_acc = {name: 0.0 for name in objective.vgg_layers}
     pixel = cfg.term("pixel")
+    color = cfg.term("color")
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
@@ -647,6 +670,8 @@ def measure_vae(model, films, specs, crop, batch_size, device, cfg, objective):
             frames = len(chunk)
             if pixel is not None:
                 pixel_acc += pixel_loss(pred, image, pixel.kind).item() * frames
+            if color is not None:
+                color_acc += color_loss(pred, image).item() * frames
             if objective.vgg is not None:
                 for name, loss in objective.vgg.layer_losses(pred, image).items():
                     layer_acc[name] += loss.item() * frames
@@ -655,6 +680,8 @@ def measure_vae(model, films, specs, crop, batch_size, device, cfg, objective):
     term_means = {}
     if pixel is not None:
         term_means["pixel"] = pixel_acc / count
+    if color is not None:
+        term_means["color"] = color_acc / count
     layer_means = {name: value / count for name, value in layer_acc.items()}
     return layer_means, term_means
 
@@ -668,6 +695,7 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
     loss_acc = 0.0
     pixel_acc = 0.0
     vgg_acc = 0.0
+    color_acc = 0.0
     kl_acc = 0.0
     count = 0
     saved = 0
@@ -694,17 +722,23 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
                 pixel_acc += weighted["pixel"].item() * frames
             if "vgg" in weighted:
                 vgg_acc += weighted["vgg"].item() * frames
+            if "color" in weighted:
+                color_acc += weighted["color"].item() * frames
             kl_acc += float(model.kl) * frames
             count += frames
     model.train()
     pixel_mean = pixel_acc / count if cfg.term("pixel") is not None else None
     vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
+    extras = None
+    if cfg.term("color") is not None:
+        extras = {"val/color": color_acc / count}
     return EvalResult(
         loss_acc / count,
         (pixel_mean, vgg_mean, None, None),
         None,
         kl_acc / count,
         tally.report(),
+        extras,
     )
 
 
@@ -717,12 +751,17 @@ class FrameBatch:
 
 @dataclass
 class StepOut:
+    """One forward pass. `loss` is added to the objective, `gan` is its logged value."""
+
     raw: dict
     layer_raw: dict
     d_value: float | None
     images: dict | None
     width: int
     height: int
+    loss: torch.Tensor | None = None
+    gan: float | None = None
+    extras: dict | None = None
 
 
 @dataclass
@@ -732,6 +771,7 @@ class EvalResult:
     neighbor: float | None
     kl: float | None
     latent: dict | None = None
+    extras: dict | None = None
 
 
 def _scalar(value):
@@ -843,8 +883,15 @@ def open_run(cfg, resume, finetune, load):
         latent=cfg.latent, factor=cfg.factor, beta=cfg.beta,
     )
     model = model.train().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    trainable = model.parameters()
+    if cfg.freeze_encoder:
+        for parameter in model.encoder.parameters():
+            parameter.requires_grad_(False)
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.Adam(trainable, lr=cfg.lr)
     print(label, flush=True)
+    if cfg.freeze_encoder:
+        print("encoder frozen", flush=True)
     if generator is not None:
         model.load_state_dict(generator.state_dict)
     if train_state is not None:
@@ -917,13 +964,27 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
         live = open_live(live_bind, preview)
         writer = SummaryWriter(log_dir=run.out_dir)
 
-        def logged_parts(weighted, d_value):
+        def logged_parts(weighted, work):
+            gan_value = work.gan
+            if "gan" in weighted:
+                gan_value = weighted["gan"].item()
             return (
                 weighted["pixel"].item() if cfg.term("pixel") is not None else None,
                 weighted["vgg"].item() if cfg.term("vgg") is not None else None,
-                weighted["gan"].item() if run.gan is not None else None,
-                d_value if run.gan is not None else None,
+                gan_value if run.gan is not None else None,
+                work.d_value if run.gan is not None else None,
             )
+
+        def step_extras(weighted, work):
+            """Weighted terms beyond pixel, vgg, and gan, and what the step reports."""
+            extras = {
+                f"train/{name}": value.item()
+                for name, value in weighted.items()
+                if name not in ("pixel", "vgg", "gan")
+            }
+            if work.extras:
+                extras.update(work.extras)
+            return extras
 
         def batch_latent():
             mu = getattr(run.model, "mu", None)
@@ -933,8 +994,12 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
             tally.add(mu, run.model.logvar)
             return tally.report()
 
-        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, train_kl, val_kl, train_latent, val_latent):
+        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, train_kl, val_kl, train_latent, val_latent, train_extras=None, val_extras=None):
             extras = {}
+            if train_extras:
+                extras.update(train_extras)
+            if val_extras:
+                extras.update(val_extras)
             if train_kl is not None:
                 extras["train/kl"] = train_kl
             if val_kl is not None:
@@ -962,6 +1027,8 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
                 message += f"  weight {usage['weight']:.5f}"
                 if usage.get("grad") is not None:
                     message += f"  grad {usage['grad']:.4f}"
+            if val_extras and "val/color" in val_extras:
+                message += f"  color {val_extras['val/color']:.6f}"
             if val_kl is not None:
                 message += f"  kl {val_kl:.6f}"
             if val_latent is not None:
@@ -1029,6 +1096,7 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
                 log(
                     step, None, result.loss, None, result.parts, None, result.neighbor,
                     learning_rate(cfg, step, run.plateau), None, result.kl, None, result.latent,
+                    None, result.extras,
                 )
                 stopped = note_plateau(decision, old_lr)
             while not stopped and not updates_done():
@@ -1046,6 +1114,8 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
                 kl_loss = getattr(run.model, "kl_loss", None)
                 if kl_loss is not None:
                     loss = loss + kl_loss
+                if work.loss is not None:
+                    loss = loss + work.loss
                 run.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 usage = run.model.neighbor_usage() if hasattr(run.model, "neighbor_usage") else None
@@ -1056,12 +1126,17 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
                 objective.observe(
                     work.layer_raw, {name: value.detach() for name, value in work.raw.items()},
                 )
-                batch_parts = logged_parts(weighted, work.d_value)
+                batch_parts = logged_parts(weighted, work)
+                train_extras = step_extras(weighted, work)
                 line = (
                     f"step {step:06d}  {time.perf_counter() - started:.1f}s  "
                     f"lr {lr:.4g}  loss {loss.item():.6f}  {part_text(*batch_parts)}  "
                     f"{work.width}x{work.height}"
                 )
+                if "train/color" in train_extras:
+                    line += f"  color {train_extras['train/color']:.6f}"
+                if "train/gan_weight" in train_extras:
+                    line += f"  gan_weight {train_extras['train/gan_weight']:.4g}"
                 if train_kl is not None:
                     line += f"  kl {train_kl:.6f}"
                 print(line, flush=True)
@@ -1090,6 +1165,8 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
                     None if result is None else result.kl,
                     train_latent,
                     None if result is None else result.latent,
+                    train_extras,
+                    None if result is None else result.extras,
                 )
                 if note_plateau(decision, old_lr):
                     break
@@ -1181,11 +1258,27 @@ def sr_hooks(run):
     return make_val_specs, make_loader, measure, one_step, evaluate_split
 
 
+def adaptive_gan_weight(objective_loss, gan_loss, layer):
+    """Latent diffusion's ratio of gradient norms at `layer`, kept within 0 and 1e4."""
+    objective_grad = torch.autograd.grad(objective_loss, layer, retain_graph=True)[0]
+    gan_grad = torch.autograd.grad(gan_loss, layer, retain_graph=True)[0]
+    weight = torch.linalg.vector_norm(objective_grad) / (torch.linalg.vector_norm(gan_grad) + 1e-4)
+    return weight.clamp(0.0, 1e4).detach()
+
+
 def vae_hooks(run):
-    """Master frames in, the same frames as the target."""
+    """Master frames in, the same frames as the target.
+
+    A vae2 gan term trains its discriminator on one window per step. The
+    generator term starts at the term's `start` step.
+    """
     cfg = run.cfg
     films = run.films
     rng = run.rng
+    gan = run.gan
+    # Windows for the discriminator come from their own draw, on this thread.
+    gan_rng = random.Random(cfg.seed + 1)
+    counter = {"step": run.start_step}
 
     def make_val_specs():
         specs = []
@@ -1206,11 +1299,45 @@ def vae_hooks(run):
             run.model, films, specs, cfg.crop, cfg.batch, run.device, cfg, objective,
         )
 
+    def adversarial(objective, raw, pred, image):
+        """Discriminator update, then the weighted generator term once it has started."""
+        box = sample_box(image, gan.crop, gan_rng)
+        discriminator = run.discriminator
+        d_loss = 0.5 * (
+            gan_bce(discriminator(take(image, box)), True)
+            + gan_bce(discriminator(take(pred.detach(), box)), False)
+        )
+        run.disc_optimizer.zero_grad(set_to_none=True)
+        d_loss.backward()
+        run.disc_optimizer.step()
+        for parameter in discriminator.parameters():
+            parameter.requires_grad_(False)
+        start = 0 if gan.start is None else gan.start
+        if counter["step"] < start:
+            return d_loss.item(), None, None, None
+        gan_loss = gan_bce(discriminator(take(pred, box)), True)
+        objective_loss, _weighted = objective.combine(raw)
+        weight = gan.weight * adaptive_gan_weight(
+            objective_loss, gan_loss, run.model.last_layer(),
+        )
+        added = weight * gan_loss
+        return d_loss.item(), added, added.item(), {
+            "train/gan_weight": float(weight),
+            "train/gan_raw": gan_loss.item(),
+        }
+
     def one_step(loader, objective, show):
+        counter["step"] += 1
         prepared = loader.get()
         image = prepared.image.to(run.device)
         pred = run.model(image)
         raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None)
+        d_value = None
+        added = None
+        gan_value = None
+        extras = None
+        if gan is not None:
+            d_value, added, gan_value, extras = adversarial(objective, raw, pred, image)
         images = None
         if show:
             images = {
@@ -1218,13 +1345,23 @@ def vae_hooks(run):
                 "recon": pred[0],
                 "master": image[0],
             }
-        return StepOut(raw, layer_raw, None, images, prepared.width, prepared.height)
+        return StepOut(
+            raw, layer_raw, d_value, images, prepared.width, prepared.height,
+            added, gan_value, extras,
+        )
 
     def evaluate_split(objective, specs, image_dir, step):
-        return evaluate_vae(
+        result = evaluate_vae(
             run.model, films, specs, cfg.crop, cfg.batch, run.device, cfg, objective,
             image_dir=image_dir, step=step,
         )
+        if hasattr(run.model, "set_latent_stats") and result.latent is not None:
+            run.model.set_latent_stats(result.latent["mu_mean"], result.latent["spread"])
+            extras = dict(result.extras or {})
+            extras["val/latent/shift"] = float(run.model.latent_shift)
+            extras["val/latent/scale"] = float(run.model.latent_scale)
+            result.extras = extras
+        return result
 
     return make_val_specs, make_loader, measure, one_step, evaluate_split
 
@@ -1250,7 +1387,7 @@ def load_vae(cfg):
 
 
 def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
-    if cfg.arch == "vae":
+    if cfg.arch in VAE_ARCHS:
         def load():
             return load_vae(cfg)
 

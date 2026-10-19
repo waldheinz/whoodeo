@@ -6,7 +6,8 @@ integer search. `pyramid` aligns them with a coarse-to-fine flow. `vq`
 keeps the residual stack, reads one frame, and quantizes the correction.
 `espcn` and `edsr` are the other architectures. `vote` is an EDSR trunk
 that adds a shared vote from the previous and next frame. `vae` reconstructs
-one frame through a spatial Gaussian. `swinir`,
+one frame through a spatial Gaussian. `vae2` does the same with tapered
+widths and no normalization, so its decoder runs on the Neural Engine. `swinir`,
 `swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
 reconstruction heads. The training config sets depth, width, and input frames.
 """
@@ -19,6 +20,7 @@ from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
 from whoodeo.models.swinir import SwinIR
 from whoodeo.models.vae import VAE
+from whoodeo.models.vae2 import VAE2
 from whoodeo.models.vote import VoteEDSR
 from whoodeo.models.vq import CODES, PATCH, VQESPCN
 
@@ -41,6 +43,7 @@ PRESETS = {
     "edsr": {"blocks": 32, "channels": 256, "frames": 1},
     "vote": {"blocks": 14, "channels": 64, "frames": 3},
     "vae": {"blocks": 4, "channels": 64, "frames": 1},
+    "vae2": {"blocks": 6, "channels": 64, "frames": 1},
     "swinir": {"blocks": 6, "channels": 180, "frames": 1},
     "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
     "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
@@ -106,6 +109,9 @@ def build_model(
     elif arch == "vae":
         _check_vae(latent, factor, beta)
         model = VAE(width, depth, latent, factor, beta)
+    elif arch == "vae2":
+        _check_vae(latent, factor, beta)
+        model = VAE2(width, depth, latent, factor, beta)
     else:
         _check_edsr(res_scale)
         model = EDSR(depth, width, float(res_scale))
@@ -137,9 +143,9 @@ def build_model(
             f"vote {depth}x{width} stem {stem} vote {vote} "
             f"res_scale {float(res_scale):g} parameters {count}"
         )
-    elif arch == "vae":
+    elif arch in ("vae", "vae2"):
         label = (
-            f"vae {depth}x{width} latent {latent} factor {factor} "
+            f"{arch} {depth}x{width} latent {latent} factor {factor} "
             f"beta {float(beta):g} parameters {count}"
         )
     else:

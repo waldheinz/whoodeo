@@ -1,8 +1,9 @@
-"""Pixel, VGG, and GAN terms, scaled so their weights are shares of the sum.
+"""Pixel, VGG, color, and GAN terms, scaled so their weights are shares of the sum.
 
 The first term anchors the magnitude: its scale is 1. The other scales are
 chosen so that weight_i * raw_i lines up with that anchor. `start` freezes
 the scales after the validation pass. `running` updates them from an EMA.
+A vae2 gan term is not one of the shares. The training step weighs it.
 """
 
 import torch
@@ -13,12 +14,36 @@ from whoodeo.config import VGG_LAYERS
 
 EMA_DECAY = 0.99
 REF_FLOOR = 1e-8
+# The color term compares 1/COLOR_POOL averages on each side.
+COLOR_POOL = 8
+# BT.709 RGB to Y, Cb, Cr, one row each.
+_YCBCR = (
+    (0.2126, 0.7152, 0.0722),
+    (-0.1146, -0.3854, 0.5),
+    (0.5, -0.4542, -0.0458),
+)
+# Cb and Cr count twice as much as Y: the term is there for color drift.
+_YCBCR_WEIGHT = (1.0, 2.0, 2.0)
 
 
 def pixel_loss(pred, high, kind):
     if kind == "l1":
         return F.l1_loss(pred, high)
     return F.mse_loss(pred, high)
+
+
+def color_loss(pred, high):
+    """L1 on 1/8 average-pooled YCbCr, Cb and Cr weighted twice.
+
+    Pooling first leaves texture to the other terms, so this reads the slow
+    color of flat areas. A remainder below 8 on an edge is left out.
+    """
+    matrix = pred.new_tensor(_YCBCR)
+    weight = pred.new_tensor(_YCBCR_WEIGHT).view(1, 3, 1, 1)
+    pooled_pred = F.avg_pool2d(pred, COLOR_POOL)
+    pooled_high = F.avg_pool2d(high, COLOR_POOL)
+    diff = torch.einsum("ij,bjhw->bihw", matrix, pooled_pred - pooled_high)
+    return (diff.abs() * weight).mean() * 3.0 / float(sum(_YCBCR_WEIGHT))
 
 
 def scales_from_refs(names, weights, term_ref):
@@ -73,8 +98,9 @@ class VGGLoss(nn.Module):
 
 class Objective:
     def __init__(self, cfg, device):
-        self.names = tuple(term.name for term in cfg.terms)
-        self.weights = {term.name: term.weight for term in cfg.terms}
+        shared = cfg.shared_terms()
+        self.names = tuple(term.name for term in shared)
+        self.weights = {term.name: term.weight for term in shared}
         self.balance = cfg.balance
         self.vgg_layers = ()
         self.vgg = None

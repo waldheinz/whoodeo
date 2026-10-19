@@ -1,9 +1,14 @@
-"""Convert a vote or edsr checkpoint into a Core ML program.
+"""Convert a vote or edsr checkpoint into a Core ML program, or a vae2 decoder.
 
 The package is what the macOS app loads. Without -o it goes to
 ~/Library/Application Support/Whoodeo/Models, which is the app's collection.
 Three low frames are stacked on the channel axis, previous then current then
 next, the same order as apply.
+A vae2 checkpoint gives its decoder alone: a latent in, the frame clamped
+to [0, 1] out, both fp16. The input takes the enumerated latent sizes of
+--latent, 60x107, 90x160, and 135x240 by default (480p, 720p, and 1080p at
+factor 8), so the Neural Engine can run it. One size gives a fixed shape.
+The metadata carries the latent shift and scale.
 coremltools stays out of the training dependencies. On the Mac:
 
     uv pip install --python .venv/bin/python 'coremltools==9.1.dev1'
@@ -24,6 +29,8 @@ from whoodeo.video import frame_tensor
 STEP = 1 / 1023
 _FLEX_H = (64, 1080, 360)
 _FLEX_W = (64, 1920, 640)
+# Latent sides of 480p (856x480), 720p, and 1080p at factor 8.
+LATENT_SIZES = ((60, 107), (90, 160), (135, 240))
 
 
 def _coremltools():
@@ -75,13 +82,17 @@ def _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote):
     return meta
 
 
-def convert(checkpoint, output):
-    """Write an mlprogram with a flexible input."""
+def convert(checkpoint, output, latent_sizes=LATENT_SIZES):
+    """Write an mlprogram with a flexible input, or a vae2 decoder."""
     ct = _coremltools()
     spec = load_generator(checkpoint)
     arch = spec.architecture.get("arch")
+    if arch == "vae2":
+        return convert_decoder(ct, spec, output, latent_sizes)
     if arch not in ("vote", "edsr"):
-        raise SystemExit(f"{checkpoint}: whoodeo-coreml converts vote and edsr, not {arch}")
+        raise SystemExit(
+            f"{checkpoint}: whoodeo-coreml converts vote, edsr, and vae2, not {arch}"
+        )
     model, label, in_frames, step, _path = build_generator(spec, torch.device("cpu"))
     _prepare(model)
     blocks = spec.architecture.get("blocks")
@@ -118,6 +129,64 @@ def convert(checkpoint, output):
     output.parent.mkdir(parents=True, exist_ok=True)
     mlmodel.save(str(output))
     print(f"wrote {output}", flush=True)
+    return output, spec
+
+
+def convert_decoder(ct, spec, output, latent_sizes):
+    """Write the vae2 decoder with enumerated latent sizes, or one fixed size."""
+    from whoodeo.models.vae2 import DecoderExport
+
+    model, label, _in_frames, step, _path = build_generator(spec, torch.device("cpu"))
+    _prepare(model)
+    latent = spec.architecture["latent"]
+    sizes = [tuple(size) for size in latent_sizes]
+    trace_h, trace_w = sizes[len(sizes) // 2]
+    example = torch.zeros(1, latent, trace_h, trace_w)
+    with torch.no_grad():
+        traced = torch.jit.trace(DecoderExport(model).eval(), example)
+    if len(sizes) == 1:
+        shape = (1, latent, trace_h, trace_w)
+    else:
+        shape = ct.EnumeratedShapes(
+            shapes=[(1, latent, height, width) for height, width in sizes],
+            default=(1, latent, trace_h, trace_w),
+        )
+    print(f"convert {label}  step {step}  decoder -> {output}", flush=True)
+    mlmodel = ct.convert(
+        traced,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[ct.TensorType(name="latent", shape=shape, dtype=np.float16)],
+        outputs=[ct.TensorType(name="image", dtype=np.float16)],
+    )
+    mlmodel.author = "whoodeo"
+    mlmodel.short_description = f"{label} decoder"
+    _assign_metadata(mlmodel, {
+        "whoodeo.arch": "vae2",
+        "whoodeo.part": "decoder",
+        "whoodeo.blocks": str(spec.architecture.get("blocks")),
+        "whoodeo.channels": str(spec.architecture.get("channels")),
+        "whoodeo.latent": str(latent),
+        "whoodeo.factor": str(spec.architecture.get("factor")),
+        "whoodeo.step": "" if spec.step is None else str(spec.step),
+        "whoodeo.input": "fixed" if len(sizes) == 1 else "enumerated",
+        "whoodeo.latent_sizes": ",".join(f"{height}x{width}" for height, width in sizes),
+        "whoodeo.latent_shift": f"{float(model.latent_shift):.8g}",
+        "whoodeo.latent_scale": f"{float(model.latent_scale):.8g}",
+    })
+    output = Path(output)
+    if output.exists():
+        import shutil
+        shutil.rmtree(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    mlmodel.save(str(output))
+    print(f"wrote {output}", flush=True)
+    try:
+        counts = _plan_counts(mlmodel, ct.ComputeUnit.CPU_AND_NE)
+    except Exception as exc:
+        counts = {"plan": str(exc)}
+    print(f"plan ane {trace_h}x{trace_w} {counts}", flush=True)
     return output, spec
 
 
@@ -370,7 +439,8 @@ def package_filename(checkpoint, spec):
     shape = f"{blocks}x{channels}" if blocks and channels else "model"
     step = spec.step
     step_part = f"step{int(step):06d}" if step is not None else "step"
-    return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-flex.mlpackage"
+    kind = "decoder" if arch == "vae2" else "flex"
+    return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"
 
 
 def _default_output(checkpoint, spec):
@@ -378,7 +448,9 @@ def _default_output(checkpoint, spec):
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="convert a vote or edsr checkpoint to Core ML")
+    parser = argparse.ArgumentParser(
+        description="convert a vote or edsr checkpoint, or a vae2 decoder, to Core ML",
+    )
     parser.add_argument("model", type=Path, help="checkpoint, run directory, or model.pt")
     parser.add_argument(
         "-o", "--out", type=Path, default=None,
@@ -391,16 +463,36 @@ def parse_args(argv=None):
         default=None,
         help="compare with PyTorch on frame 100 of each video",
     )
+    parser.add_argument(
+        "--latent",
+        type=_latent_size,
+        action="append",
+        default=None,
+        help="vae2 latent size HxW, repeatable. Default: 60x107, 90x160, 135x240",
+    )
     return parser.parse_args(argv)
+
+
+def _latent_size(text):
+    try:
+        height, width = (int(part) for part in text.lower().split("x"))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected HxW, got {text!r}") from exc
+    if height < 1 or width < 1:
+        raise argparse.ArgumentTypeError(f"expected positive sides, got {text!r}")
+    return height, width
 
 
 def main(argv=None):
     args = parse_args(argv)
+    spec = load_generator(args.model)
+    if args.bench and spec.architecture.get("arch") == "vae2":
+        raise SystemExit("--bench compares upscalers. A vae2 decoder has no low frames")
     if args.out is not None:
         output = args.out
     else:
-        output = _default_output(args.model, load_generator(args.model))
-    package, _spec = convert(args.model, output)
+        output = _default_output(args.model, spec)
+    package, _spec = convert(args.model, output, args.latent or LATENT_SIZES)
     if args.bench:
         bench(package, args.model, args.bench)
 

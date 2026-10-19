@@ -1,0 +1,32 @@
+# Fine-tune a vae2 decoder with a GAN. The encoder stays frozen, so the
+# latent an upscaler learns on does not move. The model comes from the run:
+#   uv run whoodeo-train configs/vae2-gan.yaml --model <run>/latest
+# The discriminator trains from the first step. The generator term joins at
+# start, weighted by the gradient ratio at the last decoder layer times weight.
+# lr stays put: the validation objective leaves the gan out, so a plateau on
+# it would read the sharper decoder as a regression.
+
+freeze_encoder: true
+batch: 2
+lr: 5.0e-5
+steps: 20000
+holdout: 0.1
+val_every: 250
+val_count: 32
+seed: 0
+loss:
+  balance: start
+  terms:
+    - name: pixel
+      weight: 0.6
+      kind: l1
+    - name: vgg
+      weight: 0.25
+      layers: [relu2_2, relu3_4]
+    - name: color
+      weight: 0.15
+    - name: gan        # outside the shares: multiplies the adaptive weight
+      weight: 0.1      # latent diffusion uses 0.5; a gentler start for a fine-tune
+      crop: 512
+      disc_lr: 1.0e-4
+      start: 1000
