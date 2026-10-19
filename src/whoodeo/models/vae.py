@@ -105,6 +105,10 @@ class LatentTally:
     `spread` is the square root of var(μ) + mean(σ²). It sits near 1 when the
     code matches that Gaussian. A mu_std near 0 means the latent carries
     nothing. A sigma_mean near 0 means a deterministic code.
+
+    Per channel it keeps the std of μ, the mean σ, and the KL to the unit
+    Gaussian per latent position. A channel counts as active when its μ
+    varies with std above ACTIVE_STD; a collapsed channel copies the prior.
     """
 
     def __init__(self):
@@ -124,10 +128,13 @@ class LatentTally:
         self.sumsq_mu += float(mu.square().sum())
         self.sum_sigma += float(sigma.sum())
         self.sumsq_sigma += float(sigma.square().sum())
+        logvar = logvar.detach().float()
         summed = torch.stack((
             mu.sum(dim=(0, 2, 3)),
             mu.square().sum(dim=(0, 2, 3)),
             sigma.sum(dim=(0, 2, 3)),
+            sigma.square().sum(dim=(0, 2, 3)),
+            logvar.sum(dim=(0, 2, 3)),
         )).cpu()
         self.channels = summed if self.channels is None else self.channels + summed
         if sample:
@@ -149,10 +156,13 @@ class LatentTally:
         each = self.count // width
         per_channel = []
         for index in range(width):
-            total, squares, sig = (float(self.channels[row, index]) for row in range(3))
+            total, squares, sig, sig_sq, logs = (
+                float(self.channels[row, index]) for row in range(5)
+            )
             center = total / each
             channel_var = max(0.0, squares / each - center * center)
-            per_channel.append((channel_var ** 0.5, sig / each))
+            kl = 0.5 * (squares / each + sig_sq / each - 1.0 - logs / each)
+            per_channel.append((channel_var ** 0.5, sig / each, kl))
         hist = None
         if self._hist:
             hist = torch.cat(self._hist)
@@ -168,15 +178,30 @@ class LatentTally:
         }
 
 
+ACTIVE_STD = 0.1   # std of μ across the data; var 0.01 is the usual active-unit line
+
+
 def latent_scalars(report, prefix):
-    """TensorBoard tags for one tally report. `prefix` is empty or `val/`."""
-    tags = {
+    """TensorBoard tags for one tally report. `prefix` is empty or `val/`.
+
+    Per channel there are only two summaries: how many channels are active,
+    and the KL of the weakest one. The full table goes to `latent_table`.
+    """
+    channels = report["channels"]
+    return {
         f"{prefix}latent/mu_mean": report["mu_mean"],
         f"{prefix}latent/mu_std": report["mu_std"],
         f"{prefix}latent/sigma_mean": report["sigma_mean"],
         f"{prefix}latent/spread": report["spread"],
+        f"{prefix}latent/active": sum(1 for mu_std, _, _ in channels if mu_std > ACTIVE_STD),
+        f"{prefix}latent/kl_min": min(kl for _, _, kl in channels),
     }
-    for index, (mu_std, sigma_mean) in enumerate(report["channels"]):
-        tags[f"{prefix}latent/channel/{index}/mu_std"] = mu_std
-        tags[f"{prefix}latent/channel/{index}/sigma_mean"] = sigma_mean
-    return tags
+
+
+def latent_table(report):
+    """Markdown table of every channel, for TensorBoard's text tab."""
+    rows = ["| channel | μ std | σ mean | KL | |", "|---:|---:|---:|---:|:---|"]
+    for index, (mu_std, sigma_mean, kl) in enumerate(report["channels"]):
+        mark = "" if mu_std > ACTIVE_STD else "collapsed"
+        rows.append(f"| {index} | {mu_std:.3f} | {sigma_mean:.3f} | {kl:.3f} | {mark} |")
+    return "\n".join(rows)

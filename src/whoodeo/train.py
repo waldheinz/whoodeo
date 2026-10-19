@@ -66,7 +66,10 @@ in the shared vote. A vae adds train/kl and val/kl. The step loss includes
 beta times that KL. The validation loss the plateau reads is the pixel and
 VGG objective. It also records latent/mu_mean, latent/mu_std, latent/sigma_mean
 and latent/spread for the batch, the same four on the validation set, and the
-per-channel pair under latent/channel/<i>. spread is the square root of
+channel summaries latent/active and latent/kl_min. active counts the channels
+whose μ varies with std above 0.1, kl_min is the KL of the weakest channel.
+Each validation also writes the per-channel table (μ std, σ mean, KL) to the
+text tab as latent/channels. spread is the square root of
 var(μ) + mean(σ²) and sits near 1 when the code matches the unit Gaussian.
 The validation histogram is latent/mu.
 whoodeo-board serves every run.
@@ -113,7 +116,7 @@ from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
 from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
-from whoodeo.models.vae import LatentTally, latent_scalars
+from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
 from whoodeo.objective import Objective, color_loss, pixel_loss
 from whoodeo.video import png_bytes, rgb_image
 
@@ -1015,6 +1018,9 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, measure, one_ste
             hist = None if val_latent is None else val_latent.get("hist")
             if hist is not None:
                 writer.add_histogram("latent/mu", hist, step)
+            if val_latent is not None:
+                writer.add_text("latent/channels", latent_table(val_latent), step)
+            if hist is not None or val_latent is not None:
                 writer.flush()
             if val_loss is None:
                 return
