@@ -13,7 +13,7 @@ steps: 20000
 holdout: 0.1
 val_every: 250
 val_count: 32
-seed: 0
+seed: 42
 loss:
   balance: start
   terms:
