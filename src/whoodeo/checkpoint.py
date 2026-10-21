@@ -180,7 +180,7 @@ def build_generator(spec, device):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, _vae,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, _vae, activation,
     ) = parse_model(spec.architecture, f"{spec.path}: architecture")
     model, label = build_model(
         arch, blocks, channels, in_frames,
@@ -189,6 +189,7 @@ def build_generator(spec, device):
         latent=latent, factor=factor, beta=beta,
         encoder_blocks=encoder_blocks, decoder_blocks=decoder_blocks,
         widths=widths, decoder_widths=decoder_widths, posterior=posterior,
+        activation=activation,
     )
     model.load_state_dict(spec.state_dict)
     model.eval().to(device)

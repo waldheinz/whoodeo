@@ -9,7 +9,7 @@ import yaml
 
 from whoodeo.models import PRESETS
 from whoodeo.models.latent_up import latent_layout
-from whoodeo.models.vae2 import layout, layout_text
+from whoodeo.models.vae2 import ACTIVATIONS, layout, layout_text
 
 VGG_LAYERS = {
     "relu1_1": 1,
@@ -142,6 +142,8 @@ class TrainConfig:
     vae: str | None = None
     # latent_up: start the 1/4 blocks and the head from the vae2 encoder.
     init_from_vae: bool = False
+    # vae2 and latent_up: silu or relu. None is silu, as before the option.
+    activation: str | None = None
 
     def arch_key(self):
         return model_key(
@@ -150,7 +152,7 @@ class TrainConfig:
             self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
             self.latent, self.factor, self.beta,
             self.encoder_blocks, self.decoder_blocks, self.widths, self.decoder_widths,
-            self.posterior, self.vae,
+            self.posterior, self.vae, self.activation,
         )
 
     def loss_recipe(self):
@@ -203,20 +205,24 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"res_scale {res_scale:g}"
         )
     elif arch == LATENT_ARCH:
-        latent, encoder_blocks, widths, vae = extra
+        latent, encoder_blocks, widths, vae, activation = extra
         text = (
             f"{arch} {blocks}x{channels} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in encoder_blocks)} "
             f"widths {'/'.join(str(item) for item in widths)} vae {vae}"
         )
+        if activation != "silu":
+            text += f" activation {activation}"
     elif arch in VAE_ARCHS:
         latent, factor, *levels = extra
         text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
         if levels:
-            *levels, posterior = levels
+            *levels, posterior, activation = levels
             text += layout_text(factor, *levels)
             if posterior != "gaussian":
                 text += f" posterior {posterior}"
+            if activation != "silu":
+                text += f" activation {activation}"
     return text
 
 
@@ -224,7 +230,7 @@ def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
     bilinear, codes, patch, res_scale, vote, latent, factor, beta,
     encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None, vae=None,
+    posterior=None, vae=None, activation=None,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -242,12 +248,12 @@ def model_key(
         # The levels compare with their defaults filled in.
         return key + (latent, factor) + layout(
             factor, encoder_blocks, decoder_blocks, widths, decoder_widths,
-        ) + (posterior or "gaussian",)
+        ) + (posterior or "gaussian", activation or "silu")
     if arch in VAE_ARCHS:
         return key + (latent, factor)
     if arch == LATENT_ARCH:
         # The vae2 is the checkpoint directory the config resolved to.
-        return key + (latent,) + latent_layout(encoder_blocks, widths) + (vae,)
+        return key + (latent,) + latent_layout(encoder_blocks, widths) + (vae, activation or "silu")
     return key
 
 
@@ -290,6 +296,8 @@ def architecture_dict(cfg):
             value = getattr(cfg, name)
             if value is not None:
                 item[name] = list(value)
+        if cfg.activation is not None:
+            item["activation"] = cfg.activation
     elif cfg.arch == LATENT_ARCH:
         item["latent"] = cfg.latent
         for name in ("encoder_blocks", "widths"):
@@ -297,6 +305,8 @@ def architecture_dict(cfg):
             if value is not None:
                 item[name] = list(value)
         item["vae"] = cfg.vae
+        if cfg.activation is not None:
+            item["activation"] = cfg.activation
     return item
 
 
@@ -329,7 +339,7 @@ def load_config(path, architecture=None, architecture_from=None):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation,
     ) = _take_model(
         data, where, architecture, architecture_from,
     )
@@ -409,6 +419,7 @@ def load_config(path, architecture=None, architecture_from=None):
         decoder_widths=decoder_widths,
         posterior=posterior,
         vae=vae,
+        activation=activation,
         init_from_vae=init_from_vae,
         latent_noise_tau=latent_noise_tau,
         crop=crop,
@@ -445,7 +456,7 @@ def _resolve_vae(parsed, where):
     A run directory follows its latest link, as --model does. The saved
     architecture keeps that directory, so a resume decodes with the same vae2.
     """
-    *head, vae = parsed
+    *head, vae, activation = parsed
     if vae is None:
         return parsed
     from whoodeo.checkpoint import _model_file
@@ -454,7 +465,7 @@ def _resolve_vae(parsed, where):
         model_path = _model_file(Path(vae))
     except SystemExit as exc:
         raise SystemExit(f"{where}: vae: {exc}") from exc
-    return (*head, str(model_path.parent.resolve()))
+    return (*head, str(model_path.parent.resolve()), activation)
 
 
 def parse_model(model, where):
@@ -498,6 +509,7 @@ def parse_model(model, where):
     latent, factor, beta = _take_vae(model, arch, where, posterior)
     encoder_blocks, decoder_blocks, widths, decoder_widths = _take_levels(model, arch, factor, where)
     vae = _take_vae_path(model, arch, where)
+    activation = _take_activation(model, arch, where)
     vote = None
     if arch == "vote":
         stem = _take_int(model, "stem", where)
@@ -518,8 +530,17 @@ def parse_model(model, where):
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation,
     )
+
+
+def _take_activation(data, arch, where):
+    """vae2 and latent_up activation as written, None when left out (silu)."""
+    if "activation" not in data:
+        return None
+    if arch not in ("vae2", LATENT_ARCH):
+        raise SystemExit(f"{where}: only vae2 and latent_up take activation")
+    return _take_choice(data, "activation", where, ACTIVATIONS)
 
 
 def _take_vae_path(data, arch, where):

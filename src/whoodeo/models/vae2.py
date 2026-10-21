@@ -1,7 +1,10 @@
 """A tapered convolutional VAE on one RGB frame, shaped for the Neural Engine.
 
-The layers are 3x3 convolutions, SiLU, additions, and nearest-neighbor
-doubling. There is no normalization and no attention, so a Core ML decoder
+The layers are 3x3 convolutions, an activation, additions, and nearest-neighbor
+doubling. `activation` is silu (the default) or relu. relu is what the Neural
+Engine computes exactly: its SiLU is an approximation that held the Core ML
+decoder to about 48 dB against fp32, where relu reaches about 70 dB at 10%
+less time. There is no normalization and no attention, so a Core ML decoder
 runs on the Neural Engine at a fixed latent size. Width grows as the picture
 shrinks: `channels` at full resolution, twice that at half, four times that
 from a quarter down. Full resolution has one residual block, the levels below
@@ -52,13 +55,24 @@ DILATIONS = (1, 2, 4)
 POSTERIORS = ("gaussian", "fixed")
 # Running std of μ per channel, the scale of the training noise.
 EMA_DECAY = 0.99
+# The activations a vae2 or latent_up can use. silu is the default.
+ACTIVATIONS = {"silu": F.silu, "relu": F.relu}
+
+
+def activation_fn(name):
+    if name is None:
+        return F.silu
+    if name not in ACTIVATIONS:
+        raise SystemExit(f"activation must be one of {', '.join(ACTIVATIONS)}, not {name!r}")
+    return ACTIVATIONS[name]
 
 
 class Block(nn.Module):
-    """x + conv(SiLU(conv(SiLU(x)))). The second convolution starts at zero."""
+    """x + conv(act(conv(act(x)))). The second convolution starts at zero."""
 
-    def __init__(self, channels, dilation=1):
+    def __init__(self, channels, dilation=1, activation=None):
         super().__init__()
+        self.act = activation_fn(activation)
         self.conv1 = nn.Conv2d(
             channels, channels, kernel_size=3, padding=dilation, dilation=dilation,
         )
@@ -66,19 +80,19 @@ class Block(nn.Module):
         zero_conv(self.conv2)
 
     def forward(self, x):
-        return x + self.conv2(F.silu(self.conv1(F.silu(x))))
+        return x + self.conv2(self.act(self.conv1(self.act(x))))
 
 
-def _blocks(channels, count, dilations=(1,)):
+def _blocks(channels, count, dilations=(1,), activation=None):
     return nn.Sequential(*(
-        Block(channels, dilations[index % len(dilations)]) for index in range(count)
+        Block(channels, dilations[index % len(dilations)], activation) for index in range(count)
     ))
 
 
 class _Down(nn.Module):
-    def __init__(self, width, wider, blocks):
+    def __init__(self, width, wider, blocks, activation=None):
         super().__init__()
-        self.blocks = _blocks(width, blocks)
+        self.blocks = _blocks(width, blocks, activation=activation)
         self.down = nn.Conv2d(width, wider, kernel_size=3, stride=2, padding=1)
 
     def forward(self, x):
@@ -86,10 +100,10 @@ class _Down(nn.Module):
 
 
 class _Up(nn.Module):
-    def __init__(self, wider, width, blocks):
+    def __init__(self, wider, width, blocks, activation=None):
         super().__init__()
         self.mix = nn.Conv2d(wider, width, kernel_size=3, padding=1)
-        self.blocks = _blocks(width, blocks)
+        self.blocks = _blocks(width, blocks, activation=activation)
 
     def forward(self, x):
         x = F.interpolate(x, scale_factor=2, mode="nearest")
@@ -139,15 +153,16 @@ def layout_text(factor, encoder_blocks=None, decoder_blocks=None, widths=None, d
 
 
 class Encoder(nn.Module):
-    def __init__(self, widths, blocks, latent, level_blocks, stats=2):
+    def __init__(self, widths, blocks, latent, level_blocks, stats=2, activation=None):
         super().__init__()
         stages = len(widths) - 1
+        self.act = activation_fn(activation)
         self.stem = nn.Conv2d(3, widths[0], kernel_size=3, padding=1)
         self.downs = nn.ModuleList(
-            _Down(widths[level], widths[level + 1], level_blocks[level])
+            _Down(widths[level], widths[level + 1], level_blocks[level], activation)
             for level in range(stages)
         )
-        self.mid = _blocks(widths[-1], blocks, DILATIONS)
+        self.mid = _blocks(widths[-1], blocks, DILATIONS, activation)
         self.to_stats = nn.Conv2d(widths[-1], latent * stats, kernel_size=3, padding=1)
 
     def forward(self, image):
@@ -155,17 +170,18 @@ class Encoder(nn.Module):
         for stage in self.downs:
             hidden = stage(hidden)
         hidden = self.mid(hidden)
-        return self.to_stats(F.silu(hidden))
+        return self.to_stats(self.act(hidden))
 
 
 class Decoder(nn.Module):
-    def __init__(self, widths, blocks, latent, level_blocks):
+    def __init__(self, widths, blocks, latent, level_blocks, activation=None):
         super().__init__()
         stages = len(widths) - 1
+        self.act = activation_fn(activation)
         self.from_latent = nn.Conv2d(latent, widths[-1], kernel_size=3, padding=1)
-        self.mid = _blocks(widths[-1], blocks, DILATIONS)
+        self.mid = _blocks(widths[-1], blocks, DILATIONS, activation)
         self.ups = nn.ModuleList(
-            _Up(widths[level + 1], widths[level], level_blocks[level])
+            _Up(widths[level + 1], widths[level], level_blocks[level], activation)
             for level in reversed(range(stages))
         )
         self.to_rgb = nn.Conv2d(widths[0], 3, kernel_size=3, padding=1)
@@ -174,7 +190,7 @@ class Decoder(nn.Module):
         hidden = self.mid(self.from_latent(latent))
         for stage in self.ups:
             hidden = stage(hidden)
-        return self.to_rgb(F.silu(hidden))
+        return self.to_rgb(self.act(hidden))
 
 
 class VAE2(nn.Module):
@@ -183,9 +199,11 @@ class VAE2(nn.Module):
     def __init__(
         self, channels, blocks, latent, factor, beta,
         encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-        posterior=None,
+        posterior=None, activation=None,
     ):
         super().__init__()
+        activation_fn(activation)
+        self.activation = activation or "silu"
         if channels < 1 or blocks < 1 or latent < 1:
             raise SystemExit("channels, blocks, and latent must be positive")
         if factor < 2 or factor > 16 or factor & (factor - 1):
@@ -216,8 +234,8 @@ class VAE2(nn.Module):
         self.widths = tuple(channels * multiple for multiple in widths)
         self.decoder_widths = tuple(channels * multiple for multiple in decoder_widths)
         stats = 2 if posterior == "gaussian" else 1
-        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats)
-        self.decoder = Decoder(self.decoder_widths, blocks, latent, decoder_blocks)
+        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats, activation)
+        self.decoder = Decoder(self.decoder_widths, blocks, latent, decoder_blocks, activation)
         self.register_buffer("latent_shift", torch.zeros(latent))
         self.register_buffer("latent_scale", torch.ones(latent))
         # Zero until the first training batch sets it.

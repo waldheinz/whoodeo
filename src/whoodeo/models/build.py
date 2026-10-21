@@ -53,13 +53,17 @@ PRESETS = {
     "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
 }
 
+def _activation_text(activation):
+    return "" if activation in (None, "silu") else f" activation {activation}"
+
+
 def build_model(
     arch, blocks=None, channels=None, in_frames=5, *,
     radius=None, stem=None, sharpness=None, reject=None, levels=None,
     bilinear=None, codes=None, patch=None, res_scale=None, vote=None,
     latent=None, factor=None, beta=None,
     encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None,
+    posterior=None, activation=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -118,12 +122,12 @@ def build_model(
     elif arch == "latent_up":
         if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
             raise SystemExit("latent must be a positive integer")
-        model = LatentUp(width, depth, latent, encoder_blocks, widths)
+        model = LatentUp(width, depth, latent, encoder_blocks, widths, activation)
     elif arch == "vae2":
         _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
         model = VAE2(
             width, depth, latent, factor, beta,
-            encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
+            encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, activation,
         )
     else:
         _check_edsr(res_scale)
@@ -161,7 +165,8 @@ def build_model(
         label = (
             f"latent_up {depth}x{width} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in chosen_blocks)} "
-            f"widths {'/'.join(str(item) for item in chosen_widths)} parameters {count}"
+            f"widths {'/'.join(str(item) for item in chosen_widths)}"
+            f"{_activation_text(activation)} parameters {count}"
         )
     elif arch in ("vae", "vae2"):
         levels = ""
@@ -170,7 +175,7 @@ def build_model(
         kl = "posterior fixed" if posterior == "fixed" else f"beta {float(beta):g}"
         label = (
             f"{arch} {depth}x{width} latent {latent} factor {factor}{levels} "
-            f"{kl} parameters {count}"
+            f"{kl}{_activation_text(activation)} parameters {count}"
         )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"

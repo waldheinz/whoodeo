@@ -13,6 +13,11 @@ model:
   widths: [1, 2, 4]         # multiples of channels: low, 1/2, 1/4
   encoder_blocks: [2, 4]    # residual blocks at low and at 1/2
   blocks: 12                # residual blocks at 1/4, dilations 1, 2, 4 in turn
+  # relu instead of silu, for the Neural Engine (see vae2e-spark.yaml). The
+  # step-2669 run (runs/train-20261021-064120) is silu and does not resume
+  # under this. vae: above still names the silu vae2d; it moves to the vae2e
+  # run once that is trained.
+  activation: relu
 
 # Copy the vae2d's 6 latent blocks into the last 6 blocks at 1/4 and its head
 # (shift and scale folded in). Fresh runs only.

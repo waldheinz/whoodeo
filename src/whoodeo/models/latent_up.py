@@ -8,9 +8,9 @@ z / scale + shift into the 2x picture. Training and the decoder live in
 train.py; this module is the trainable part alone.
 
 The layers are the vae2 encoder's: a 3x3 stem, residual blocks of
-conv + SiLU whose last convolution starts at zero, a stride-2 convolution to
+conv + activation (`activation`, silu or relu as in vae2) whose last convolution starts at zero, a stride-2 convolution to
 each coarser level, and `blocks` residual blocks at 1/4 with dilations 1, 2,
-4 in turn. A 3x3 head after SiLU gives the code. No normalization, no
+4 in turn. A 3x3 head after the activation gives the code. No normalization, no
 attention, so it runs on the Neural Engine at a fixed size. `channels` is the
 width at the low resolution, `widths` the multiples per level (low, 1/2, 1/4),
 `encoder_blocks` the residual count at low and at 1/2. A side that 4 does not
@@ -42,7 +42,7 @@ def latent_layout(encoder_blocks=None, widths=None, where="latent_up"):
 class LatentUp(nn.Module):
     """Low RGB in, the normalized vae2 code at 1/4 of the padded low frame out."""
 
-    def __init__(self, channels, blocks, latent, encoder_blocks=None, widths=None):
+    def __init__(self, channels, blocks, latent, encoder_blocks=None, widths=None, activation=None):
         super().__init__()
         if channels < 1 or blocks < 0 or latent < 1:
             raise SystemExit("channels and latent must be positive, blocks zero or more")
@@ -54,7 +54,8 @@ class LatentUp(nn.Module):
         self.latent = latent
         self.encoder_blocks = encoder_blocks
         self.widths = tuple(channels * multiple for multiple in widths)
-        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats=1)
+        self.activation = activation or "silu"
+        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats=1, activation=activation)
 
     def forward(self, low):
         padded, _height, _width = pad_to(low, FACTOR)

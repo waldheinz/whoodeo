@@ -966,6 +966,7 @@ def open_run(cfg, resume, finetune, load):
         latent=cfg.latent, factor=cfg.factor, beta=cfg.beta,
         encoder_blocks=cfg.encoder_blocks, decoder_blocks=cfg.decoder_blocks,
         widths=cfg.widths, decoder_widths=cfg.decoder_widths, posterior=cfg.posterior,
+        activation=cfg.activation,
     )
     model = model.train().to(device)
     if hasattr(model, "noise_tau"):
