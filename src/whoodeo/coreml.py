@@ -12,12 +12,19 @@ The metadata carries the latent shift and scale, one value per channel.
 A latent_up checkpoint gives one program with its vae2 decoder behind it: the
 low frame in, the 2x frame clamped to [0, 1] out, both fp16. The latent shift
 and scale fold into the head of latent_up, so the graph hands the decoder μ
-directly. The input takes the enumerated low sizes of --low, 428x240,
-640x360, 720x480, 720x576, and 960x540 by default, all divisible by 4. The app
-pads a frame on the bottom and the right (reflect) to the next multiple of 4
-and crops the result to 2h x 2w. The vae2 is the one the checkpoint names;
-a path under /mnt/home-storinator-trem is looked up under /Volumes/home, and
---vae overrides it.
+directly. The input takes any size from 64x64 to --max-low, 1136x640 by
+default; the Neural Engine aborts on a whole 1280x720 low frame. --low gives
+enumerated sizes instead. The app pads a frame on the bottom and the right
+(reflect) to the next multiple of 4 and crops the result to 2h x 2w. The vae2
+is the one the checkpoint names; a path under /mnt/home-storinator-trem is
+looked up under /Volumes/home, and --vae overrides it.
+The Neural Engine loses conv products below about 2^-14, which the residual
+convolutions that start at zero produce in numbers. --conv-scale k (16 by
+default for vae2 and latent_up, off for vote and edsr) multiplies each
+convolution's weight and bias by k and puts a separate multiply by 1/k behind
+it. The pass that would fold that multiply back into the weights is off, so
+the products stay large; the Neural Engine runs the multiply with the
+convolution at no measurable cost. In fp32 the picture does not change.
 coremltools stays out of the training dependencies. On the Mac:
 
     uv pip install --python .venv/bin/python 'coremltools==9.1.dev1'
@@ -43,10 +50,14 @@ _FLEX_H = (64, 1080, 360)
 _FLEX_W = (64, 1920, 640)
 # Latent sides of 480p (856x480), 720p, and 1080p at factor 8.
 LATENT_SIZES = ((60, 107), (90, 160), (135, 240))
-# Low sides latent_up takes, height x width: 480p (426x240 padded), 360p, NTSC,
-# PAL, and 540p. Each divides by 4.
-LOW_SIZES = ((240, 428), (360, 640), (480, 720), (576, 720), (540, 960))
 LOW_PAD = 4
+# latent_up's flexible input: 64 up to this, height x width. 1280x720 aborts on the Neural Engine.
+LOW_MIN = 64
+LOW_MAX = (640, 1136)
+# Sizes --plan and --bench use for a flexible latent_up package.
+LOW_PROBES = ((240, 428), (360, 640), (480, 852), (640, 1136))
+# Convolution weights and bias times this, with a multiply by its inverse behind.
+CONV_SCALE = 16.0
 # Where the Spark's runs mount lives on the Mac.
 VAE_MOUNTS = (("/mnt/home-storinator-trem", "/Volumes/home"),)
 
@@ -68,6 +79,65 @@ def _prepare(model):
         if isinstance(module, torch.nn.ReLU):
             module.inplace = False
     return model
+
+
+class ScaledConv(torch.nn.Module):
+    """A convolution with weight and bias times k, its output times 1/k: the same picture,
+    larger products on the Neural Engine."""
+
+    def __init__(self, conv, k):
+        super().__init__()
+        import copy
+
+        self.conv = copy.deepcopy(conv)
+        with torch.no_grad():
+            self.conv.weight.mul_(k)
+            if self.conv.bias is not None:
+                self.conv.bias.mul_(k)
+        self.inverse = 1.0 / k
+
+    def forward(self, x):
+        return self.conv(x) * self.inverse
+
+
+def scale_convs(module, k):
+    """A copy of `module` with every Conv2d wrapped in ScaledConv. k of 1 returns it as is."""
+    if k is None or k == 1:
+        return module
+    import copy
+
+    module = copy.deepcopy(module)
+
+    def walk(parent):
+        for name, child in parent.named_children():
+            if isinstance(child, torch.nn.Conv2d):
+                setattr(parent, name, ScaledConv(child, k))
+            else:
+                walk(child)
+
+    walk(module)
+    return module.eval()
+
+
+def _pipeline(ct, k):
+    """The default passes, without the conv-scale fusion when the convolutions are scaled."""
+    import copy
+
+    pipeline = copy.deepcopy(ct.PassPipeline.DEFAULT)
+    if k is not None and k != 1:
+        pipeline.remove_passes(["common::fuse_conv_scale"])
+    return pipeline
+
+
+def _check_scaled(plain, scaled, example, label):
+    """The scaled copy must give the same output in fp32."""
+    with torch.no_grad():
+        want = plain(example)
+        got = scaled(example)
+    diff = float((want - got).abs().max())
+    print(f"conv scale check {label}  max abs {diff:.3g}", flush=True)
+    if diff > 1e-3:
+        raise SystemExit(f"scaling the convolutions changed the output by {diff}")
 
 
 def _shape(ct, in_frames):
@@ -100,21 +170,34 @@ def _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote):
     return meta
 
 
-def convert(checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=LOW_SIZES, vae=None, plan=False):
-    """Write an mlprogram with a flexible input, a vae2 decoder, or latent_up with its decoder."""
+def convert(
+    checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=None, vae=None, plan=False,
+    conv_scale=None, max_low=LOW_MAX,
+):
+    """Write an mlprogram with a flexible input, a vae2 decoder, or latent_up with its decoder.
+
+    `conv_scale` None picks CONV_SCALE for vae2 and latent_up and 1 for vote and edsr.
+    `low_sizes` None gives latent_up a flexible input up to `max_low`.
+    """
     ct = _coremltools()
     spec = load_generator(checkpoint)
     arch = spec.architecture.get("arch")
+    if conv_scale is None:
+        conv_scale = CONV_SCALE if arch in ("vae2", "latent_up") else 1.0
     if arch == "vae2":
-        return convert_decoder(ct, spec, output, latent_sizes)
+        return convert_decoder(ct, spec, output, latent_sizes, conv_scale)
     if arch == "latent_up":
-        return convert_latent_up(ct, spec, output, low_sizes, vae, plan)
+        return convert_latent_up(ct, spec, output, low_sizes, vae, plan, conv_scale, max_low)
     if arch not in ("vote", "edsr"):
         raise SystemExit(
             f"{checkpoint}: whoodeo-coreml converts vote, edsr, vae2, and latent_up, not {arch}"
         )
     model, label, in_frames, step, _path = build_generator(spec, torch.device("cpu"))
     _prepare(model)
+    if conv_scale != 1:
+        scaled = scale_convs(model, conv_scale)
+        _check_scaled(model, scaled, torch.rand(1, in_frames * 3, 64, 96), label)
+        model = scaled
     blocks = spec.architecture.get("blocks")
     channels = spec.architecture.get("channels")
     res_scale = spec.architecture.get("res_scale")
@@ -135,13 +218,14 @@ def convert(checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=LOW_SIZES, 
         minimum_deployment_target=target,
         inputs=[ct.TensorType(name="frames", shape=_shape(ct, in_frames), dtype=np.float32)],
         outputs=[ct.TensorType(name="image", dtype=np.float32)],
+        pass_pipeline=_pipeline(ct, conv_scale),
     )
     mlmodel.author = "whoodeo"
     mlmodel.short_description = label
     # The property is the protobuf map. It has no setter in coremltools 9.
-    _assign_metadata(mlmodel, _metadata(
-        spec, arch, blocks, channels, in_frames, res_scale, stem, vote,
-    ))
+    meta = _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote)
+    meta["whoodeo.conv_scale"] = f"{conv_scale:g}"
+    _assign_metadata(mlmodel, meta)
     output = Path(output)
     if output.exists():
         import shutil
@@ -152,7 +236,7 @@ def convert(checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=LOW_SIZES, 
     return output, spec
 
 
-def convert_decoder(ct, spec, output, latent_sizes):
+def convert_decoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
     """Write the vae2 decoder with enumerated latent sizes, or one fixed size."""
     from whoodeo.models.vae2 import DecoderExport
 
@@ -162,8 +246,12 @@ def convert_decoder(ct, spec, output, latent_sizes):
     sizes = [tuple(size) for size in latent_sizes]
     trace_h, trace_w = sizes[len(sizes) // 2]
     example = torch.zeros(1, latent, trace_h, trace_w)
+    plain = DecoderExport(model).eval()
+    export = scale_convs(plain, conv_scale)
+    if conv_scale != 1:
+        _check_scaled(plain, export, torch.randn(1, latent, 12, 20), "decoder")
     with torch.no_grad():
-        traced = torch.jit.trace(DecoderExport(model).eval(), example)
+        traced = torch.jit.trace(export, example)
     if len(sizes) == 1:
         shape = (1, latent, trace_h, trace_w)
     else:
@@ -179,6 +267,7 @@ def convert_decoder(ct, spec, output, latent_sizes):
         minimum_deployment_target=ct.target.iOS18,
         inputs=[ct.TensorType(name="latent", shape=shape, dtype=np.float16)],
         outputs=[ct.TensorType(name="image", dtype=np.float16)],
+        pass_pipeline=_pipeline(ct, conv_scale),
     )
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} decoder"
@@ -191,6 +280,7 @@ def convert_decoder(ct, spec, output, latent_sizes):
         "whoodeo.factor": str(spec.architecture.get("factor")),
         "whoodeo.step": "" if spec.step is None else str(spec.step),
         "whoodeo.input": "fixed" if len(sizes) == 1 else "enumerated",
+        "whoodeo.conv_scale": f"{conv_scale:g}",
         "whoodeo.latent_sizes": ",".join(f"{height}x{width}" for height, width in sizes),
         # One value per latent channel, comma separated.
         "whoodeo.latent_shift": ",".join(f"{float(v):.8g}" for v in model.latent_shift.reshape(-1)),
@@ -260,20 +350,21 @@ def _smooth_frames(height, width, seed=0):
     return torch.nn.functional.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
 
 
-def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan):
-    """Write latent_up and its vae2 decoder as one program with enumerated low sizes."""
+def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan, conv_scale=CONV_SCALE, max_low=LOW_MAX):
+    """Write latent_up and its vae2 decoder as one program, flexible up to `max_low` or enumerated."""
     from whoodeo.models.latent_up import FACTOR, LatentUpExport, LatentUpReference
 
     model, label, step, vae, vae_label, vae_spec, vae_path = load_latent_up(
         spec, torch.device("cpu"), vae_override,
     )
-    sizes = [tuple(size) for size in low_sizes]
-    for height, width in sizes:
+    sizes = None if low_sizes is None else [tuple(size) for size in low_sizes]
+    for height, width in sizes or [max_low]:
         if height % FACTOR or width % FACTOR:
             raise SystemExit(f"low size {width}x{height}: both sides must divide by {FACTOR}")
-    export = LatentUpExport(model, vae).eval()
+    folded = LatentUpExport(model, vae).eval()
+    export = scale_convs(folded, conv_scale)
     reference = LatentUpReference(model, vae).eval()
-    # The fold must not change the picture. fp32 on the CPU, padded and unpadded.
+    # Neither the fold nor the conv scale may change the picture. fp32 on the CPU, padded and unpadded.
     with torch.no_grad():
         for height, width in ((96, 128), (90, 130)):
             frames = _smooth_frames(height, width)
@@ -281,29 +372,42 @@ def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan):
             padded, _h, _w = _pad(frames)
             got = export(padded)[:, :, :2 * height, :2 * width]
             fold = float((want - got).abs().max())
-            print(f"fold check {width}x{height}  max abs {fold:.3g}", flush=True)
+            print(f"fold and conv scale {conv_scale:g} check {width}x{height}  max abs {fold:.3g}", flush=True)
             if fold > 1e-4:
-                raise SystemExit(f"folding the latent shift and scale changed the frame by {fold}")
-    trace_h, trace_w = sizes[len(sizes) // 2] if len(sizes) > 1 else sizes[0]
-    if (360, 640) in sizes:
-        trace_h, trace_w = 360, 640
+                raise SystemExit(f"folding the latent shift and scale or the conv scale changed the frame by {fold}")
+    trace_h, trace_w = 360, 640
+    if sizes is not None and (trace_h, trace_w) not in sizes:
+        trace_h, trace_w = sizes[len(sizes) // 2]
     example = torch.zeros(1, 3, trace_h, trace_w)
     with torch.no_grad():
         traced = torch.jit.trace(export, example)
-    if len(sizes) == 1:
+    if sizes is None:
+        max_h, max_w = max_low
+        shape = ct.Shape(shape=(
+            1,
+            3,
+            ct.RangeDim(lower_bound=LOW_MIN, upper_bound=max_h, default=min(trace_h, max_h)),
+            ct.RangeDim(lower_bound=LOW_MIN, upper_bound=max_w, default=min(trace_w, max_w)),
+        ))
+        kind = "range"
+        widths, heights = (LOW_MIN, max_w), (LOW_MIN, max_h)
+    elif len(sizes) == 1:
         shape = (1, 3, trace_h, trace_w)
+        kind = "fixed"
     else:
         shape = ct.EnumeratedShapes(
             shapes=[(1, 3, height, width) for height, width in sizes],
             default=(1, 3, trace_h, trace_w),
         )
-    print(f"convert {label}  step {step}  + {vae_label} decoder -> {output}", flush=True)
-    mlmodel = _convert_latent_up_traced(ct, traced, shape)
+        kind = "enumerated"
+    if sizes is not None:
+        widths = [width for _height, width in sizes]
+        heights = [height for height, _width in sizes]
+    print(f"convert {label}  step {step}  + {vae_label} decoder  {kind} -> {output}", flush=True)
+    mlmodel = _convert_latent_up_traced(ct, traced, shape, conv_scale)
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} + vae2 decoder"
-    widths = [width for _height, width in sizes]
-    heights = [height for height, _width in sizes]
-    _assign_metadata(mlmodel, {
+    meta = {
         "whoodeo.arch": "latent_up",
         "whoodeo.part": "upscaler+decoder",
         "whoodeo.blocks": str(spec.architecture.get("blocks")),
@@ -314,16 +418,20 @@ def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan):
         "whoodeo.step": "" if spec.step is None else str(spec.step),
         "whoodeo.vae": str(vae_path),
         "whoodeo.vae_step": "" if vae_spec.step is None else str(vae_spec.step),
-        "whoodeo.input": "fixed" if len(sizes) == 1 else "enumerated",
-        # Width x height, the order the app reads.
-        "whoodeo.sizes": ",".join(f"{width}x{height}" for height, width in sizes),
+        "whoodeo.input": kind,
+        "whoodeo.conv_scale": f"{conv_scale:g}",
         "whoodeo.pad": str(FACTOR),
         "whoodeo.pad_mode": "reflect",
+        # The app checks the padded size against these.
         "whoodeo.width_min": str(min(widths)),
         "whoodeo.width_max": str(max(widths)),
         "whoodeo.height_min": str(min(heights)),
         "whoodeo.height_max": str(max(heights)),
-    })
+    }
+    if sizes is not None:
+        # Width x height, the order the app reads.
+        meta["whoodeo.sizes"] = ",".join(f"{width}x{height}" for height, width in sizes)
+    _assign_metadata(mlmodel, meta)
     output = Path(output)
     if output.exists():
         import shutil
@@ -332,11 +440,14 @@ def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan):
     mlmodel.save(str(output))
     print(f"wrote {output}", flush=True)
     if plan:
-        _plan_sizes(ct, traced, sizes)
+        probes = sizes if sizes is not None else [
+            size for size in LOW_PROBES if size[0] <= max_low[0] and size[1] <= max_low[1]
+        ]
+        _plan_sizes(ct, traced, probes, conv_scale)
     return output, spec
 
 
-def _convert_latent_up_traced(ct, traced, shape):
+def _convert_latent_up_traced(ct, traced, shape, conv_scale=CONV_SCALE):
     return ct.convert(
         traced,
         convert_to="mlprogram",
@@ -344,15 +455,16 @@ def _convert_latent_up_traced(ct, traced, shape):
         minimum_deployment_target=ct.target.iOS18,
         inputs=[ct.TensorType(name="frames", shape=shape, dtype=np.float16)],
         outputs=[ct.TensorType(name="image", dtype=np.float16)],
+        pass_pipeline=_pipeline(ct, conv_scale),
     )
 
 
-def _plan_sizes(ct, traced, sizes):
+def _plan_sizes(ct, traced, sizes, conv_scale=CONV_SCALE):
     """The Neural Engine plan of each size, from a fixed-shape copy of the program."""
     import tempfile
 
     for height, width in sizes:
-        fixed = _convert_latent_up_traced(ct, traced, (1, 3, height, width))
+        fixed = _convert_latent_up_traced(ct, traced, (1, 3, height, width), conv_scale)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "plan.mlpackage"
             fixed.save(str(path))
@@ -517,6 +629,15 @@ def _package_sizes(package, ct):
     return sizes
 
 
+def _package_probes(package):
+    """LOW_PROBES that fit a flexible package's range."""
+    from coremltools.models.utils import load_spec
+    defined = load_spec(str(package)).description.metadata.userDefined
+    max_w = int(defined.get("whoodeo.width_max", LOW_MAX[1]))
+    max_h = int(defined.get("whoodeo.height_max", LOW_MAX[0]))
+    return [size for size in LOW_PROBES if size[0] <= max_h and size[1] <= max_w]
+
+
 def bench(package, checkpoint, videos, vae=None):
     """Compare the package with PyTorch fp32 on real frames. PSNR sets the default unit."""
     ct = _coremltools()
@@ -527,7 +648,7 @@ def bench(package, checkpoint, videos, vae=None):
         from whoodeo.models.latent_up import LatentUpReference
         model, label, _step, vae_model, _vae_label, _vae_spec, _vae_path = load_latent_up(spec, device, vae)
         model = LatentUpReference(model, vae_model).eval()
-        sizes = _package_sizes(package, ct)
+        sizes = _package_sizes(package, ct) or _package_probes(package)
         cases = list(_cases_latent_up(videos, sizes))
         dtype = np.float16
         repeats = 5
@@ -688,7 +809,7 @@ def package_filename(checkpoint, spec):
     shape = f"{blocks}x{channels}" if blocks and channels else "model"
     step = spec.step
     step_part = f"step{int(step):06d}" if step is not None else "step"
-    kind = {"vae2": "decoder", "latent_up": "enum"}.get(arch, "flex")
+    kind = {"vae2": "decoder", "latent_up": "range"}.get(arch, "flex")
     return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"
 
 
@@ -724,8 +845,22 @@ def parse_args(argv=None):
         type=_latent_size,
         action="append",
         default=None,
-        help="latent_up low size HxW, repeatable, sides divisible by 4. "
-             "Default: 240x428, 360x640, 480x720, 576x720, 540x960",
+        help="latent_up: enumerated low sizes HxW instead of the flexible input, repeatable, "
+             "sides divisible by 4",
+    )
+    parser.add_argument(
+        "--max-low",
+        type=_latent_size,
+        default=LOW_MAX,
+        help="latent_up: largest low frame HxW of the flexible input, sides divisible by 4. "
+             "Default: 640x1136",
+    )
+    parser.add_argument(
+        "--conv-scale",
+        type=float,
+        default=None,
+        help="multiply conv weights by k and the outputs by 1/k, for the Neural Engine. "
+             "1 turns it off. Default: 16 for vae2 and latent_up, 1 for vote and edsr",
     )
     parser.add_argument(
         "--vae",
@@ -761,8 +896,11 @@ def main(argv=None):
         output = args.out
     else:
         output = _default_output(args.model, spec)
+    if args.conv_scale is not None and args.conv_scale <= 0:
+        raise SystemExit("--conv-scale must be positive")
     package, _spec = convert(
-        args.model, output, args.latent or LATENT_SIZES, args.low or LOW_SIZES, args.vae, args.plan,
+        args.model, output, args.latent or LATENT_SIZES, args.low, args.vae, args.plan,
+        args.conv_scale, args.max_low,
     )
     if args.bench:
         bench(package, args.model, args.bench, args.vae)
