@@ -32,6 +32,11 @@ nonisolated enum Compute: String, CaseIterable, Identifiable {
     }
 }
 
+nonisolated struct FrameSize: Hashable {
+    var width: Int
+    var height: Int
+}
+
 nonisolated struct PackageInfo {
     var arch: String
     var blocks: Int
@@ -49,6 +54,11 @@ nonisolated struct PackageInfo {
     var prefer: Compute
     var inputName: String
     var outputName: String
+    /// Enumerated input sizes, empty for a flexible range.
+    var sizes: [FrameSize] = []
+    /// Both sides are padded (reflect, bottom and right) to a multiple of this, 1 for none.
+    var pad: Int = 1
+    var inputType: MLMultiArrayDataType = .float32
 
     var label: String {
         var parts = ["\(arch) \(blocks)×\(channels)"]
@@ -58,11 +68,28 @@ nonisolated struct PackageInfo {
         return parts.joined(separator: " ")
     }
 
+    /// The size the model sees: each side rounded up to a multiple of `pad`.
+    func padded(width: Int, height: Int) -> FrameSize {
+        guard pad > 1 else { return FrameSize(width: width, height: height) }
+        return FrameSize(
+            width: (width + pad - 1) / pad * pad,
+            height: (height + pad - 1) / pad * pad
+        )
+    }
+
     func shapeError(width: Int, height: Int) -> String? {
-        if width >= widthMin && width <= widthMax && height >= heightMin && height <= heightMax {
+        let size = padded(width: width, height: height)
+        let note = size.width != width || size.height != height
+            ? " (aufgefüllt \(size.width)×\(size.height))" : ""
+        if !sizes.isEmpty {
+            if sizes.contains(size) { return nil }
+            let list = sizes.map { "\($0.width)×\($0.height)" }.joined(separator: ", ")
+            return "Dieses Paket kennt nur die Eingangsgrößen \(list). Der Film ist \(width)×\(height)\(note)."
+        }
+        if size.width >= widthMin && size.width <= widthMax && size.height >= heightMin && size.height <= heightMax {
             return nil
         }
-        return "Dieses Paket erwartet Breite \(widthMin)–\(widthMax) und Höhe \(heightMin)–\(heightMax). Der Film ist \(width)×\(height)."
+        return "Dieses Paket erwartet Breite \(widthMin)–\(widthMax) und Höhe \(heightMin)–\(heightMax). Der Film ist \(width)×\(height)\(note)."
     }
 
     static func read(_ model: MLModel) throws -> PackageInfo {
@@ -75,6 +102,13 @@ nonisolated struct PackageInfo {
         let inputName = inputs["frames"] != nil ? "frames" : (inputs.keys.first ?? "frames")
         let outputName = outputs["image"] != nil ? "image" : (outputs.keys.first ?? "image")
         let prefer = Compute.parse(meta["whoodeo.bench.prefer"] ?? "") ?? .gpu
+        // "428x240,640x360": width x height.
+        let sizes: [FrameSize] = (meta["whoodeo.sizes"] ?? "").split(separator: ",").compactMap { part in
+            let sides = part.split(separator: "x")
+            guard sides.count == 2, let width = Int(sides[0]), let height = Int(sides[1]) else { return nil }
+            return FrameSize(width: width, height: height)
+        }
+        let inputType = inputs[inputName]?.multiArrayConstraint?.dataType ?? .float32
         return PackageInfo(
             arch: arch,
             blocks: Int(meta["whoodeo.blocks"] ?? "") ?? 0,
@@ -91,7 +125,10 @@ nonisolated struct PackageInfo {
             heightMax: Int(meta["whoodeo.height_max"] ?? "") ?? 8192,
             prefer: prefer,
             inputName: inputName,
-            outputName: outputName
+            outputName: outputName,
+            sizes: sizes,
+            pad: max(Int(meta["whoodeo.pad"] ?? "") ?? 1, 1),
+            inputType: inputType == .float16 ? .float16 : .float32
         )
     }
 }
@@ -133,8 +170,16 @@ nonisolated final class Predictor {
         guard stack.count == count else {
             throw CLIError("Stapel hat \(stack.count) Werte, erwartet \(count)")
         }
-        let array = try inputBuffer(channels: channels, height: height, width: width)
-        Self.write(stack, into: array)
+        let size = info.padded(width: width, height: height)
+        let input = size.width == width && size.height == height
+            ? stack
+            : Self.pad(stack, channels: channels, width: width, height: height, to: size)
+        let array = try inputBuffer(channels: channels, height: size.height, width: size.width)
+        if array.dataType == .float16 {
+            Self.write16(input, into: array)
+        } else {
+            Self.write(input, into: array)
+        }
         let features = try MLDictionaryFeatureProvider(dictionary: [
             info.inputName: MLFeatureValue(multiArray: array),
         ])
@@ -144,19 +189,82 @@ nonisolated final class Predictor {
         guard let output = result.featureValue(for: info.outputName)?.multiArrayValue else {
             throw CLIError("keine Ausgabe \(info.outputName)")
         }
-        guard output.dataType == .float32 else {
-            throw CLIError("Ausgabe ist nicht float32")
+        let values: [Float]
+        let outH: Int
+        let outW: Int
+        switch output.dataType {
+        case .float32:
+            (values, outH, outW) = Self.read(output, as: Float.self)
+        case .float16:
+            (values, outH, outW) = Self.read(output, as: Float16.self)
+        default:
+            throw CLIError("Ausgabe ist weder float32 noch float16")
         }
-        let (values, outH, outW) = Self.read(output)
+        if outW == size.width * info.scale && outH == size.height * info.scale
+            && (size.width != width || size.height != height) {
+            let cropW = width * info.scale
+            let cropH = height * info.scale
+            return Prediction(
+                image: Self.crop(values, width: outW, height: outH, to: FrameSize(width: cropW, height: cropH)),
+                width: cropW,
+                height: cropH,
+                milliseconds: milliseconds
+            )
+        }
         return Prediction(image: values, width: outW, height: outH, milliseconds: milliseconds)
+    }
+
+    /// Planar channels padded on the bottom and the right, as whoodeo's pad_to:
+    /// reflect when the frame is larger than the pad, replicate otherwise.
+    static func pad(_ values: [Float], channels: Int, width: Int, height: Int, to size: FrameSize) -> [Float] {
+        let padW = size.width - width
+        let padH = size.height - height
+        let reflect = height > padH && width > padW
+        func source(_ index: Int, _ count: Int) -> Int {
+            if index < count { return index }
+            return reflect ? 2 * (count - 1) - index : count - 1
+        }
+        let columns = (0..<size.width).map { source($0, width) }
+        var out = [Float](repeating: 0, count: channels * size.width * size.height)
+        values.withUnsafeBufferPointer { from in
+            out.withUnsafeMutableBufferPointer { to in
+                for c in 0..<channels {
+                    for y in 0..<size.height {
+                        let row = (c * height + source(y, height)) * width
+                        let dest = (c * size.height + y) * size.width
+                        to.baseAddress!.advanced(by: dest).update(from: from.baseAddress!.advanced(by: row), count: width)
+                        for x in width..<size.width {
+                            to[dest + x] = from[row + columns[x]]
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// The top left `size` of planar RGB.
+    static func crop(_ values: [Float], width: Int, height: Int, to size: FrameSize) -> [Float] {
+        var out = [Float](repeating: 0, count: 3 * size.width * size.height)
+        values.withUnsafeBufferPointer { from in
+            out.withUnsafeMutableBufferPointer { to in
+                for c in 0..<3 {
+                    for y in 0..<size.height {
+                        to.baseAddress!.advanced(by: (c * size.height + y) * size.width)
+                            .update(from: from.baseAddress!.advanced(by: (c * height + y) * width), count: size.width)
+                    }
+                }
+            }
+        }
+        return out
     }
 
     private func inputBuffer(channels: Int, height: Int, width: Int) throws -> MLMultiArray {
         let shape: [NSNumber] = [1, channels as NSNumber, height as NSNumber, width as NSNumber]
-        if let inputArray, inputArray.shape == shape, inputArray.dataType == .float32 {
+        if let inputArray, inputArray.shape == shape, inputArray.dataType == info.inputType {
             return inputArray
         }
-        let array = try MLMultiArray(shape: shape, dataType: .float32)
+        let array = try MLMultiArray(shape: shape, dataType: info.inputType)
         inputArray = array
         return array
     }
@@ -210,7 +318,29 @@ nonisolated final class Predictor {
         }
     }
 
-    private static func read(_ array: MLMultiArray) -> ([Float], Int, Int) {
+    /// fp16 input, element by element along the array's strides.
+    private static func write16(_ values: [Float], into array: MLMultiArray) {
+        let shape = array.shape.map(\.intValue)
+        let strides = array.strides.map(\.intValue)
+        guard shape.count == 4, values.count == array.count else { return }
+        let pointer = array.dataPointer.bindMemory(to: Float16.self, capacity: array.count)
+        let channels = shape[1]
+        let height = shape[2]
+        let width = shape[3]
+        values.withUnsafeBufferPointer { source in
+            for c in 0..<channels {
+                for y in 0..<height {
+                    let from = (c * height + y) * width
+                    let to = c * strides[1] + y * strides[2]
+                    for x in 0..<width {
+                        pointer[to + x * strides[3]] = Float16(source[from + x])
+                    }
+                }
+            }
+        }
+    }
+
+    private static func read<T: BinaryFloatingPoint>(_ array: MLMultiArray, as _: T.Type) -> ([Float], Int, Int) {
         let shape = array.shape.map(\.intValue)
         let channels: Int
         let height: Int
@@ -231,17 +361,18 @@ nonisolated final class Predictor {
         guard count > 0 else { return (values, height, width) }
         values.withUnsafeMutableBufferPointer { dest in
             guard let base = dest.baseAddress else { return }
-            if packed(array), array.count == count {
+            if T.self == Float.self, packed(array), array.count == count {
                 base.update(from: array.dataPointer.bindMemory(to: Float.self, capacity: count), count: count)
                 return
             }
             let strides = array.strides.map(\.intValue)
             let offset = shape.count - 3
-            let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
-            if strides[offset + 2] == 1 {
+            let pointer = array.dataPointer.bindMemory(to: T.self, capacity: array.count)
+            if T.self == Float.self, strides[offset + 2] == 1 {
+                let floats = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
                 for c in 0..<channels {
                     for y in 0..<height {
-                        let from = pointer.advanced(by: c * strides[offset] + y * strides[offset + 1])
+                        let from = floats.advanced(by: c * strides[offset] + y * strides[offset + 1])
                         base.advanced(by: (c * height + y) * width).update(from: from, count: width)
                     }
                 }
@@ -250,7 +381,7 @@ nonisolated final class Predictor {
                     for y in 0..<height {
                         for x in 0..<width {
                             let index = c * strides[offset] + y * strides[offset + 1] + x * strides[offset + 2]
-                            base[(c * height + y) * width + x] = pointer[index]
+                            base[(c * height + y) * width + x] = Float(pointer[index])
                         }
                     }
                 }
