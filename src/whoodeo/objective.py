@@ -172,10 +172,10 @@ class Objective:
 
 
 def raw_scalars(prefix, raw, layer_raw):
-    """<prefix>/raw/<term> and <prefix>/raw/vgg_<layer>, the unweighted values."""
-    found = {f"{prefix}/raw/{name}": _number(value) for name, value in raw.items()}
+    """<prefix>_raw/<term> and <prefix>_raw/vgg_<layer>, the unweighted values."""
+    found = {f"{prefix}_raw/{name}": _number(value) for name, value in raw.items()}
     for name, value in layer_raw.items():
-        found[f"{prefix}/raw/vgg_{name}"] = _number(value)
+        found[f"{prefix}_raw/vgg_{name}"] = _number(value)
     return found
 
 

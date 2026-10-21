@@ -44,6 +44,11 @@ def load_checkpoint(path, device):
             f"{path}: a {spec.architecture['arch']} checkpoint reconstructs frames. "
             "whoodeo-apply upscales video"
         )
+    if spec.architecture.get("arch") == "latent_up":
+        raise SystemExit(
+            f"{path}: a latent_up checkpoint predicts a vae2 code. "
+            "whoodeo-apply does not decode it yet"
+        )
     return build_generator(spec, device)
 
 

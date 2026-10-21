@@ -24,7 +24,7 @@ decoder convolution, times the term's weight. That term stays out of the
 validation objective. freeze_encoder: true trains the decoder alone, for a
 fine-tune from a vae2 checkpoint. A vae2 validation also stores the latent
 shift and scale per channel in the model and logs the mean scale as
-val/latent/scale. The mean shift is val/latent/mu_mean.
+val_latent/scale. The mean shift is val_latent/mu_mean.
 
 latent_noise: {tau: t} perturbs the vae2 latent in training, encoder and
 decoder together, also with freeze_encoder. Each frame adds s * std_c * N(0, 1)
@@ -36,9 +36,9 @@ factors k per step, decodes the k x k average-pooled latent, and compares it
 with the k x k average-pooled frame under the pixel, color, and VGG weights of
 the objective, times its weight.
 
-Each vae2 validation also logs val/noise_psnr_<s> for s 0.1, 0.3, 0.5: the PSNR
+Each vae2 validation also logs val_noise/psnr_<s> for s 0.1, 0.3, 0.5: the PSNR
 of decode(μ + s * std_c * N(0, 1)) with a fixed seed, std_c the std of the
-validation μ per channel. val/scale_eq_psnr decodes the 2 x 2 pooled μ against
+validation μ per channel. val_noise/scale_eq_psnr decodes the 2 x 2 pooled μ against
 the 2 x 2 pooled frame. `python -m whoodeo.eval_latent <checkpoint>` computes
 the same numbers for a saved checkpoint.
 
@@ -50,10 +50,19 @@ The step copies a batch onto the device. Validation reads on the main thread.
 The loss is the sum of weight * raw over the terms in the file. A weight
 is a multiplier, not a share, and nothing is calibrated on the network.
 vgg weighs each of its layers. A vae adds beta times the KL, a gan term
-adds as above. TensorBoard has each weighted term under train/ and val/,
-and the raw values under train/raw/ and val/raw/, vgg as raw/vgg_<layer>.
-val/psnr is the mean PSNR of the clamped output over the validation frames,
-comparable across loss weights.
+adds as above.
+
+TensorBoard groups tags by their first segment, so the headline numbers sit
+in train/ and val/ and the details in groups of their own:
+train/loss, train/lr, and the weighted terms (train/pixel, train/vgg, ...);
+val/loss, val/psnr, and the weighted terms on the validation frames;
+train_raw/ and val_raw/ the unweighted terms, vgg as vgg_<layer>, the KL as
+kl, and for vae2 train_raw/mu_l2, scale_eq, scale_eq_factor, gan, and
+gan_weight; train_latent/ and val_latent/ the latent statistics, with the
+val_latent/mu histogram and the val_latent/channels table; val_noise/ the
+vae2 robustness PSNRs; val_ref/ the latent_up reference PSNRs; and for vote
+train_neighbor/ and val_neighbor/. val/psnr is the mean PSNR of the clamped
+output over the validation frames, comparable across loss weights.
 
 schedule chooses how lr moves. Left out, it is const: lr stays put. steps,
 at the top of the file or under schedule, stops const and plateau after
@@ -81,19 +90,39 @@ file. train.pt is the step, the optimizers, the discriminator, and the loss
 recipe. latest in the run points at the newest of
 those directories, and latest in the runs directory follows the newest
 checkpoint written. The run directory also gets a TensorBoard event file for the losses.
-The vote model adds neighbor/weight and neighbor/grad on each step, and
-neighbor/image when validation runs. weight and grad cover every kernel
-in the shared vote. A vae adds train/kl and val/kl. The step loss includes
+The vote model adds train_neighbor/weight and train_neighbor/grad on each
+step, and val_neighbor/image when validation runs. weight and grad cover every kernel
+in the shared vote. A vae adds train_raw/kl and val_raw/kl. The step loss includes
 beta times that KL. The validation loss the plateau reads is the sum of the
-weighted terms, without the KL and without the gan term. It also records latent/mu_mean, latent/mu_std, latent/sigma_mean
-and latent/spread for the batch, the same four on the validation set, and the
-channel summaries latent/active and latent/kl_min. active counts the channels
+weighted terms, without the KL and without the gan term. It also records train_latent/mu_mean, mu_std, sigma_mean
+and spread for the batch, the same four under val_latent/ for the validation
+set, and the channel summaries active and kl_min. active counts the channels
 whose μ varies with std above 0.1, kl_min is the KL of the weakest channel.
 Each validation also writes the per-channel table (μ std, σ mean, KL) to the
-text tab as latent/channels. spread is the square root of
+text tab as val_latent/channels. spread is the square root of
 var(μ) + mean(σ²) and sits near 1 when the code matches the unit Gaussian.
-The validation histogram is latent/mu.
+The validation histogram is val_latent/mu.
 whoodeo-board serves every run.
+
+`arch: latent_up` reads the same low and master pairs as the upscalers and
+predicts the normalized code z = (μ - shift) * scale of a frozen vae2 at 1/4
+of the low frame, which is the vae2 latent of the 2x master. `vae` under
+model: names that vae2, a run directory (its latest checkpoint) or a
+checkpoint; the config stores the checkpoint it resolved to, so a resume
+decodes with the same one. The vae2 stays in eval mode with no gradient on
+its weights and no latent noise. Each step encodes the master with it under
+no_grad for the target code. The `latent` term is L1 between the predicted
+and that target code. The pixel, vgg, and color terms compare
+decode(z / scale + shift), cut to the master size, with the master, and their
+gradient runs through the frozen decoder into z. The step skips the decode
+when no image term is set and the live page is off. train_raw/latent and
+val_raw/latent are logged in every case. The first validation of a
+process also logs three references on the same frames, val_ref/bicubic_psnr, val_ref/bilinear_psnr, and
+val_ref/vae_psnr, the vae2 roundtrip decode(encode(master)), which is
+the ceiling of this decoder. The live page shows low (bicubic 2x), upscale,
+and master. init_from_vae: true starts the last blocks at 1/4 and the head
+from the vae2 encoder, the head with shift and scale folded in, on a fresh
+run only.
 
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss weights, and the Adam state. The schedule comes from the
@@ -125,9 +154,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, runs_root
-from whoodeo.checkpoint import continue_run, load_generator, load_resume, run_directory, save_run
+from whoodeo.checkpoint import (
+    build_generator, continue_run, load_generator, load_resume, run_directory, save_run,
+)
 from whoodeo.config import (
-    VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
+    LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
     load_config, restore_plateau, shape_text,
 )
 from whoodeo.films import (
@@ -138,6 +169,8 @@ from whoodeo.live import add_live_args, open_live
 from whoodeo.models import build_model
 from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
+from whoodeo.models.latent_up import FACTOR as LATENT_FACTOR
+from whoodeo.models.latent_up import init_from_vae
 from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
 from whoodeo.objective import Objective, color_loss, pixel_loss, raw_scalars
 from whoodeo.video import png_bytes, rgb_image
@@ -311,9 +344,9 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, us
         if value is not None:
             writer.add_scalar(tag, value, step)
 
-    emit("loss/train", train_loss)
-    emit("loss/val", val_loss)
-    emit("lr", lr)
+    emit("train/loss", train_loss)
+    emit("val/loss", val_loss)
+    emit("train/lr", lr)
     for prefix, parts in (("train", train_parts), ("val", val_parts)):
         if parts is None:
             continue
@@ -323,9 +356,9 @@ def write_scalars(writer, step, train_loss, val_loss, train_parts, val_parts, us
         emit(f"{prefix}/gan", gan)
         emit(f"{prefix}/d", d_loss)
     if usage is not None:
-        emit("neighbor/weight", usage.get("weight"))
-        emit("neighbor/grad", usage.get("grad"))
-    emit("neighbor/image", neighbor_image)
+        emit("train_neighbor/weight", usage.get("weight"))
+        emit("train_neighbor/grad", usage.get("grad"))
+    emit("val_neighbor/image", neighbor_image)
     if extras:
         for tag, value in extras.items():
             emit(tag, value)
@@ -393,6 +426,9 @@ def describe_loss(cfg, objective):
         if term.name == "mu_l2":
             print(f"  mu_l2  weight {term.weight:g}  step only", flush=True)
             continue
+        if term.name == "latent":
+            print(f"  latent l1 on the normalized code  weight {term.weight:g}", flush=True)
+            continue
         if term.name == "scale_eq":
             factors = "/".join(str(k) for k in term.factors)
             print(f"  scale_eq factors {factors}  weight {term.weight:g}  step only", flush=True)
@@ -441,7 +477,7 @@ def psnr_sum(pred, target):
     return (-10.0 * torch.log10(error.clamp_min(1e-10))).sum().item()
 
 
-# Noise levels of val/noise_psnr_<s>, in units of the per-channel std of μ.
+# Noise levels of val_noise/psnr_<s>, in units of the per-channel std of μ.
 NOISE_LEVELS = (0.1, 0.3, 0.5)
 NOISE_SEED = 1234
 
@@ -462,7 +498,7 @@ def pooled_pair(model, image, latent, k):
 
 
 def robustness(model, mus, images, std):
-    """val/noise_psnr_<s> and val/scale_eq_psnr over the validation frames.
+    """val_noise/psnr_<s> and val_noise/scale_eq_psnr over the validation frames.
 
     `mus` and `images` are the batches of one validation, μ on the device and the
     frames on the CPU. `std` is the per-channel std of μ. The noise has a fixed seed.
@@ -471,8 +507,8 @@ def robustness(model, mus, images, std):
     generator = torch.Generator(device=device)
     generator.manual_seed(NOISE_SEED)
     scale = torch.as_tensor(std, dtype=mus[0].dtype, device=device).view(1, -1, 1, 1)
-    sums = {f"val/noise_psnr_{level:g}": 0.0 for level in NOISE_LEVELS}
-    sums["val/scale_eq_psnr"] = 0.0
+    sums = {f"val_noise/psnr_{level:g}": 0.0 for level in NOISE_LEVELS}
+    sums["val_noise/scale_eq_psnr"] = 0.0
     count = 0
     pooled_count = 0
     with torch.no_grad():
@@ -482,15 +518,15 @@ def robustness(model, mus, images, std):
             for level in NOISE_LEVELS:
                 eps = torch.randn(mu.shape, device=device, dtype=mu.dtype, generator=generator)
                 recon = model.decode(mu + level * scale * eps)[:, :, :height, :width]
-                sums[f"val/noise_psnr_{level:g}"] += psnr_sum(recon, image)
+                sums[f"val_noise/psnr_{level:g}"] += psnr_sum(recon, image)
             recon, frame = pooled_pair(model, image, mu, 2)
             if recon is not None:
-                sums["val/scale_eq_psnr"] += psnr_sum(recon, frame)
+                sums["val_noise/scale_eq_psnr"] += psnr_sum(recon, frame)
                 pooled_count += image.shape[0]
             count += image.shape[0]
-    found = {tag: value / count for tag, value in sums.items() if tag != "val/scale_eq_psnr"}
+    found = {tag: value / count for tag, value in sums.items() if tag != "val_noise/scale_eq_psnr"}
     if pooled_count:
-        found["val/scale_eq_psnr"] = sums["val/scale_eq_psnr"] / pooled_count
+        found["val_noise/scale_eq_psnr"] = sums["val_noise/scale_eq_psnr"] / pooled_count
     return found
 
 
@@ -540,7 +576,7 @@ def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, di
 
     With image_dir set, each sample is written under image_dir/<index>/.
     Then the neighbor image effect, or None when the model has no vote, and
-    the raw term means as val/raw/ tags beside val/psnr.
+    the raw term means as val_raw/ tags beside val/psnr.
     """
     model.eval()
     disc_training = discriminator is not None and discriminator.training
@@ -843,6 +879,8 @@ class Run:
     discriminator: torch.nn.Module | None
     disc_optimizer: torch.optim.Optimizer | None
     gan: object
+    # The generator weights came from --resume or --model.
+    loaded: bool = False
 
     def apply_rate(self, at_step):
         rate = learning_rate(self.cfg, at_step, self.plateau)
@@ -982,6 +1020,7 @@ def open_run(cfg, resume, finetune, load):
     run = Run(
         cfg, out_dir, device, rng, model, optimizer, start_step, plateau, plateau_note,
         train_state, films, discriminator, disc_optimizer, gan,
+        loaded=generator is not None,
     )
     run.apply_rate(start_step)
     return run
@@ -1047,22 +1086,22 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
             if val_extras:
                 extras.update(val_extras)
             if train_kl is not None:
-                extras["train/kl"] = train_kl
+                extras["train_raw/kl"] = train_kl
             if val_kl is not None:
-                extras["val/kl"] = val_kl
+                extras["val_raw/kl"] = val_kl
             if train_latent is not None:
-                extras.update(latent_scalars(train_latent, ""))
+                extras.update(latent_scalars(train_latent, "train"))
             if val_latent is not None:
-                extras.update(latent_scalars(val_latent, "val/"))
+                extras.update(latent_scalars(val_latent, "val"))
             write_scalars(
                 writer, step, train_loss, val_loss, train_parts, val_parts, usage,
                 neighbor_image, lr, extras or None,
             )
             hist = None if val_latent is None else val_latent.get("hist")
             if hist is not None:
-                writer.add_histogram("latent/mu", hist, step)
+                writer.add_histogram("val_latent/mu", hist, step)
             if val_latent is not None:
-                writer.add_text("latent/channels", latent_table(val_latent), step)
+                writer.add_text("val_latent/channels", latent_table(val_latent), step)
             if hist is not None or val_latent is not None:
                 writer.flush()
             if val_loss is None:
@@ -1078,16 +1117,18 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                     message += f"  grad {usage['grad']:.4f}"
             if val_extras and "val/color" in val_extras:
                 message += f"  color {val_extras['val/color']:.6f}"
+            if val_extras and "val_raw/latent" in val_extras:
+                message += f"  latent {val_extras['val_raw/latent']:.5f}"
             if val_extras and "val/psnr" in val_extras:
                 message += f"  psnr {val_extras['val/psnr']:.2f}"
-            if val_extras and "val/noise_psnr_0.3" in val_extras:
+            if val_extras and "val_noise/psnr_0.3" in val_extras:
                 message += (
                     "  noise " + "/".join(
-                        f"{val_extras[f'val/noise_psnr_{level:g}']:.2f}" for level in NOISE_LEVELS
+                        f"{val_extras[f'val_noise/psnr_{level:g}']:.2f}" for level in NOISE_LEVELS
                     )
                 )
-            if val_extras and "val/scale_eq_psnr" in val_extras:
-                message += f"  pooled {val_extras['val/scale_eq_psnr']:.2f}"
+            if val_extras and "val_noise/scale_eq_psnr" in val_extras:
+                message += f"  pooled {val_extras['val_noise/scale_eq_psnr']:.2f}"
             if val_kl is not None:
                 message += f"  kl {val_kl:.6f}"
             if val_latent is not None:
@@ -1191,8 +1232,10 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                 )
                 if "train/color" in train_extras:
                     line += f"  color {train_extras['train/color']:.6f}"
-                if "train/gan_weight" in train_extras:
-                    line += f"  gan_weight {train_extras['train/gan_weight']:.4g}"
+                if "train_raw/latent" in train_extras:
+                    line += f"  latent {train_extras['train_raw/latent']:.5f}"
+                if "train_raw/gan_weight" in train_extras:
+                    line += f"  gan_weight {train_extras['train_raw/gan_weight']:.4g}"
                 if "train/scale_eq" in train_extras:
                     line += f"  scale_eq {train_extras['train/scale_eq']:.6f}"
                 if "train/mu_l2" in train_extras:
@@ -1349,7 +1392,7 @@ def vae_hooks(run):
             weighted = mu_l2.weight * value
             added = weighted
             extras["train/mu_l2"] = weighted.item()
-            extras["train/raw/mu_l2"] = value.item()
+            extras["train_raw/mu_l2"] = value.item()
         if scale_eq is not None:
             k = eq_rng.choice(scale_eq.factors)
             recon, frame = pooled_pair(run.model, image, run.model.code, k)
@@ -1359,8 +1402,8 @@ def vae_hooks(run):
                 weighted = scale_eq.weight * value
                 added = weighted if added is None else added + weighted
                 extras["train/scale_eq"] = weighted.item()
-                extras["train/raw/scale_eq"] = value.item()
-                extras["train/scale_eq_factor"] = float(k)
+                extras["train_raw/scale_eq"] = value.item()
+                extras["train_raw/scale_eq_factor"] = float(k)
         return added, extras
 
     def make_val_specs():
@@ -1400,8 +1443,8 @@ def vae_hooks(run):
         )
         added = weight * gan_loss
         return d_loss.item(), added, added.item(), {
-            "train/gan_weight": float(weight),
-            "train/gan_raw": gan_loss.item(),
+            "train_raw/gan_weight": float(weight),
+            "train_raw/gan": gan_loss.item(),
         }
 
     def one_step(loader, objective, show):
@@ -1444,9 +1487,209 @@ def vae_hooks(run):
                 [row[3] for row in channels], [row[0] for row in channels],
             )
             extras = dict(result.extras or {})
-            extras["val/latent/scale"] = float(run.model.latent_scale.mean())
+            extras["val_latent/scale"] = float(run.model.latent_scale.mean())
             result.extras = extras
         return result
+
+    return make_val_specs, make_loader, one_step, evaluate_split
+
+
+def load_frozen_vae(cfg, device):
+    """The vae2 that latent_up decodes with, in eval mode, its weights frozen."""
+    spec = load_generator(cfg.vae)
+    arch = spec.architecture.get("arch")
+    if arch != "vae2":
+        raise SystemExit(f"{spec.path}: latent_up decodes with a vae2, not {arch}")
+    vae, label, _frames, step, path = build_generator(spec, device)
+    if vae.factor != 2 * LATENT_FACTOR:
+        raise SystemExit(
+            f"{path}: vae2 factor {vae.factor}, latent_up needs {2 * LATENT_FACTOR} "
+            f"(its own {LATENT_FACTOR} times the 2x scale)"
+        )
+    if vae.latent != cfg.latent:
+        raise SystemExit(f"{path}: vae2 has {vae.latent} latent channels, the config says {cfg.latent}")
+    if (
+        bool((vae.latent_scale == 1).all()) and bool((vae.latent_shift == 0).all())
+    ):
+        raise SystemExit(f"{path}: the vae2 has no latent shift and scale yet, validate it once")
+    vae.eval()
+    vae.noise_tau = 0.0
+    for parameter in vae.parameters():
+        parameter.requires_grad_(False)
+    print(f"vae {path}  step {step}  {label}  frozen", flush=True)
+    print(
+        f"vae latent shift {float(vae.latent_shift.mean()):+.3f} mean  "
+        f"scale {float(vae.latent_scale.min()):.3f}..{float(vae.latent_scale.max()):.3f}",
+        flush=True,
+    )
+    return vae
+
+
+def latent_hooks(run):
+    """Low frames in, the frozen vae2 code of the master as the target.
+
+    The image terms compare the decoded code with the master. The first
+    validation of the process adds the bicubic, bilinear, and vae2 roundtrip
+    PSNR of the same frames.
+    """
+    cfg = run.cfg
+    films = run.films
+    rng = run.rng
+    device = run.device
+    vae = load_frozen_vae(cfg, device)
+    if cfg.init_from_vae:
+        if run.loaded:
+            print("init_from_vae skipped: the weights come from a checkpoint", flush=True)
+        else:
+            print(init_from_vae(run.model, vae), flush=True)
+    shift = vae.latent_shift.view(1, -1, 1, 1)
+    scale = vae.latent_scale.view(1, -1, 1, 1)
+    need_image = any(cfg.term(name) is not None for name in ("pixel", "vgg", "color"))
+    pending = {"baselines": True}
+
+    def target_code(high):
+        """(μ - shift) * scale of the master, no gradient."""
+        with torch.no_grad():
+            padded, _height, _width = pad_to(high, vae.factor)
+            mu, _logvar = vae.encode(padded)
+            return (mu - shift) * scale, mu
+
+    def decode(code, height, width):
+        return vae.decode(code / scale + shift)[:, :, :height, :width]
+
+    def predict(low, high):
+        code = run.model(low)
+        target, mu = target_code(high)
+        if code.shape != target.shape:
+            raise SystemExit(
+                f"code {tuple(code.shape)} does not match the vae2 code {tuple(target.shape)} "
+                f"of a {high.shape[-1]}x{high.shape[-2]} master"
+            )
+        return code, target, mu
+
+    def bicubic(low):
+        return F.interpolate(low, scale_factor=2, mode="bicubic", align_corners=False).clamp(0, 1)
+
+    def terms(objective, code, target, pred, high):
+        raw = {"latent": F.l1_loss(code, target)}
+        layer_raw = {}
+        if need_image:
+            image_raw, layer_raw = raw_terms(objective, cfg, pred, high, None, None)
+            raw.update(image_raw)
+        return raw, layer_raw
+
+    def make_val_specs():
+        specs = []
+        while len(specs) < cfg.val_count:
+            need = min(cfg.batch, cfg.val_count - len(specs))
+            specs.extend(make_batch_specs(rng, films, "val", need))
+        return specs
+
+    def make_loader():
+        def produce():
+            specs = make_batch_specs(rng, films, "train", cfg.batch)
+            film_index, variant_index, _index = specs[0]
+            variant = films[film_index].variants[variant_index]
+            low, high = batch_from_specs(films, specs, 0)
+            return PreparedBatch(low, high, variant.low.width, variant.low.height, None)
+
+        return BatchLoader(produce)
+
+    def one_step(loader, objective, show):
+        prepared = loader.get()
+        low = prepared.low.to(device)
+        high = prepared.high.to(device)
+        height, width = high.shape[-2:]
+        code, target, _mu = predict(low, high)
+        pred = None
+        if need_image:
+            pred = decode(code, height, width)
+        elif show:
+            with torch.no_grad():
+                pred = decode(code, height, width)
+        raw, layer_raw = terms(objective, code, target, pred, high)
+        if cfg.term("latent") is None:
+            raw["latent"] = raw["latent"].detach()
+        images = None
+        if show:
+            images = {
+                "low": bicubic(low[:1])[0],
+                "upscale": pred[0].detach(),
+                "master": high[0],
+            }
+        extras = {"train_latent/z_std": float(code.detach().std())}
+        return StepOut(
+            raw, layer_raw, None, images, prepared.width, prepared.height, extras=extras,
+        )
+
+    def evaluate_split(objective, specs, image_dir, step):
+        started = time.perf_counter()
+        run.model.eval()
+        baselines = pending["baselines"]
+        loss_acc = 0.0
+        weighted_acc = {}
+        raw_acc = {}
+        z_std_acc = 0.0
+        count = 0
+        saved = 0
+        digits = max(2, len(str(max(len(specs) - 1, 0))))
+        with torch.no_grad():
+            for start in range(0, len(specs), cfg.batch):
+                chunk = specs[start:start + cfg.batch]
+                low, high = batch_on_device(films, chunk, 0, device)
+                height, width = high.shape[-2:]
+                code, target, mu = predict(low, high)
+                pred = decode(code, height, width)
+                raw, layer_raw = terms(objective, code, target, pred, high)
+                total, weighted = objective.combine(raw, layer_raw)
+                frames = len(chunk)
+                loss_acc += total.item() * frames
+                for name, value in weighted.items():
+                    weighted_acc[name] = weighted_acc.get(name, 0.0) + value.item() * frames
+                add_raw(raw_acc, "val", raw, layer_raw, frames)
+                raw_acc["val/psnr"] = raw_acc.get("val/psnr", 0.0) + psnr_sum(pred, high)
+                z_std_acc += float(code.std()) * frames
+                roundtrip = None
+                if baselines:
+                    roundtrip = vae.decode(mu)[:, :, :height, :width]
+                    for tag, image in (
+                        ("val_ref/bicubic_psnr", bicubic(low)),
+                        ("val_ref/bilinear_psnr", F.interpolate(
+                            low, scale_factor=2, mode="bilinear", align_corners=False,
+                        )),
+                        ("val_ref/vae_psnr", roundtrip),
+                    ):
+                        raw_acc[tag] = raw_acc.get(tag, 0.0) + psnr_sum(image, high)
+                if image_dir is not None:
+                    for offset in range(frames):
+                        save_val_images(
+                            image_dir, step, saved + offset,
+                            low[offset], pred[offset], high[offset], digits,
+                        )
+                        if roundtrip is not None:
+                            folder = image_dir / f"{saved + offset:0{digits}d}"
+                            save_still(folder, "vae", roundtrip[offset])
+                    saved += frames
+                count += frames
+        run.model.train()
+        extras = {tag: value / count for tag, value in raw_acc.items()}
+        extras["val_latent/z_std"] = z_std_acc / count
+        for name, value in weighted_acc.items():
+            if name not in ("pixel", "vgg"):
+                extras[f"val/{name}"] = value / count
+        if baselines:
+            pending["baselines"] = False
+            print(
+                f"step {step:06d}  baselines on {count} val frames  psnr  "
+                f"bicubic {extras['val_ref/bicubic_psnr']:.2f}  "
+                f"bilinear {extras['val_ref/bilinear_psnr']:.2f}  "
+                f"vae2 roundtrip {extras['val_ref/vae_psnr']:.2f}",
+                flush=True,
+            )
+        print(f"step {step:06d}  validation {count} frames  {time.perf_counter() - started:.1f}s", flush=True)
+        pixel = weighted_acc["pixel"] / count if "pixel" in weighted_acc else None
+        vgg = weighted_acc["vgg"] / count if "vgg" in weighted_acc else None
+        return EvalResult(loss_acc / count, (pixel, vgg, None, None), None, None, None, extras)
 
     return make_val_specs, make_loader, one_step, evaluate_split
 
@@ -1477,6 +1720,11 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
             return load_vae(cfg)
 
         hooks = vae_hooks
+    elif cfg.arch == LATENT_ARCH:
+        def load():
+            return load_sr(cfg)
+
+        hooks = latent_hooks
     else:
         def load():
             return load_sr(cfg)

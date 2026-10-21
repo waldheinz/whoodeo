@@ -5,9 +5,9 @@
 The run's config.yaml gives the data, the seed, the batch, and val_count, so the
 frames are the ones that run validated on. The loss section comes from --loss,
 so runs trained under different weights compare under one loss. Prints the validation
-loss, val/psnr, val/noise_psnr_<s> for s 0.1, 0.3, 0.5 (decode of μ + s * std_c
+loss, val/psnr, val_noise/psnr_<s> for s 0.1, 0.3, 0.5 (decode of μ + s * std_c
 * N(0, 1), fixed seed, std_c the per-channel std of the validation μ),
-val/scale_eq_psnr, and the per-channel latent table.
+val_noise/scale_eq_psnr, and the per-channel latent table.
 """
 
 import argparse
@@ -66,12 +66,12 @@ def main():
     result = evaluate_vae(model, films, specs, cfg.crop, cfg.batch, device, cfg, objective)
     model.eval()
     extras = result.extras or {}
-    print(f"frames {len(specs)}  loss/val {result.loss:.6f}", flush=True)
+    print(f"frames {len(specs)}  val/loss {result.loss:.6f}", flush=True)
     for tag in sorted(extras):
         if "psnr" in tag:
             print(f"{tag} {extras[tag]:.3f}", flush=True)
     if result.kl is not None:
-        print(f"val/kl {result.kl:.6f}", flush=True)
+        print(f"val_raw/kl {result.kl:.6f}", flush=True)
     if result.latent is not None:
         print(latent_table(result.latent), flush=True)
 

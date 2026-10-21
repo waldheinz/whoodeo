@@ -197,22 +197,22 @@ ACTIVE_STD = 0.1   # std of μ across the data; var 0.01 is the usual active-uni
 
 
 def latent_scalars(report, prefix):
-    """TensorBoard tags for one tally report. `prefix` is empty or `val/`.
+    """TensorBoard tags for one tally report. `prefix` is `train` or `val`, the tags `<prefix>_latent/...`.
 
     Per channel there are only two summaries: how many channels are active,
     and the KL of the weakest one. The full table goes to `latent_table`.
     """
     channels = report["channels"]
     found = {
-        f"{prefix}latent/mu_mean": report["mu_mean"],
-        f"{prefix}latent/mu_std": report["mu_std"],
-        f"{prefix}latent/sigma_mean": report["sigma_mean"],
-        f"{prefix}latent/spread": report["spread"],
-        f"{prefix}latent/active": sum(1 for row in channels if row[0] > ACTIVE_STD),
+        f"{prefix}_latent/mu_mean": report["mu_mean"],
+        f"{prefix}_latent/mu_std": report["mu_std"],
+        f"{prefix}_latent/sigma_mean": report["sigma_mean"],
+        f"{prefix}_latent/spread": report["spread"],
+        f"{prefix}_latent/active": sum(1 for row in channels if row[0] > ACTIVE_STD),
     }
     kls = [row[2] for row in channels if row[2] is not None]
     if kls:
-        found[f"{prefix}latent/kl_min"] = min(kls)
+        found[f"{prefix}_latent/kl_min"] = min(kls)
     return found
 
 

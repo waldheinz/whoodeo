@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from whoodeo.models import PRESETS
+from whoodeo.models.latent_up import latent_layout
 from whoodeo.models.vae2 import layout, layout_text
 
 VGG_LAYERS = {
@@ -29,7 +30,7 @@ VGG_LAYERS = {
     "relu5_4": 35,
 }
 
-TERM_NAMES = ("pixel", "vgg", "gan", "color", "mu_l2", "scale_eq")
+TERM_NAMES = ("pixel", "vgg", "gan", "color", "mu_l2", "scale_eq", "latent")
 # vae2 terms that stand beside the objective: in the step loss, not in val.
 SIDE_TERMS = ("mu_l2", "scale_eq")
 SCALE_EQ_FACTORS = (2, 4)
@@ -40,6 +41,8 @@ COLOR_POOL = 8
 
 # Architectures that reconstruct a master frame through a latent.
 VAE_ARCHS = ("vae", "vae2")
+# The upscaler that predicts the code of a frozen vae2 from the low frame.
+LATENT_ARCH = "latent_up"
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,10 @@ class TrainConfig:
     # Training noise on the vae2 latent. Not part of the loss recipe, so a
     # resume may change it. 0 is off.
     latent_noise_tau: float = 0.0
+    # latent_up: the frozen vae2 checkpoint directory, resolved at load.
+    vae: str | None = None
+    # latent_up: start the 1/4 blocks and the head from the vae2 encoder.
+    init_from_vae: bool = False
 
     def arch_key(self):
         return model_key(
@@ -143,7 +150,7 @@ class TrainConfig:
             self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
             self.latent, self.factor, self.beta,
             self.encoder_blocks, self.decoder_blocks, self.widths, self.decoder_widths,
-            self.posterior,
+            self.posterior, self.vae,
         )
 
     def loss_recipe(self):
@@ -195,6 +202,13 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"vote {blocks}x{channels} stem {stem} vote {vote} "
             f"res_scale {res_scale:g}"
         )
+    elif arch == LATENT_ARCH:
+        latent, encoder_blocks, widths, vae = extra
+        text = (
+            f"{arch} {blocks}x{channels} latent {latent} "
+            f"encoder_blocks {'/'.join(str(item) for item in encoder_blocks)} "
+            f"widths {'/'.join(str(item) for item in widths)} vae {vae}"
+        )
     elif arch in VAE_ARCHS:
         latent, factor, *levels = extra
         text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
@@ -210,7 +224,7 @@ def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
     bilinear, codes, patch, res_scale, vote, latent, factor, beta,
     encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None,
+    posterior=None, vae=None,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -231,6 +245,9 @@ def model_key(
         ) + (posterior or "gaussian",)
     if arch in VAE_ARCHS:
         return key + (latent, factor)
+    if arch == LATENT_ARCH:
+        # The vae2 is the checkpoint directory the config resolved to.
+        return key + (latent,) + latent_layout(encoder_blocks, widths) + (vae,)
     return key
 
 
@@ -273,6 +290,13 @@ def architecture_dict(cfg):
             value = getattr(cfg, name)
             if value is not None:
                 item[name] = list(value)
+    elif cfg.arch == LATENT_ARCH:
+        item["latent"] = cfg.latent
+        for name in ("encoder_blocks", "widths"):
+            value = getattr(cfg, name)
+            if value is not None:
+                item[name] = list(value)
+        item["vae"] = cfg.vae
     return item
 
 
@@ -305,7 +329,7 @@ def load_config(path, architecture=None, architecture_from=None):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae,
     ) = _take_model(
         data, where, architecture, architecture_from,
     )
@@ -322,6 +346,7 @@ def load_config(path, architecture=None, architecture_from=None):
     variants = _take_variants(data, where)
     crop = _take_crop(data, where)
     freeze_encoder = _take_flag(data, "freeze_encoder", where)
+    init_from_vae = _take_flag(data, "init_from_vae", where)
     latent_noise_tau = _take_latent_noise(data, where, arch)
     terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
@@ -333,8 +358,10 @@ def load_config(path, architecture=None, architecture_from=None):
             raise SystemExit(f"{where}: crop must be a multiple of factor {factor}")
     elif crop is not None:
         raise SystemExit(f"{where}: only vae and vae2 use crop")
-    if arch not in VAE_ARCHS and any(term.name == "color" for term in terms):
-        raise SystemExit(f"{where}: only vae and vae2 use a color term")
+    if arch not in (*VAE_ARCHS, LATENT_ARCH) and any(term.name == "color" for term in terms):
+        raise SystemExit(f"{where}: only vae, vae2, and latent_up use a color term")
+    if init_from_vae and arch != LATENT_ARCH:
+        raise SystemExit(f"{where}: only latent_up takes init_from_vae")
     if arch != "vae2" and any(term.start is not None for term in terms):
         raise SystemExit(f"{where}: only a vae2 gan term takes start")
     if freeze_encoder and arch != "vae2":
@@ -381,6 +408,8 @@ def load_config(path, architecture=None, architecture_from=None):
         widths=widths,
         decoder_widths=decoder_widths,
         posterior=posterior,
+        vae=vae,
+        init_from_vae=init_from_vae,
         latent_noise_tau=latent_noise_tau,
         crop=crop,
         freeze_encoder=freeze_encoder,
@@ -394,7 +423,7 @@ def _take_model(data, where, architecture, architecture_from):
         raw = data.pop("model")
         if not isinstance(raw, dict):
             raise SystemExit(f"{where}: model must be a mapping")
-        chosen = parse_model(raw, f"{where}: model")
+        chosen = _resolve_vae(parse_model(raw, f"{where}: model"), f"{where}: model")
         if architecture is not None:
             from_file = parse_model(architecture, f"{source}: architecture")
             if model_key(*from_file) != model_key(*chosen):
@@ -408,6 +437,24 @@ def _take_model(data, where, architecture, architecture_from):
             f"{where}: missing model. Add a model: section, or pass --model to fine-tune."
         )
     return parse_model(architecture, f"{source}: architecture")
+
+
+def _resolve_vae(parsed, where):
+    """The latent_up vae as the checkpoint directory it names now.
+
+    A run directory follows its latest link, as --model does. The saved
+    architecture keeps that directory, so a resume decodes with the same vae2.
+    """
+    *head, vae = parsed
+    if vae is None:
+        return parsed
+    from whoodeo.checkpoint import _model_file
+
+    try:
+        model_path = _model_file(Path(vae))
+    except SystemExit as exc:
+        raise SystemExit(f"{where}: vae: {exc}") from exc
+    return (*head, str(model_path.parent.resolve()))
 
 
 def parse_model(model, where):
@@ -430,7 +477,7 @@ def parse_model(model, where):
                 f"{where}: {arch} reads one master frame and does not take in_frames"
             )
         in_frames = 1
-    elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr") and "in_frames" not in model:
+    elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr", LATENT_ARCH) and "in_frames" not in model:
         in_frames = 1
     else:
         in_frames = _take_int(model, "in_frames", where, positive=True)
@@ -450,6 +497,7 @@ def parse_model(model, where):
     posterior = _take_posterior(model, arch, where)
     latent, factor, beta = _take_vae(model, arch, where, posterior)
     encoder_blocks, decoder_blocks, widths, decoder_widths = _take_levels(model, arch, factor, where)
+    vae = _take_vae_path(model, arch, where)
     vote = None
     if arch == "vote":
         stem = _take_int(model, "stem", where)
@@ -470,8 +518,22 @@ def parse_model(model, where):
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae,
     )
+
+
+def _take_vae_path(data, arch, where):
+    """The frozen vae2 of latent_up as written: a run directory, a checkpoint, or model.pt."""
+    if arch != LATENT_ARCH:
+        if "vae" in data:
+            raise SystemExit(f"{where}: only latent_up takes vae")
+        return None
+    if "vae" not in data:
+        raise SystemExit(f"{where}: latent_up needs vae, the vae2 run or checkpoint it decodes with")
+    value = data.pop("vae")
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{where}: vae must be a path")
+    return str(Path(value).expanduser())
 
 
 def _take_posterior(data, arch, where):
@@ -504,7 +566,23 @@ _LEVEL_KEYS = ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths")
 
 
 def _take_levels(data, arch, factor, where):
-    """vae2 blocks and width multiples per level, as written. None where left out."""
+    """vae2 blocks and width multiples per level, as written. None where left out.
+
+    latent_up takes encoder_blocks (low, 1/2) and widths (low, 1/2, 1/4) only.
+    """
+    if arch == LATENT_ARCH:
+        foreign = [name for name in ("decoder_blocks", "decoder_widths") if name in data]
+        if foreign:
+            raise SystemExit(f"{where}: latent_up does not use {', '.join(foreign)}")
+        encoder_blocks = data.pop("encoder_blocks", None)
+        widths = data.pop("widths", None)
+        latent_layout(encoder_blocks, widths, where=where)
+        return (
+            None if encoder_blocks is None else tuple(encoder_blocks),
+            None,
+            None if widths is None else tuple(widths),
+            None,
+        )
     if arch != "vae2":
         foreign = [name for name in _LEVEL_KEYS if name in data]
         if foreign:
@@ -544,6 +622,14 @@ def _take_vq(data, arch, where):
 
 
 def _take_vae(data, arch, where, posterior=None):
+    if arch == LATENT_ARCH:
+        foreign = [name for name in ("factor", "beta") if name in data]
+        if foreign:
+            raise SystemExit(
+                f"{where}: latent_up does not take {', '.join(foreign)}. "
+                "The factor is the vae2's over 2"
+            )
+        return _take_int(data, "latent", where, positive=True), None, None
     if arch not in VAE_ARCHS:
         foreign = [name for name in ("latent", "factor", "beta") if name in data]
         if foreign:
@@ -783,6 +869,10 @@ def _take_loss(data, where, arch=None):
         seen.add(name)
         if name in SIDE_TERMS and arch != "vae2":
             raise SystemExit(f"{label}: only vae2 takes {name}")
+        if name == "latent" and arch != LATENT_ARCH:
+            raise SystemExit(f"{label}: only latent_up takes a latent term")
+        if name == "gan" and arch == LATENT_ARCH:
+            raise SystemExit(f"{label}: latent_up does not take a gan term yet")
         if name == "vgg":
             if "weight" in raw:
                 raise SystemExit(
@@ -805,7 +895,7 @@ def _take_loss(data, where, arch=None):
                 raise SystemExit(f"{label}: unknown space {space!r}. choices: {known}")
             pool = _take_int(raw, "pool", label, positive=True, default=COLOR_POOL)
             terms.append(Term(name=name, weight=weight, space=space, pool=pool))
-        elif name == "mu_l2":
+        elif name in ("mu_l2", "latent"):
             terms.append(Term(name=name, weight=weight))
         elif name == "scale_eq":
             factors = raw.pop("factors", list(SCALE_EQ_FACTORS))

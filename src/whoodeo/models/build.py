@@ -7,13 +7,16 @@ keeps the residual stack, reads one frame, and quantizes the correction.
 `espcn` and `edsr` are the other architectures. `vote` is an EDSR trunk
 that adds a shared vote from the previous and next frame. `vae` reconstructs
 one frame through a spatial Gaussian. `vae2` does the same with tapered
-widths and no normalization, so its decoder runs on the Neural Engine. `swinir`,
+widths and no normalization, so its decoder runs on the Neural Engine.
+`latent_up` maps a low frame to the code of a frozen vae2, whose decoder
+gives the 2x picture. `swinir`,
 `swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
 reconstruction heads. The training config sets depth, width, and input frames.
 """
 
 from whoodeo.models.deform import DeformESPCN
 from whoodeo.models.edsr import EDSR
+from whoodeo.models.latent_up import LatentUp, latent_layout
 from whoodeo.models.espcn import ESPCN
 from whoodeo.models.modified import ModifiedESPCN
 from whoodeo.models.pyramid import PyramidESPCN
@@ -44,6 +47,7 @@ PRESETS = {
     "vote": {"blocks": 14, "channels": 64, "frames": 3},
     "vae": {"blocks": 4, "channels": 64, "frames": 1},
     "vae2": {"blocks": 6, "channels": 64, "frames": 1},
+    "latent_up": {"blocks": 12, "channels": 64, "frames": 1},
     "swinir": {"blocks": 6, "channels": 180, "frames": 1},
     "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
     "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
@@ -111,6 +115,10 @@ def build_model(
     elif arch == "vae":
         _check_vae(latent, factor, beta)
         model = VAE(width, depth, latent, factor, beta)
+    elif arch == "latent_up":
+        if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
+            raise SystemExit("latent must be a positive integer")
+        model = LatentUp(width, depth, latent, encoder_blocks, widths)
     elif arch == "vae2":
         _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
         model = VAE2(
@@ -147,6 +155,13 @@ def build_model(
         label = (
             f"vote {depth}x{width} stem {stem} vote {vote} "
             f"res_scale {float(res_scale):g} parameters {count}"
+        )
+    elif arch == "latent_up":
+        chosen_blocks, chosen_widths = latent_layout(encoder_blocks, widths)
+        label = (
+            f"latent_up {depth}x{width} latent {latent} "
+            f"encoder_blocks {'/'.join(str(item) for item in chosen_blocks)} "
+            f"widths {'/'.join(str(item) for item in chosen_widths)} parameters {count}"
         )
     elif arch in ("vae", "vae2"):
         levels = ""
