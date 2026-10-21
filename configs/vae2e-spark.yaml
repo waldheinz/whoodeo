@@ -54,7 +54,7 @@ model:
 # Not part of the loss recipe: a resume may change it, tau 0 is off for a
 # clean fine-tune at the end.
 latent_noise:
-  tau: 0.4
+  tau: 0.2         # vae2d had 0.4; gentler this time (21.10.2026)
 
 batch: 6          # Spark, vae2c-color: batch 6 ~72 GiB on the GPU, ~41 GB RAM left;
                   # batch 8 ~107 GiB, only ~4.5 GB left. No swap used either way.
