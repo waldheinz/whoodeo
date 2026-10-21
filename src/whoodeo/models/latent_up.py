@@ -95,3 +95,48 @@ def init_from_vae(model, vae):
         ours.to_stats.bias.copy_((head.bias - shift) * scale)
         notes.append("head from the vae2 head, shift and scale folded in")
     return "warm start: " + ", ".join(notes)
+
+
+class LatentUpExport(nn.Module):
+    """latent_up and the vae2 decoder in one graph, the frame clamped to [0, 1], for tracing.
+
+    The vae2 decoder reads μ = z / scale + shift. Both are per channel and sit
+    right behind the head, the last convolution of latent_up, so they fold
+    into its weight and bias: no extra op, and exact, since the decoder's zero
+    padding sees μ in both cases. The input must already divide by FACTOR;
+    the caller pads the bottom and the right as `pad_to` does and crops the
+    frame back to 2h x 2w.
+    """
+
+    def __init__(self, model, vae):
+        super().__init__()
+        import copy
+
+        self.encoder = copy.deepcopy(model.encoder)
+        self.decoder = copy.deepcopy(vae.decoder)
+        head = self.encoder.to_stats
+        inverse = vae.latent_scale.reciprocal().to(head.weight)
+        shift = vae.latent_shift.to(head.weight)
+        with torch.no_grad():
+            head.weight.copy_(head.weight * inverse.view(-1, 1, 1, 1))
+            head.bias.copy_(head.bias * inverse + shift)
+
+    def forward(self, frames):
+        return self.decoder(self.encoder(frames)).clamp(0, 1)
+
+
+class LatentUpReference(nn.Module):
+    """The unfolded path training takes: code, z / scale + shift, decode, crop to 2h x 2w."""
+
+    def __init__(self, model, vae):
+        super().__init__()
+        self.model = model
+        self.vae = vae
+
+    def forward(self, low):
+        height, width = low.shape[-2:]
+        code = self.model(low)
+        shift = self.vae.latent_shift.view(1, -1, 1, 1)
+        scale = self.vae.latent_scale.view(1, -1, 1, 1)
+        image = self.vae.decode(code / scale + shift, clamp=True)
+        return image[:, :, :2 * height, :2 * width]
