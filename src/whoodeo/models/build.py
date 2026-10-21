@@ -20,7 +20,7 @@ from whoodeo.models.pyramid import PyramidESPCN
 from whoodeo.models.shift import ShiftESPCN
 from whoodeo.models.swinir import SwinIR
 from whoodeo.models.vae import VAE
-from whoodeo.models.vae2 import VAE2
+from whoodeo.models.vae2 import VAE2, layout_text
 from whoodeo.models.vote import VoteEDSR
 from whoodeo.models.vq import CODES, PATCH, VQESPCN
 
@@ -54,6 +54,8 @@ def build_model(
     radius=None, stem=None, sharpness=None, reject=None, levels=None,
     bilinear=None, codes=None, patch=None, res_scale=None, vote=None,
     latent=None, factor=None, beta=None,
+    encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
+    posterior=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -110,8 +112,11 @@ def build_model(
         _check_vae(latent, factor, beta)
         model = VAE(width, depth, latent, factor, beta)
     elif arch == "vae2":
-        _check_vae(latent, factor, beta)
-        model = VAE2(width, depth, latent, factor, beta)
+        _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
+        model = VAE2(
+            width, depth, latent, factor, beta,
+            encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
+        )
     else:
         _check_edsr(res_scale)
         model = EDSR(depth, width, float(res_scale))
@@ -144,9 +149,13 @@ def build_model(
             f"res_scale {float(res_scale):g} parameters {count}"
         )
     elif arch in ("vae", "vae2"):
+        levels = ""
+        if arch == "vae2":
+            levels = layout_text(factor, encoder_blocks, decoder_blocks, widths, decoder_widths)
+        kl = "posterior fixed" if posterior == "fixed" else f"beta {float(beta):g}"
         label = (
-            f"{arch} {depth}x{width} latent {latent} factor {factor} "
-            f"beta {float(beta):g} parameters {count}"
+            f"{arch} {depth}x{width} latent {latent} factor {factor}{levels} "
+            f"{kl} parameters {count}"
         )
     else:
         label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"

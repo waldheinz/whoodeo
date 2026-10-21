@@ -1,9 +1,9 @@
-"""Pixel, VGG, color, and GAN terms, scaled so their weights are shares of the sum.
+"""Pixel, VGG, color, and GAN terms. The loss is the sum of weight * raw.
 
-The first term anchors the magnitude: its scale is 1. The other scales are
-chosen so that weight_i * raw_i lines up with that anchor. `start` freezes
-the scales after the validation pass. `running` updates them from an EMA.
-A vae2 gan term is not one of the shares. The training step weighs it.
+A weight multiplies its raw term. Nothing is normalized or calibrated, and
+the weights need not add up to anything. The VGG term weighs each layer: its
+part is the sum of layer weight * L1 on that layer. A vae2 gan term is not
+in that sum. The training step weighs it.
 """
 
 import torch
@@ -12,10 +12,6 @@ import torch.nn.functional as F
 
 from whoodeo.config import VGG_LAYERS
 
-EMA_DECAY = 0.99
-REF_FLOOR = 1e-8
-# The color term compares 1/COLOR_POOL averages on each side.
-COLOR_POOL = 8
 # BT.709 RGB to Y, Cb, Cr, one row each.
 _YCBCR = (
     (0.2126, 0.7152, 0.0722),
@@ -24,6 +20,25 @@ _YCBCR = (
 )
 # Cb and Cr count twice as much as Y: the term is there for color drift.
 _YCBCR_WEIGHT = (1.0, 2.0, 2.0)
+# Oklab (Ottosson 2020, https://bottosson.github.io/posts/oklab/): linear sRGB
+# to LMS, and the cube-rooted LMS to L, a, b.
+_OKLAB_M1 = (
+    (0.4122214708, 0.5363325363, 0.0514459929),
+    (0.2119034982, 0.6806995451, 0.1073969566),
+    (0.0883024619, 0.2817188376, 0.6299787005),
+)
+_OKLAB_M2 = (
+    (0.2104542553, 0.7936177850, -0.0040720468),
+    (1.9779984951, -2.4285922050, 0.4505937099),
+    (0.0259040371, 0.7827717662, -0.8086757660),
+)
+# a and b count twice as much as L, as Cb and Cr do: the term is there for
+# color drift. Oklab scales a and b so that a step is about as visible as the
+# same step in L. On vae2c (step 2416, 1/16 pool) the mean |dL|, |da|, |db|
+# came out about equal, 0.0079, 0.0079, 0.0093, so a and b carry 4/5 of it.
+_OKLAB_WEIGHT = (1.0, 2.0, 2.0)
+# Added under the cube root, so its slope at 0 stays finite (about 3e3).
+_OKLAB_EPS = 1e-6
 
 
 def pixel_loss(pred, high, kind):
@@ -32,28 +47,50 @@ def pixel_loss(pred, high, kind):
     return F.mse_loss(pred, high)
 
 
-def color_loss(pred, high):
-    """L1 on 1/8 average-pooled YCbCr, Cb and Cr weighted twice.
+def color_loss(pred, high, space, pool):
+    """L1 on 1/pool average-pooled color, the chroma channels weighted twice.
 
+    `space` is ycbcr or oklab. ycbcr pools the gamma sRGB frames and compares
+    BT.709 Y, Cb, Cr. oklab pools in linear light and compares Oklab L, a, b.
     Pooling first leaves texture to the other terms, so this reads the slow
-    color of flat areas. A remainder below 8 on an edge is left out.
+    color of flat areas. A remainder below `pool` on an edge is left out.
     """
-    matrix = pred.new_tensor(_YCBCR)
-    weight = pred.new_tensor(_YCBCR_WEIGHT).view(1, 3, 1, 1)
-    pooled_pred = F.avg_pool2d(pred, COLOR_POOL)
-    pooled_high = F.avg_pool2d(high, COLOR_POOL)
-    diff = torch.einsum("ij,bjhw->bihw", matrix, pooled_pred - pooled_high)
-    return (diff.abs() * weight).mean() * 3.0 / float(sum(_YCBCR_WEIGHT))
+    if space == "oklab":
+        diff = oklab(F.avg_pool2d(srgb_linear(pred), pool)) - oklab(
+            F.avg_pool2d(srgb_linear(high), pool)
+        )
+        weights = _OKLAB_WEIGHT
+    else:
+        matrix = pred.new_tensor(_YCBCR)
+        pooled = F.avg_pool2d(pred, pool) - F.avg_pool2d(high, pool)
+        diff = torch.einsum("ij,bjhw->bihw", matrix, pooled)
+        weights = _YCBCR_WEIGHT
+    weight = pred.new_tensor(weights).view(1, 3, 1, 1)
+    return (diff.abs() * weight).mean() * 3.0 / float(sum(weights))
 
 
-def scales_from_refs(names, weights, term_ref):
-    anchor = names[0]
-    anchor_weight = weights[anchor]
-    anchor_ref = term_ref[anchor]
-    return {
-        name: (weights[name] / anchor_weight) * anchor_ref / term_ref[name]
-        for name in names
-    }
+def srgb_linear(image):
+    """sRGB to linear light, the piecewise sRGB curve.
+
+    The decoder output is not clamped, so the curve is mirrored below 0 and
+    runs on above 1. A pooled block then stays right when a few of its
+    pixels overshoot, and their gradient is kept.
+    """
+    size = image.abs()
+    curve = ((size.clamp_min(0.04045) + 0.055) / 1.055) ** 2.4
+    return torch.where(size <= 0.04045, image / 12.92, torch.sign(image) * curve)
+
+
+def oklab(linear):
+    """Linear sRGB to Oklab L, a, b, one channel each.
+
+    LMS is clamped at 0 before the cube root: only a pooled block outside the
+    gamut gets there. The root is taken of LMS + eps, so the gradient at 0
+    stays finite. That lifts black to L 0.01, which a difference does not see.
+    """
+    lms = torch.einsum("ij,bjhw->bihw", linear.new_tensor(_OKLAB_M1), linear)
+    root = (lms.clamp_min(0) + _OKLAB_EPS) ** (1.0 / 3.0)
+    return torch.einsum("ij,bjhw->bihw", linear.new_tensor(_OKLAB_M2), root)
 
 
 class VGGLoss(nn.Module):
@@ -97,81 +134,52 @@ class VGGLoss(nn.Module):
 
 
 class Objective:
+    """Weights from the recipe. `combine` is the only place they apply."""
+
     def __init__(self, cfg, device):
-        shared = cfg.shared_terms()
-        self.names = tuple(term.name for term in shared)
-        self.weights = {term.name: term.weight for term in shared}
-        self.balance = cfg.balance
-        self.vgg_layers = ()
+        terms = cfg.objective_terms()
+        self.names = tuple(term.name for term in terms)
+        self.weights = {term.name: term.weight for term in terms if term.name != "vgg"}
+        self.layer_weights = {}
         self.vgg = None
         vgg = cfg.term("vgg")
         if vgg is not None:
-            self.vgg_layers = vgg.layers
-            self.vgg = VGGLoss(vgg.layers).to(device)
-        self.layer_ref = {}
-        self.term_ref = {}
-        self.scale = {}
+            self.layer_weights = dict(vgg.layers)
+            self.vgg = VGGLoss(tuple(self.layer_weights)).to(device)
 
-    def calibrate(self, layer_means, term_means):
-        for name in self.vgg_layers:
-            value = float(layer_means[name])
-            if value <= 0:
-                raise SystemExit(f"VGG {name} on the val frames is zero")
-            self.layer_ref[name] = value
-        self.term_ref = {}
-        if "vgg" in self.names:
-            self.term_ref["vgg"] = 1.0
-        for name in self.names:
-            if name == "vgg":
-                continue
-            value = float(term_means[name])
-            if value <= 0:
-                raise SystemExit(f"{name} loss on the val frames is zero")
-            self.term_ref[name] = value
-        self.scale = scales_from_refs(self.names, self.weights, self.term_ref)
+    def vgg_layers(self, pred, high):
+        """Raw L1 per VGG layer, still in the graph."""
+        return self.vgg.layer_losses(pred, high)
 
-    def vgg_raw(self, pred, high):
-        losses = self.vgg.layer_losses(pred, high)
-        detached = {name: losses[name].detach() for name in self.vgg_layers}
-        normed = [losses[name] / self.layer_ref[name] for name in self.vgg_layers]
-        return torch.stack(normed).mean(), detached
+    def combine(self, raw, layer_raw):
+        """Sum of weight * raw over the terms. vgg sums its weighted layers.
 
-    def combine(self, raw):
+        Returns the total and the weighted part of each term.
+        """
         total = None
         weighted = {}
         for name in self.names:
-            value = self.scale[name] * raw[name]
+            if name == "vgg":
+                value = sum(
+                    weight * layer_raw[layer]
+                    for layer, weight in self.layer_weights.items()
+                )
+            else:
+                value = self.weights[name] * raw[name]
             weighted[name] = value
             total = value if total is None else total + value
         return total, weighted
 
-    def observe(self, layer_raw, term_raw):
-        """Move the running references. `start` keeps the calibrated scales."""
-        if self.balance != "running":
-            return
-        for name, value in layer_raw.items():
-            self.layer_ref[name] = _ema(self.layer_ref[name], float(value))
-        for name, value in term_raw.items():
-            self.term_ref[name] = _ema(self.term_ref[name], float(value))
-        self.scale = scales_from_refs(self.names, self.weights, self.term_ref)
 
-    def state_dict(self):
-        return {
-            "layer_ref": dict(self.layer_ref),
-            "term_ref": dict(self.term_ref),
-            "scale": dict(self.scale),
-        }
-
-    def load_state_dict(self, state):
-        if set(state.get("term_ref", {})) != set(self.names) or set(state.get("scale", {})) != set(self.names):
-            raise SystemExit("checkpoint objective does not match the loss terms")
-        if set(state.get("layer_ref", {})) != set(self.vgg_layers):
-            raise SystemExit("checkpoint objective does not match the vgg layers")
-        self.layer_ref = {name: float(state["layer_ref"][name]) for name in self.vgg_layers}
-        self.term_ref = {name: float(state["term_ref"][name]) for name in self.names}
-        self.scale = {name: float(state["scale"][name]) for name in self.names}
+def raw_scalars(prefix, raw, layer_raw):
+    """<prefix>/raw/<term> and <prefix>/raw/vgg_<layer>, the unweighted values."""
+    found = {f"{prefix}/raw/{name}": _number(value) for name, value in raw.items()}
+    for name, value in layer_raw.items():
+        found[f"{prefix}/raw/vgg_{name}"] = _number(value)
+    return found
 
 
-def _ema(old, value):
-    mixed = EMA_DECAY * old + (1.0 - EMA_DECAY) * value
-    return max(mixed, REF_FLOOR)
+def _number(value):
+    if torch.is_tensor(value):
+        return value.detach().item()
+    return float(value)

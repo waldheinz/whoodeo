@@ -12,9 +12,9 @@ holdout: 0.1
 val_every: 500
 val_count: 32
 seed: 0
+# The loss is the sum of weight x raw term. With one term, weight 1 is the old loss.
 loss:
-  balance: start
   terms:
     - name: pixel
-      weight: 1
+      weight: 1.0
       kind: mse

@@ -34,7 +34,9 @@
 # times, once per frame. One more stem block also widens the comparison
 # by 4 input pixels. stem 2 is already inside the 31x31 above.
 #
-# Same data and loss as the x264 EDSR run.
+# Same pairs as the x264 EDSR run. VGG is relu2_2 and relu3_4, the edge
+# and the local texture. Both sit inside the 31x31 vote. relu4_4 is
+# wider than that comparison, and relu5_4 is wider than the trunk.
 
 model:
   arch: vote
@@ -81,12 +83,15 @@ val_every: 250
 val_count: 32
 seed: 42
 variants: "^x264-"
+# Estimate, no checkpoint to derive from: the old balanced pixel 0.7, vgg 0.3 (it ran balance running) at step 0, with
+# the bilinear upscale of the 32 seed-42 x264 val frames as reference (L1 0.0116, VGG
+# relu2_2 0.265, relu3_4 0.404). A layer weight is (0.3/0.7) x L1 / (2 x ref).
 loss:
-  balance: running
   terms:
     - name: pixel
-      weight: 0.7
+      weight: 1.0
       kind: l1
     - name: vgg
-      weight: 0.3
-      layers: [relu3_4, relu4_4]
+      layers:
+        relu2_2: 0.00938
+        relu3_4: 0.00616

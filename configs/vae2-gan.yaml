@@ -14,18 +14,24 @@ holdout: 0.1
 val_every: 250
 val_count: 32
 seed: 42
+# The loss is the sum of weight x raw term. The weights are multipliers, not
+# shares, and nothing is calibrated. pixel, vgg, and color are those of
+# configs/vae2.yaml and configs/vae2d-spark.yaml. mu_l2 and scale_eq are left
+# out: the encoder is frozen.
 loss:
-  balance: start
   terms:
     - name: pixel
-      weight: 0.6
+      weight: 1.0
       kind: l1
     - name: vgg
-      weight: 0.25
-      layers: [relu2_2, relu3_4]
+      layers:
+        relu2_2: 0.230
+        relu3_4: 0.155
     - name: color
-      weight: 0.15
-    - name: gan        # outside the shares: multiplies the adaptive weight
+      weight: 5.5
+      space: oklab
+      pool: 16
+    - name: gan        # not in the sum: multiplies the adaptive weight
       weight: 0.1      # latent diffusion uses 0.5; a gentler start for a fine-tune
       crop: 512
       disc_lr: 1.0e-4

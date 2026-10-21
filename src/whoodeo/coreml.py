@@ -8,7 +8,7 @@ A vae2 checkpoint gives its decoder alone: a latent in, the frame clamped
 to [0, 1] out, both fp16. The input takes the enumerated latent sizes of
 --latent, 60x107, 90x160, and 135x240 by default (480p, 720p, and 1080p at
 factor 8), so the Neural Engine can run it. One size gives a fixed shape.
-The metadata carries the latent shift and scale.
+The metadata carries the latent shift and scale, one value per channel.
 coremltools stays out of the training dependencies. On the Mac:
 
     uv pip install --python .venv/bin/python 'coremltools==9.1.dev1'
@@ -172,8 +172,9 @@ def convert_decoder(ct, spec, output, latent_sizes):
         "whoodeo.step": "" if spec.step is None else str(spec.step),
         "whoodeo.input": "fixed" if len(sizes) == 1 else "enumerated",
         "whoodeo.latent_sizes": ",".join(f"{height}x{width}" for height, width in sizes),
-        "whoodeo.latent_shift": f"{float(model.latent_shift):.8g}",
-        "whoodeo.latent_scale": f"{float(model.latent_scale):.8g}",
+        # One value per latent channel, comma separated.
+        "whoodeo.latent_shift": ",".join(f"{float(v):.8g}" for v in model.latent_shift.reshape(-1)),
+        "whoodeo.latent_scale": ",".join(f"{float(v):.8g}" for v in model.latent_scale.reshape(-1)),
     })
     output = Path(output)
     if output.exists():

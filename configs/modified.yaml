@@ -1,6 +1,4 @@
-# Full-frame 2x training. The first term anchors the loss magnitude.
-# balance: start freezes the scales on the validation frames.
-# balance: running keeps the weights as shares (EMA 0.99).
+# Full-frame 2x training. The loss is the sum of weight x raw term.
 # Optional keys, omitted here: steps, out, variants.
 
 model:
@@ -15,9 +13,9 @@ holdout: 0.1
 val_every: 1000
 val_count: 32
 seed: 0
+# The loss is the sum of weight x raw term. With one term, weight 1 is the old loss.
 loss:
-  balance: start
   terms:
     - name: pixel
-      weight: 1.00
+      weight: 1.0
       kind: l1

@@ -1,7 +1,6 @@
 # Search stays as in the README: radius 4, three frames, fixed sharpness.
 # The trunk is wide enough for texture. Pixel L1 holds structure, VGG the
-# mid frequencies, a small GAN the last crispness. balance running keeps
-# those weights as shares, so a stronger discriminator cannot take over.
+# mid frequencies, a small GAN the last crispness.
 
 model:
   arch: shift
@@ -19,16 +18,20 @@ holdout: 0.1
 val_every: 500
 val_count: 16
 seed: 0
+# Estimate, no checkpoint to derive from: the old balanced pixel 0.6, vgg 0.3, gan 0.1 (it ran balance running) at step 0, with
+# the bilinear upscale of the 32 seed-0 val frames as reference (L1 0.0134, VGG
+# relu2_2 0.309, relu3_4 0.472). A layer weight is (0.3/0.6) x L1 / (2 x ref).
+# gan is (0.1/0.6) x L1 / ln 2, the BCE of an untrained discriminator.
 loss:
-  balance: running
   terms:
     - name: pixel
-      weight: 0.60
+      weight: 1.0
       kind: l1
     - name: vgg
-      weight: 0.30
-      layers: [relu2_2, relu3_4]
+      layers:
+        relu2_2: 0.0108
+        relu3_4: 0.00711
     - name: gan
-      weight: 0.10
+      weight: 0.00322
       crop: 256
       disc_lr: 1.0e-4

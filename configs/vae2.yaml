@@ -1,35 +1,58 @@
 # Reconstruct master frames with the tapered vae2. No low variant is read.
 # The decoder is only convolutions, SiLU, additions, and nearest doubling,
 # so it converts for the Neural Engine. Fine-tune it with configs/vae2-gan.yaml.
+#
+# The current recipe, the one of configs/vae2d-spark.yaml, at a batch for a
+# smaller machine. vae2d-spark.yaml says where each choice comes from: a fixed
+# posterior without KL, relative latent noise, 16 latent channels at factor 8,
+# Oklab color pooled 1/16, mu_l2 against scale drift, and scale_eq.
 
 model:
   arch: vae2
   blocks: 6          # dilated residual blocks at the latent, in encoder and decoder
   channels: 64       # full resolution; 128 at 1/2, 256 from 1/4 down
-  latent: 8
+  latent: 16
   factor: 8
-  beta: 1.0e-4       # KL is ~1% of the objective at sigma 0.05; 0.02 dominated it
+  encoder_blocks: [1, 2, 2]   # full, 1/2, 1/4
+  decoder_blocks: [2, 3, 2]   # one more block at full and at 1/2 resolution
+  widths: [1, 2, 4, 4]        # multiples of channels, full resolution to the latent
+  posterior: fixed   # the encoder gives μ only: no σ, no KL, no beta
+
+# Each frame adds s * std_c * N(0, 1) to the latent, s ~ |N(0, 0.4^2)|, std_c
+# the running std of μ per channel. Not part of the loss recipe: a resume may
+# change it, tau 0 is off for a clean fine-tune at the end.
+latent_noise:
+  tau: 0.4
 
 batch: 2
 lr: 1.0e-4
 schedule:
   kind: plateau
-  patience: 4        # validations, 4 x 250 = 1000 steps
+  patience: 8        # validations, 8 x 250 = 2000 steps
   factor: 0.5
   min_delta: 0.01    # relative improvement over best that counts
   min_lr: 1.0e-6
 holdout: 0.1
 val_every: 250
-val_count: 32
+val_count: 96
 seed: 42
+# The loss is the sum of weight x raw term. The weights are multipliers, not
+# shares, and nothing is calibrated.
 loss:
-  balance: start
   terms:
     - name: pixel
-      weight: 0.6
+      weight: 1.0
       kind: l1
     - name: vgg
+      layers:
+        relu2_2: 0.230
+        relu3_4: 0.155
+    - name: color      # L1 on 1/16 pooled Oklab, against drift in flat areas
+      weight: 5.5
+      space: oklab     # pooled in linear light, a and b weighted twice
+      pool: 16
+    - name: mu_l2      # pulls μ toward 0 so the latent scale does not drift. Not in val.
+      weight: 5.0e-4
+    - name: scale_eq   # decode the pooled latent against the pooled frame. Not in val.
       weight: 0.25
-      layers: [relu2_2, relu3_4]
-    - name: color      # L1 on 1/8 pooled YCbCr, against drift in flat areas
-      weight: 0.15
+      factors: [2, 4]

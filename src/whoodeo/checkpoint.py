@@ -10,9 +10,9 @@ step those weights were saved at. whoodeo-apply and a fine-tune read only
 this file.
 
 train.pt is everything else the same run needs in order to continue: the
-step again, both optimizers, the discriminator, the loss recipe, the loss
-scales, and the plateau schedule when that schedule is in use. --resume
-reads it. A fine-tune does not.
+step again, both optimizers, the discriminator, the loss recipe, and the
+plateau schedule when that schedule is in use. --resume reads it. A
+fine-tune does not.
 
 A run directory follows its latest link. A checkpoint directory, model.pt,
 or train.pt names one step exactly. An older run that still keeps model.pt
@@ -54,7 +54,6 @@ class TrainState:
     step: int
     optimizer: dict
     loss: dict
-    objective: dict
     discriminator: dict | None
     disc_optimizer: dict | None
     schedule: dict | None
@@ -74,7 +73,7 @@ def run_directory(model_path):
 
 
 def save_run(
-    directory, model, architecture, step, optimizer, loss, objective,
+    directory, model, architecture, step, optimizer, loss,
     discriminator=None, disc_optimizer=None, schedule=None,
 ):
     """Write checkpoints/<step>/ and point both latest links at it.
@@ -90,7 +89,6 @@ def save_run(
         "step": step,
         "optimizer": optimizer.state_dict(),
         "loss": loss,
-        "objective": objective,
     }
     if discriminator is not None:
         train_payload["discriminator"] = discriminator.state_dict()
@@ -182,12 +180,15 @@ def build_generator(spec, device):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
     ) = parse_model(spec.architecture, f"{spec.path}: architecture")
     model, label = build_model(
         arch, blocks, channels, in_frames,
         radius=radius, stem=stem, sharpness=sharpness, reject=reject, levels=levels,
         bilinear=bilinear, codes=codes, patch=patch, res_scale=res_scale, vote=vote,
         latent=latent, factor=factor, beta=beta,
+        encoder_blocks=encoder_blocks, decoder_blocks=decoder_blocks,
+        widths=widths, decoder_widths=decoder_widths, posterior=posterior,
     )
     model.load_state_dict(spec.state_dict)
     model.eval().to(device)
@@ -330,18 +331,17 @@ def _train_from_legacy(data, path):
         "step": data.get("step"),
         "optimizer": data.get("optimizer"),
         "loss": args.get("loss"),
-        "objective": args.get("objective"),
         "discriminator": data.get("discriminator"),
         "disc_optimizer": data.get("disc_optimizer"),
     })
 
 
 def _train_state(path, data):
-    missing = [key for key in ("step", "optimizer", "loss", "objective") if key not in data or data[key] is None]
+    missing = [key for key in ("step", "optimizer", "loss") if key not in data or data[key] is None]
     if missing:
         raise SystemExit(f"{path}: missing {', '.join(missing)}")
-    if not isinstance(data["loss"], dict) or not isinstance(data["objective"], dict):
-        raise SystemExit(f"{path}: loss and objective must be mappings")
+    if not isinstance(data["loss"], dict):
+        raise SystemExit(f"{path}: loss must be a mapping")
     discriminator = data.get("discriminator")
     disc_optimizer = data.get("disc_optimizer")
     if (discriminator is None) != (disc_optimizer is None):
@@ -351,7 +351,6 @@ def _train_state(path, data):
         _require_step(data["step"], path),
         data["optimizer"],
         data["loss"],
-        data["objective"],
         discriminator,
         disc_optimizer,
         data.get("schedule"),

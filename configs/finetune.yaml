@@ -7,8 +7,7 @@
 # optimizer and the discriminator start over, and the result is a new run.
 # Step 0 is the loaded generator.
 #
-# Pixel L1 stays the anchor at a smaller share. relu4_4 asks for texture
-# that relu3_4 does not see. relu5_4 is left out. The discriminator starts
+# relu4_4 asks for texture that relu3_4 does not see. relu5_4 is left out. The discriminator starts
 # from scratch at a higher learning rate than the first run. If batch 2
 # runs out of memory, set batch to 1.
 
@@ -18,16 +17,21 @@ holdout: 0.1
 val_every: 500
 val_count: 32
 seed: 0
+# Estimate, no checkpoint to derive from: the old balanced pixel 0.4, vgg 0.4, gan 0.2 at step 0, with
+# the bilinear upscale of the 32 seed-0 val frames as reference (L1 0.0134, VGG
+# relu3_4 0.472, relu4_4 0.150). A layer weight is (0.4/0.4) x L1 / (2 x ref).
+# The old run calibrated on the loaded model instead, so VGG and gan weigh
+# more here than they did there. gan is (0.2/0.4) x L1 / ln 2.
 loss:
-  balance: start
   terms:
     - name: pixel
-      weight: 0.40
+      weight: 1.0
       kind: l1
     - name: vgg
-      weight: 0.40
-      layers: [relu3_4, relu4_4]
+      layers:
+        relu3_4: 0.0142
+        relu4_4: 0.0447
     - name: gan
-      weight: 0.20
+      weight: 0.00967
       crop: 384
       disc_lr: 2.0e-4

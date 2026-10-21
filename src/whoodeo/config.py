@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from whoodeo.models import PRESETS
+from whoodeo.models.vae2 import layout, layout_text
 
 VGG_LAYERS = {
     "relu1_1": 1,
@@ -28,7 +29,14 @@ VGG_LAYERS = {
     "relu5_4": 35,
 }
 
-TERM_NAMES = ("pixel", "vgg", "gan", "color")
+TERM_NAMES = ("pixel", "vgg", "gan", "color", "mu_l2", "scale_eq")
+# vae2 terms that stand beside the objective: in the step loss, not in val.
+SIDE_TERMS = ("mu_l2", "scale_eq")
+SCALE_EQ_FACTORS = (2, 4)
+# Spaces the color term compares in, the first the default.
+COLOR_SPACES = ("ycbcr", "oklab")
+# Pooling factor of the color term when the file leaves pool out.
+COLOR_POOL = 8
 
 # Architectures that reconstruct a master frame through a latent.
 VAE_ARCHS = ("vae", "vae2")
@@ -36,21 +44,38 @@ VAE_ARCHS = ("vae", "vae2")
 
 @dataclass(frozen=True)
 class Term:
+    """One loss term. weight multiplies its raw value.
+
+    vgg has no term weight: `layers` pairs each layer with its own weight.
+    color compares in `space` after a 1/`pool` average pool.
+    """
+
     name: str
-    weight: float
+    weight: float | None
     kind: str | None = None
-    layers: tuple[str, ...] = ()
+    layers: tuple[tuple[str, float], ...] = ()
     crop: int | None = None
     disc_lr: float | None = None
     start: int | None = None
+    factors: tuple[int, ...] | None = None
+    space: str | None = None
+    pool: int | None = None
 
     def as_dict(self):
         # disc_lr stays off the matched recipe: a resume may change learning rates.
+        if self.name == "vgg":
+            return {
+                "name": self.name,
+                "layers": {layer: round(weight, 8) for layer, weight in self.layers},
+            }
         item = {"name": self.name, "weight": round(self.weight, 8)}
         if self.name == "pixel":
             item["kind"] = self.kind
-        elif self.name == "vgg":
-            item["layers"] = list(self.layers)
+        elif self.name == "scale_eq":
+            item["factors"] = list(self.factors)
+        elif self.name == "color":
+            item["space"] = self.space
+            item["pool"] = self.pool
         elif self.name == "gan":
             item["crop"] = self.crop
             if self.start is not None:
@@ -84,7 +109,6 @@ class TrainConfig:
     seed: int
     steps: int | None
     out: Path | None
-    balance: str
     terms: tuple[Term, ...]
     schedule: Schedule
     radius: int | None = None
@@ -101,8 +125,16 @@ class TrainConfig:
     latent: int | None = None
     factor: int | None = None
     beta: float | None = None
+    encoder_blocks: tuple[int, ...] | None = None
+    decoder_blocks: tuple[int, ...] | None = None
+    widths: tuple[int, ...] | None = None
+    decoder_widths: tuple[int, ...] | None = None
+    posterior: str | None = None
     crop: int | None = None
     freeze_encoder: bool = False
+    # Training noise on the vae2 latent. Not part of the loss recipe, so a
+    # resume may change it. 0 is off.
+    latent_noise_tau: float = 0.0
 
     def arch_key(self):
         return model_key(
@@ -110,10 +142,12 @@ class TrainConfig:
             self.radius, self.stem, self.sharpness, self.reject, self.levels,
             self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
             self.latent, self.factor, self.beta,
+            self.encoder_blocks, self.decoder_blocks, self.widths, self.decoder_widths,
+            self.posterior,
         )
 
     def loss_recipe(self):
-        return {"balance": self.balance, "terms": [term.as_dict() for term in self.terms]}
+        return {"terms": [term.as_dict() for term in self.terms]}
 
     def term(self, name):
         for item in self.terms:
@@ -121,15 +155,17 @@ class TrainConfig:
                 return item
         return None
 
-    def shared_terms(self):
-        """Terms whose weights are shares of the objective.
+    def objective_terms(self):
+        """Terms summed into the objective as weight * raw.
 
         A vae2 gan term stands outside: its weight multiplies the adaptive
-        weight, and the validation objective leaves it out.
+        weight, and the validation objective leaves it out. So do mu_l2 and
+        scale_eq, which the training step adds.
         """
         return tuple(
             item for item in self.terms
             if not (self.arch == "vae2" and item.name == "gan")
+            and item.name not in SIDE_TERMS
         )
 
 
@@ -160,17 +196,21 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"res_scale {res_scale:g}"
         )
     elif arch in VAE_ARCHS:
-        latent, factor, beta = extra
-        text = (
-            f"{arch} {blocks}x{channels} latent {latent} factor {factor} "
-            f"beta {float(beta):g}"
-        )
+        latent, factor, *levels = extra
+        text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
+        if levels:
+            *levels, posterior = levels
+            text += layout_text(factor, *levels)
+            if posterior != "gaussian":
+                text += f" posterior {posterior}"
     return text
 
 
 def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
     bilinear, codes, patch, res_scale, vote, latent, factor, beta,
+    encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
+    posterior=None,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -183,8 +223,14 @@ def model_key(
         return key + (float(res_scale),)
     if arch == "vote":
         return key + (stem, vote, float(res_scale))
+    if arch == "vae2":
+        # beta weighs the KL in the loss. It does not shape the weights.
+        # The levels compare with their defaults filled in.
+        return key + (latent, factor) + layout(
+            factor, encoder_blocks, decoder_blocks, widths, decoder_widths,
+        ) + (posterior or "gaussian",)
     if arch in VAE_ARCHS:
-        return key + (latent, factor, float(beta))
+        return key + (latent, factor)
     return key
 
 
@@ -219,14 +265,21 @@ def architecture_dict(cfg):
     elif cfg.arch in VAE_ARCHS:
         item["latent"] = cfg.latent
         item["factor"] = cfg.factor
-        item["beta"] = cfg.beta
+        if cfg.beta is not None:
+            item["beta"] = cfg.beta
+        if cfg.posterior is not None:
+            item["posterior"] = cfg.posterior
+        for name in ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths"):
+            value = getattr(cfg, name)
+            if value is not None:
+                item[name] = list(value)
     return item
 
 
 def assert_resume_matches(cfg, architecture, loss, checkpoint):
     """The checkpoint must be the same network and the same loss.
 
-    Learning rates and the schedule may change.
+    Learning rates, the schedule, and a vae beta may change. beta comes from the config.
     """
     saved_key = model_key(*parse_model(architecture, f"{checkpoint}: architecture"))
     if saved_key != cfg.arch_key():
@@ -249,7 +302,11 @@ def load_config(path, architecture=None, architecture_from=None):
         raise SystemExit(f"{path}: expected a mapping")
     where = str(path)
 
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels, bilinear, codes, patch, res_scale, vote, latent, factor, beta = _take_model(
+    (
+        arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
+        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
+    ) = _take_model(
         data, where, architecture, architecture_from,
     )
     batch = _take_int(data, "batch", where, positive=True)
@@ -265,7 +322,8 @@ def load_config(path, architecture=None, architecture_from=None):
     variants = _take_variants(data, where)
     crop = _take_crop(data, where)
     freeze_encoder = _take_flag(data, "freeze_encoder", where)
-    balance, terms = _take_loss(data, where, arch)
+    latent_noise_tau = _take_latent_noise(data, where, arch)
+    terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
         if variants is not None:
             raise SystemExit(f"{where}: {arch} does not take variants")
@@ -303,7 +361,6 @@ def load_config(path, architecture=None, architecture_from=None):
         seed=seed,
         steps=steps,
         out=out,
-        balance=balance,
         terms=tuple(terms),
         radius=radius,
         stem=stem,
@@ -319,6 +376,12 @@ def load_config(path, architecture=None, architecture_from=None):
         latent=latent,
         factor=factor,
         beta=beta,
+        encoder_blocks=encoder_blocks,
+        decoder_blocks=decoder_blocks,
+        widths=widths,
+        decoder_widths=decoder_widths,
+        posterior=posterior,
+        latent_noise_tau=latent_noise_tau,
         crop=crop,
         freeze_encoder=freeze_encoder,
         schedule=schedule,
@@ -384,7 +447,9 @@ def parse_model(model, where):
     if arch == "pyramid":
         levels, stem, radius = _take_pyramid(model, where)
     bilinear, codes, patch = _take_vq(model, arch, where)
-    latent, factor, beta = _take_vae(model, arch, where)
+    posterior = _take_posterior(model, arch, where)
+    latent, factor, beta = _take_vae(model, arch, where, posterior)
+    encoder_blocks, decoder_blocks, widths, decoder_widths = _take_levels(model, arch, factor, where)
     vote = None
     if arch == "vote":
         stem = _take_int(model, "stem", where)
@@ -405,7 +470,49 @@ def parse_model(model, where):
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior,
     )
+
+
+def _take_posterior(data, arch, where):
+    """vae2 posterior as written, None when left out (gaussian)."""
+    if "posterior" not in data:
+        return None
+    if arch != "vae2":
+        raise SystemExit(f"{where}: only vae2 takes posterior")
+    return _take_choice(data, "posterior", where, ("gaussian", "fixed"))
+
+
+def _take_latent_noise(data, where, arch):
+    """latent_noise: {tau: t}. Each frame adds s * std_c * N(0, 1), s ~ |N(0, t^2)|."""
+    if "latent_noise" not in data:
+        return 0.0
+    if arch != "vae2":
+        raise SystemExit(f"{where}: only vae2 takes latent_noise")
+    raw = data.pop("latent_noise")
+    label = f"{where}: latent_noise"
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{label} must be a mapping with tau")
+    tau = _take_float(raw, "tau", label)
+    if tau < 0:
+        raise SystemExit(f"{label}: tau must be zero or positive")
+    _reject_unknown(raw, label)
+    return tau
+
+
+_LEVEL_KEYS = ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths")
+
+
+def _take_levels(data, arch, factor, where):
+    """vae2 blocks and width multiples per level, as written. None where left out."""
+    if arch != "vae2":
+        foreign = [name for name in _LEVEL_KEYS if name in data]
+        if foreign:
+            raise SystemExit(f"{where}: only vae2 uses {', '.join(foreign)}")
+        return None, None, None, None
+    raw = [data.pop(name, None) for name in _LEVEL_KEYS]
+    layout(factor, *raw, where=where)
+    return tuple(None if value is None else tuple(value) for value in raw)
 
 
 def _take_res_scale(data, arch, where):
@@ -436,7 +543,7 @@ def _take_vq(data, arch, where):
     return bilinear, codes, patch
 
 
-def _take_vae(data, arch, where):
+def _take_vae(data, arch, where, posterior=None):
     if arch not in VAE_ARCHS:
         foreign = [name for name in ("latent", "factor", "beta") if name in data]
         if foreign:
@@ -447,6 +554,12 @@ def _take_vae(data, arch, where):
     factor = _take_int(data, "factor", where, positive=True)
     if factor < 2 or factor > 16 or factor & (factor - 1):
         raise SystemExit(f"{where}: factor must be a power of two from 2 to 16")
+    if posterior == "fixed":
+        if "beta" in data:
+            raise SystemExit(
+                f"{where}: posterior fixed has no KL, so beta does nothing. Remove beta"
+            )
+        return latent, factor, None
     beta = _take_float(data, "beta", where, positive=True)
     return latent, factor, beta
 
@@ -639,9 +752,12 @@ def _take_schedule(data, where, lr):
 
 
 def _take_loss(data, where, arch=None):
-    """Loss terms. Their weights sum to 1, except a vae2 gan term, which stands apart.
+    """Loss terms. The loss is the sum of weight * raw. A vae2 gan term stands apart.
 
-    color is L1 on 1/8 average-pooled YCbCr, for vae and vae2. A vae2 gan
+    A weight is any positive multiplier. vgg weighs each layer under layers.
+
+    color is L1 on average-pooled color, for vae and vae2. `space` is ycbcr
+    (the default) or oklab, `pool` the pooling factor (default 8). A vae2 gan
     term may name `start`, the first step whose generator loss includes it.
     """
     if "loss" not in data:
@@ -649,7 +765,6 @@ def _take_loss(data, where, arch=None):
     loss = data.pop("loss")
     if not isinstance(loss, dict):
         raise SystemExit(f"{where}: loss must be a mapping")
-    balance = _take_choice(loss, "balance", f"{where}: loss", ("start", "running"))
     if "terms" not in loss:
         raise SystemExit(f"{where}: loss is missing terms")
     raw_terms = loss.pop("terms")
@@ -666,17 +781,40 @@ def _take_loss(data, where, arch=None):
         if name in seen:
             raise SystemExit(f"{where}: duplicate loss term {name}")
         seen.add(name)
-        weight = _take_float(raw, "weight", label, positive=True)
-        if weight > 1:
-            raise SystemExit(f"{label}: weight must be at most 1")
+        if name in SIDE_TERMS and arch != "vae2":
+            raise SystemExit(f"{label}: only vae2 takes {name}")
+        if name == "vgg":
+            if "weight" in raw:
+                raise SystemExit(
+                    f"{label}: vgg has no weight. Weigh each layer: "
+                    f"layers: {{relu2_2: <weight>, relu3_4: <weight>}}"
+                )
+            weight = None
+        else:
+            weight = _take_float(raw, "weight", label, positive=True)
         if name == "pixel":
             kind = _take_choice(raw, "kind", label, ("mse", "l1"))
             terms.append(Term(name=name, weight=weight, kind=kind))
         elif name == "vgg":
             layers = _take_layers(raw, label)
-            terms.append(Term(name=name, weight=weight, layers=tuple(layers)))
+            terms.append(Term(name=name, weight=None, layers=layers))
         elif name == "color":
+            space = raw.pop("space", COLOR_SPACES[0])
+            if space not in COLOR_SPACES:
+                known = ", ".join(COLOR_SPACES)
+                raise SystemExit(f"{label}: unknown space {space!r}. choices: {known}")
+            pool = _take_int(raw, "pool", label, positive=True, default=COLOR_POOL)
+            terms.append(Term(name=name, weight=weight, space=space, pool=pool))
+        elif name == "mu_l2":
             terms.append(Term(name=name, weight=weight))
+        elif name == "scale_eq":
+            factors = raw.pop("factors", list(SCALE_EQ_FACTORS))
+            if (
+                not isinstance(factors, list) or not factors
+                or any(isinstance(k, bool) or not isinstance(k, int) or k < 2 for k in factors)
+            ):
+                raise SystemExit(f"{label}: factors must be a list of integers from 2 up")
+            terms.append(Term(name=name, weight=weight, factors=tuple(factors)))
         else:
             crop = _take_int(raw, "crop", label, positive=True)
             if crop % 8 != 0:
@@ -689,30 +827,31 @@ def _take_loss(data, where, arch=None):
                 name=name, weight=weight, crop=crop, disc_lr=disc_lr, start=start,
             ))
         _reject_unknown(raw, label)
-    shared = [term for term in terms if not (arch == "vae2" and term.name == "gan")]
-    if not shared:
+    summed = [
+        term for term in terms
+        if not (arch == "vae2" and term.name == "gan") and term.name not in SIDE_TERMS
+    ]
+    if not summed:
         raise SystemExit(f"{where}: vae2 needs a term beside gan")
-    total = sum(term.weight for term in shared)
-    if abs(total - 1.0) > 1e-6:
-        raise SystemExit(f"{where}: loss weights sum to {total:.6g}, expected 1")
-    return balance, terms
+    return terms
 
 
 def _take_layers(data, where):
+    """VGG layers mapped to their weights, in file order."""
     if "layers" not in data:
         raise SystemExit(f"{where}: missing layers")
     layers = data.pop("layers")
-    if not isinstance(layers, list) or not layers:
-        raise SystemExit(f"{where}: layers must be a non-empty list")
+    if not isinstance(layers, dict) or not layers:
+        raise SystemExit(f"{where}: layers must map vgg layers to weights")
     known = ", ".join(VGG_LAYERS)
-    seen = set()
-    for layer in layers:
+    pairs = []
+    for layer, weight in layers.items():
         if not isinstance(layer, str) or layer not in VGG_LAYERS:
             raise SystemExit(f"{where}: unknown vgg layer {layer!r}. choices: {known}")
-        if layer in seen:
-            raise SystemExit(f"{where}: duplicate vgg layer {layer}")
-        seen.add(layer)
-    return layers
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+            raise SystemExit(f"{where}: vgg layer {layer} weight must be a positive number")
+        pairs.append((layer, float(weight)))
+    return tuple(pairs)
 
 
 def _take_choice(data, key, where, choices):

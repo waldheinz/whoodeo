@@ -106,9 +106,11 @@ class LatentTally:
     code matches that Gaussian. A mu_std near 0 means the latent carries
     nothing. A sigma_mean near 0 means a deterministic code.
 
-    Per channel it keeps the std of μ, the mean σ, and the KL to the unit
-    Gaussian per latent position. A channel counts as active when its μ
-    varies with std above ACTIVE_STD; a collapsed channel copies the prior.
+    Per channel it keeps the mean and std of μ, the mean σ, the SNR std(μ) /
+    mean(σ), and the KL to the unit Gaussian per latent position. A channel
+    counts as active when its μ varies with std above ACTIVE_STD; a collapsed
+    channel copies the prior. A fixed posterior (logvar None) has no σ, so
+    SNR and KL are None.
     """
 
     def __init__(self):
@@ -118,11 +120,17 @@ class LatentTally:
         self.sum_sigma = 0.0
         self.sumsq_sigma = 0.0
         self.channels = None
+        self.fixed = False
         self._hist = []
 
     def add(self, mu, logvar, sample=False):
         mu = mu.detach().float()
-        sigma = torch.exp(0.5 * logvar.detach().float())
+        if logvar is None:
+            self.fixed = True
+            logvar = torch.zeros_like(mu)
+            sigma = torch.zeros_like(mu)
+        else:
+            sigma = torch.exp(0.5 * logvar.detach().float())
         self.count += mu.numel()
         self.sum_mu += float(mu.sum())
         self.sumsq_mu += float(mu.square().sum())
@@ -161,8 +169,15 @@ class LatentTally:
             )
             center = total / each
             channel_var = max(0.0, squares / each - center * center)
-            kl = 0.5 * (squares / each + sig_sq / each - 1.0 - logs / each)
-            per_channel.append((channel_var ** 0.5, sig / each, kl))
+            mu_std = channel_var ** 0.5
+            sigma_mean = sig / each
+            if self.fixed:
+                kl = None
+                snr = None
+            else:
+                kl = 0.5 * (squares / each + sig_sq / each - 1.0 - logs / each)
+                snr = mu_std / max(sigma_mean, 1e-12)
+            per_channel.append((mu_std, sigma_mean, kl, center, snr))
         hist = None
         if self._hist:
             hist = torch.cat(self._hist)
@@ -188,20 +203,30 @@ def latent_scalars(report, prefix):
     and the KL of the weakest one. The full table goes to `latent_table`.
     """
     channels = report["channels"]
-    return {
+    found = {
         f"{prefix}latent/mu_mean": report["mu_mean"],
         f"{prefix}latent/mu_std": report["mu_std"],
         f"{prefix}latent/sigma_mean": report["sigma_mean"],
         f"{prefix}latent/spread": report["spread"],
-        f"{prefix}latent/active": sum(1 for mu_std, _, _ in channels if mu_std > ACTIVE_STD),
-        f"{prefix}latent/kl_min": min(kl for _, _, kl in channels),
+        f"{prefix}latent/active": sum(1 for row in channels if row[0] > ACTIVE_STD),
     }
+    kls = [row[2] for row in channels if row[2] is not None]
+    if kls:
+        found[f"{prefix}latent/kl_min"] = min(kls)
+    return found
 
 
 def latent_table(report):
     """Markdown table of every channel, for TensorBoard's text tab."""
-    rows = ["| channel | μ std | σ mean | KL | |", "|---:|---:|---:|---:|:---|"]
-    for index, (mu_std, sigma_mean, kl) in enumerate(report["channels"]):
+    rows = [
+        "| channel | μ mean | μ std | σ mean | SNR | KL | |",
+        "|---:|---:|---:|---:|---:|---:|:---|",
+    ]
+    for index, (mu_std, sigma_mean, kl, mean, snr) in enumerate(report["channels"]):
         mark = "" if mu_std > ACTIVE_STD else "collapsed"
-        rows.append(f"| {index} | {mu_std:.3f} | {sigma_mean:.3f} | {kl:.3f} | {mark} |")
+        snr_text = "n/a" if snr is None else f"{snr:.1f}"
+        kl_text = "n/a" if kl is None else f"{kl:.3f}"
+        rows.append(
+            f"| {index} | {mean:+.3f} | {mu_std:.3f} | {sigma_mean:.3f} | {snr_text} | {kl_text} | {mark} |"
+        )
     return "\n".join(rows)
