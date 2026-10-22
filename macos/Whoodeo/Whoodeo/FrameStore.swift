@@ -200,6 +200,50 @@ nonisolated final class FrameStore: @unchecked Sendable {
         }
     }
 
+    /// Key of a model's archives inside a film folder: the folder name up to "-<unit>".
+    static func modelKey(of url: URL) -> String {
+        digest(identity(url))
+    }
+
+    /// Deletes the model archives in every film folder whose model is gone or has changed.
+    /// `keep` holds the `modelKey` of every package in the library.
+    static func pruneModelCaches(keep: Set<String>) {
+        let root = cacheRoot
+        guard let films = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        var removed = 0
+        for film in films where !film.lastPathComponent.hasSuffix(".deleting") {
+            guard (try? film.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                  let archives = try? FileManager.default.contentsOfDirectory(
+                      at: film,
+                      includingPropertiesForKeys: [.isDirectoryKey],
+                      options: [.skipsHiddenFiles]
+                  ) else { continue }
+            for archive in archives {
+                let name = archive.lastPathComponent
+                if name.hasSuffix(".deleting") {
+                    try? FileManager.default.removeItem(at: archive)
+                    continue
+                }
+                guard (try? archive.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                      let dash = name.lastIndex(of: "-") else { continue }
+                if keep.contains(String(name[..<dash])) { continue }
+                gate.lock()
+                let dest = film.appendingPathComponent(name + ".deleting")
+                try? FileManager.default.removeItem(at: dest)
+                let claimed = (try? FileManager.default.moveItem(at: archive, to: dest)) != nil
+                gate.unlock()
+                guard claimed else { continue }
+                try? FileManager.default.removeItem(at: dest)
+                removed += 1
+            }
+        }
+        if removed > 0 { Log.fill.info("Cache ohne Modell entfernt: \(removed)") }
+    }
+
     func coverage() -> Coverage {
         lock.lock()
         defer { lock.unlock() }

@@ -833,6 +833,10 @@ final class Session: ObservableObject {
 
     private func reloadLibrary() {
         library = ModelLibrary.models()
+        let urls = library.map(\.url)
+        DispatchQueue.global(qos: .utility).async {
+            FrameStore.pruneModelCaches(keep: Set(urls.map(FrameStore.modelKey(of:))))
+        }
         if let selection, !library.contains(where: { $0.url == selection }) {
             self.selection = nil
             if selection == modelURL { clearModel() }
