@@ -30,7 +30,17 @@ VGG_LAYERS = {
     "relu5_4": 35,
 }
 
-TERM_NAMES = ("pixel", "vgg", "gan", "color", "mu_l2", "scale_eq", "latent")
+TERM_NAMES = ("pixel", "vgg", "gan", "color", "oklab", "ms_ssim", "mu_l2", "scale_eq", "latent")
+# Terms that read the picture in color or structure, for vae, vae2, and latent_up.
+IMAGE_TERMS = ("color", "oklab", "ms_ssim")
+# Weights of Oklab L, a, b in the oklab term when the file leaves channels out.
+# Measured on vae2d step 15755 (32 val frames, full resolution): mean |dL|
+# 0.0058, |da| 0.0016, |db| 0.0020, so L is about 3.2 times a or b. a and b
+# at 3 make each channel weigh about the same; unweighted, L would be 62% of
+# the term, with these 35%. L also has VGG and ms_ssim, chroma only this.
+OKLAB_CHANNELS = (1.0, 3.0, 3.0)
+# Scales of the ms_ssim term when the file leaves scales out (Wang 2003).
+MS_SSIM_SCALES = 5
 # vae2 terms that stand beside the objective: in the step loss, not in val.
 SIDE_TERMS = ("mu_l2", "scale_eq")
 SCALE_EQ_FACTORS = (2, 4)
@@ -63,6 +73,8 @@ class Term:
     factors: tuple[int, ...] | None = None
     space: str | None = None
     pool: int | None = None
+    channels: tuple[float, ...] | None = None
+    scales: int | None = None
 
     def as_dict(self):
         # disc_lr stays off the matched recipe: a resume may change learning rates.
@@ -79,6 +91,10 @@ class Term:
         elif self.name == "color":
             item["space"] = self.space
             item["pool"] = self.pool
+        elif self.name == "oklab":
+            item["channels"] = [round(value, 8) for value in self.channels]
+        elif self.name == "ms_ssim":
+            item["scales"] = self.scales
         elif self.name == "gan":
             item["crop"] = self.crop
             if self.start is not None:
@@ -95,6 +111,21 @@ class Schedule:
     factor: float | None = None
     min_delta: float | None = None
     min_lr: float | None = None
+
+
+@dataclass(frozen=True)
+class Faces:
+    """faces: the image terms weigh `weight` times inside detected faces.
+
+    YuNet keeps boxes at `score` or above. Each box grows by `expand` about
+    its center, and its edge is a Gaussian of `feather` times the shorter
+    side of the grown box. Not part of the loss recipe, like latent_noise.
+    """
+
+    weight: float
+    score: float = 0.6
+    expand: float = 1.2
+    feather: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -144,6 +175,9 @@ class TrainConfig:
     init_from_vae: bool = False
     # vae2 and latent_up: silu or relu. None is silu, as before the option.
     activation: str | None = None
+    # vae and vae2: face-weighted image terms. None (or weight 1) is off,
+    # and then no detector runs.
+    faces: Faces | None = None
 
     def arch_key(self):
         return model_key(
@@ -358,6 +392,7 @@ def load_config(path, architecture=None, architecture_from=None):
     freeze_encoder = _take_flag(data, "freeze_encoder", where)
     init_from_vae = _take_flag(data, "init_from_vae", where)
     latent_noise_tau = _take_latent_noise(data, where, arch)
+    faces = _take_faces(data, where, arch)
     terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
         if variants is not None:
@@ -368,8 +403,9 @@ def load_config(path, architecture=None, architecture_from=None):
             raise SystemExit(f"{where}: crop must be a multiple of factor {factor}")
     elif crop is not None:
         raise SystemExit(f"{where}: only vae and vae2 use crop")
-    if arch not in (*VAE_ARCHS, LATENT_ARCH) and any(term.name == "color" for term in terms):
-        raise SystemExit(f"{where}: only vae, vae2, and latent_up use a color term")
+    for name in IMAGE_TERMS:
+        if arch not in (*VAE_ARCHS, LATENT_ARCH) and any(term.name == name for term in terms):
+            raise SystemExit(f"{where}: only vae, vae2, and latent_up use a {name} term")
     if init_from_vae and arch != LATENT_ARCH:
         raise SystemExit(f"{where}: only latent_up takes init_from_vae")
     if arch != "vae2" and any(term.start is not None for term in terms):
@@ -422,6 +458,7 @@ def load_config(path, architecture=None, architecture_from=None):
         activation=activation,
         init_from_vae=init_from_vae,
         latent_noise_tau=latent_noise_tau,
+        faces=faces,
         crop=crop,
         freeze_encoder=freeze_encoder,
         schedule=schedule,
@@ -581,6 +618,32 @@ def _take_latent_noise(data, where, arch):
         raise SystemExit(f"{label}: tau must be zero or positive")
     _reject_unknown(raw, label)
     return tau
+
+
+def _take_faces(data, where, arch):
+    """faces: {weight: w, score: s, expand: e, feather: f}. None when off (w 1)."""
+    if "faces" not in data:
+        return None
+    if arch not in (*VAE_ARCHS, LATENT_ARCH):
+        raise SystemExit(f"{where}: only vae, vae2, and latent_up take faces")
+    raw = data.pop("faces")
+    label = f"{where}: faces"
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{label} must be a mapping with weight")
+    weight = _take_float(raw, "weight", label, positive=True)
+    score = _take_float(raw, "score", label, positive=True, default=Faces.score)
+    expand = _take_float(raw, "expand", label, positive=True, default=Faces.expand)
+    feather = _take_float(raw, "feather", label, positive=True, default=Faces.feather)
+    _reject_unknown(raw, label)
+    if weight < 1:
+        raise SystemExit(f"{label}: weight must be 1 or more (1 is off)")
+    if score >= 1:
+        raise SystemExit(f"{label}: score must be below 1")
+    if expand < 1:
+        raise SystemExit(f"{label}: expand must be 1 or more")
+    if weight == 1:
+        return None
+    return Faces(weight=weight, score=score, expand=expand, feather=feather)
 
 
 _LEVEL_KEYS = ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths")
@@ -864,7 +927,10 @@ def _take_loss(data, where, arch=None):
     A weight is any positive multiplier. vgg weighs each layer under layers.
 
     color is L1 on average-pooled color, for vae and vae2. `space` is ycbcr
-    (the default) or oklab, `pool` the pooling factor (default 8). A vae2 gan
+    (the default) or oklab, `pool` the pooling factor (default 8). oklab is
+    L1 on Oklab L, a, b at full resolution, `channels` their weights (default
+    1, 3, 3). ms_ssim is 1 - MS-SSIM on Oklab L, `scales` the number of
+    scales (default 5). A vae2 gan
     term may name `start`, the first step whose generator loss includes it.
     """
     if "loss" not in data:
@@ -916,6 +982,22 @@ def _take_loss(data, where, arch=None):
                 raise SystemExit(f"{label}: unknown space {space!r}. choices: {known}")
             pool = _take_int(raw, "pool", label, positive=True, default=COLOR_POOL)
             terms.append(Term(name=name, weight=weight, space=space, pool=pool))
+        elif name == "oklab":
+            channels = raw.pop("channels", list(OKLAB_CHANNELS))
+            if (
+                not isinstance(channels, list) or len(channels) != 3
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0 for v in channels)
+                or sum(channels) <= 0
+            ):
+                raise SystemExit(f"{label}: channels must be three weights [L, a, b], not negative")
+            terms.append(Term(
+                name=name, weight=weight, channels=tuple(float(v) for v in channels),
+            ))
+        elif name == "ms_ssim":
+            scales = _take_int(raw, "scales", label, positive=True, default=MS_SSIM_SCALES)
+            if scales > 5:
+                raise SystemExit(f"{label}: scales must be 1 to 5")
+            terms.append(Term(name=name, weight=weight, scales=scales))
         elif name in ("mu_l2", "latent"):
             terms.append(Term(name=name, weight=weight))
         elif name == "scale_eq":

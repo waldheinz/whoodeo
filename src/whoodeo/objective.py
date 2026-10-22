@@ -1,9 +1,16 @@
-"""Pixel, VGG, color, and GAN terms. The loss is the sum of weight * raw.
+"""Pixel, VGG, color, Oklab, MS-SSIM, and GAN terms. The loss is the sum of weight * raw.
 
 A weight multiplies its raw term. Nothing is normalized or calibrated, and
 the weights need not add up to anything. The VGG term weighs each layer: its
 part is the sum of layer weight * L1 on that layer. A vae2 gan term is not
 in that sum. The training step weighs it.
+
+oklab, ms_ssim, and vgg take an optional per-pixel map (B, 1, H, W) at full
+resolution, the faces weight of whoodeo.faces with a mean of 1 per frame.
+oklab multiplies its L1 by the map. ms_ssim takes the weighted mean of the
+SSIM and contrast-structure maps at each scale, the map pooled along with the
+frames and cut to the valid window centers. vgg multiplies each layer's L1 by
+the map area-pooled to that layer's size. None is the plain mean.
 """
 
 import torch
@@ -39,6 +46,20 @@ _OKLAB_M2 = (
 _OKLAB_WEIGHT = (1.0, 2.0, 2.0)
 # Added under the cube root, so its slope at 0 stays finite (about 3e3).
 _OKLAB_EPS = 1e-6
+# The full-resolution oklab term takes the cube root of CIE L*a*b*: x^(1/3)
+# above (6/29)^3, the tangent line below. Its slope stays at 7.8 or less, and
+# negative LMS (an overshoot below black) keeps a gradient. About sRGB 0.1 and
+# darker is linear in LMS then; black lands at L 0.14, which a difference
+# does not see.
+_CBRT_ROOT = 6.0 / 29.0
+_CBRT_KNEE = _CBRT_ROOT ** 3
+# MS-SSIM (Wang, Simoncelli, Bovik 2003): the weight of each scale, the
+# Gaussian window, and the constants for a range of 1.
+_MS_SSIM_WEIGHTS = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333)
+_SSIM_WINDOW = 11
+_SSIM_SIGMA = 1.5
+_SSIM_C1 = 0.01 ** 2
+_SSIM_C2 = 0.03 ** 2
 
 
 def pixel_loss(pred, high, kind):
@@ -93,6 +114,107 @@ def oklab(linear):
     return torch.einsum("ij,bjhw->bihw", linear.new_tensor(_OKLAB_M2), root)
 
 
+def safe_cbrt(value):
+    """x^(1/3) above (6/29)^3, its tangent below, as CIE L*a*b* does."""
+    root = value.clamp_min(_CBRT_KNEE) ** (1.0 / 3.0)
+    line = _CBRT_ROOT + (value - _CBRT_KNEE) / (3.0 * _CBRT_ROOT * _CBRT_ROOT)
+    return torch.where(value > _CBRT_KNEE, root, line)
+
+
+def oklab_full(image):
+    """gamma sRGB to Oklab L, a, b with the safe cube root, for full-resolution terms."""
+    linear = srgb_linear(image)
+    lms = torch.einsum("ij,bjhw->bihw", linear.new_tensor(_OKLAB_M1), linear)
+    return torch.einsum("ij,bjhw->bihw", linear.new_tensor(_OKLAB_M2), safe_cbrt(lms))
+
+
+def oklab_loss(pred_lab, high_lab, channels, pixel_weight=None):
+    """L1 on Oklab L, a, b at full resolution, the mean weighted by `channels`.
+
+    `pixel_weight` (B, 1, H, W), mean 1 per frame, multiplies each pixel.
+    """
+    weight = pred_lab.new_tensor(channels).view(1, 3, 1, 1)
+    diff = (pred_lab - high_lab).abs() * weight
+    if pixel_weight is not None:
+        diff = diff * pixel_weight
+    return diff.mean() * 3.0 / float(sum(channels))
+
+
+def _ssim_window(like):
+    coords = torch.arange(_SSIM_WINDOW, dtype=like.dtype, device=like.device) - _SSIM_WINDOW // 2
+    gauss = torch.exp(-coords.square() / (2 * _SSIM_SIGMA ** 2))
+    return gauss / gauss.sum()
+
+
+def _blur(image, window):
+    size = window.numel()
+    image = F.conv2d(image, window.view(1, 1, 1, size))
+    return F.conv2d(image, window.view(1, 1, size, 1))
+
+
+def _weighted_mean(values, weight):
+    """Mean per frame, weighted by `weight` (B, 1, h, w) when given."""
+    if weight is None:
+        return values.flatten(1).mean(1)
+    return (values * weight).flatten(1).sum(1) / weight.flatten(1).sum(1).clamp_min(1e-12)
+
+
+def _ssim_parts(x, y, window, weight=None):
+    """Mean SSIM and mean contrast-structure per frame, valid Gaussian windows.
+
+    `weight` is at the size of x; it is cut to the window centers.
+    """
+    mu_x = _blur(x, window)
+    mu_y = _blur(y, window)
+    var_x = _blur(x * x, window) - mu_x.square()
+    var_y = _blur(y * y, window) - mu_y.square()
+    cov = _blur(x * y, window) - mu_x * mu_y
+    cs = (2 * cov + _SSIM_C2) / (var_x + var_y + _SSIM_C2)
+    luminance = (2 * mu_x * mu_y + _SSIM_C1) / (mu_x.square() + mu_y.square() + _SSIM_C1)
+    if weight is not None:
+        margin = window.numel() // 2
+        weight = weight[..., margin:margin + cs.shape[-2], margin:margin + cs.shape[-1]]
+    return _weighted_mean(luminance * cs, weight), _weighted_mean(cs, weight)
+
+
+def ms_ssim(x, y, scales, weight=None):
+    """MS-SSIM of one-channel frames with a range of 1, the mean over the batch.
+
+    Scales whose shorter side falls below the 11-pixel window are dropped and
+    the weights of the rest renormalized, so a pooled scale_eq frame works too.
+    Each factor is clamped at 1e-4 before its power: the power of 0 has no slope.
+    `weight` (B, 1, H, W) weighs the mean at each scale, pooled like the frames.
+    """
+    window = _ssim_window(x)
+    height, width = x.shape[-2:]
+    usable = 0
+    while usable < scales and min(height, width) >> usable >= _SSIM_WINDOW:
+        usable += 1
+    if usable == 0:
+        raise ValueError(f"ms_ssim: {width}x{height} is smaller than the {_SSIM_WINDOW}-pixel window")
+    weights = x.new_tensor(_MS_SSIM_WEIGHTS[:usable])
+    weights = weights / weights.sum()
+    factors = []
+    for level in range(usable):
+        ssim, cs = _ssim_parts(x, y, window, weight)
+        if level == usable - 1:
+            factors.append(ssim)
+        else:
+            factors.append(cs)
+            pad = (0, x.shape[-1] % 2, 0, x.shape[-2] % 2)
+            x = F.avg_pool2d(F.pad(x, pad, mode="replicate"), 2)
+            y = F.avg_pool2d(F.pad(y, pad, mode="replicate"), 2)
+            if weight is not None:
+                weight = F.avg_pool2d(F.pad(weight, pad, mode="replicate"), 2)
+    stacked = torch.stack(factors, dim=1).clamp_min(1e-4)
+    return (stacked ** weights.view(1, -1)).prod(dim=1).mean()
+
+
+def ms_ssim_loss(pred_lab, high_lab, scales, pixel_weight=None):
+    """1 - MS-SSIM on Oklab L, optionally weighted per pixel."""
+    return 1.0 - ms_ssim(pred_lab[:, :1], high_lab[:, :1], scales, pixel_weight)
+
+
 class VGGLoss(nn.Module):
     """L1 on frozen VGG19 layers. The classifier head is dropped."""
 
@@ -113,14 +235,21 @@ class VGGLoss(nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def layer_losses(self, pred, target):
+    def layer_losses(self, pred, target, pixel_weight=None):
         pred_maps = self._maps(pred.clamp(0, 1))
         with torch.no_grad():
             target_maps = self._maps(target.clamp(0, 1))
-        return {
-            name: F.l1_loss(pred_maps[name], target_maps[name])
-            for name in self.layer_names
-        }
+        if pixel_weight is None:
+            return {
+                name: F.l1_loss(pred_maps[name], target_maps[name])
+                for name in self.layer_names
+            }
+        found = {}
+        for name in self.layer_names:
+            diff = (pred_maps[name] - target_maps[name]).abs()
+            weight = F.interpolate(pixel_weight, size=diff.shape[-2:], mode="area")
+            found[name] = (diff * weight).mean()
+        return found
 
     def _maps(self, image):
         hidden = (image - self.mean) / self.std
@@ -147,9 +276,9 @@ class Objective:
             self.layer_weights = dict(vgg.layers)
             self.vgg = VGGLoss(tuple(self.layer_weights)).to(device)
 
-    def vgg_layers(self, pred, high):
+    def vgg_layers(self, pred, high, pixel_weight=None):
         """Raw L1 per VGG layer, still in the graph."""
-        return self.vgg.layer_losses(pred, high)
+        return self.vgg.layer_losses(pred, high, pixel_weight)
 
     def combine(self, raw, layer_raw):
         """Sum of weight * raw over the terms. vgg sums its weighted layers.

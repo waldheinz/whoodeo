@@ -1,0 +1,114 @@
+# vae2f on the DGX Spark: vae2e (relu, latent noise tau 0.2) with pixel (RGB
+# L1) and color (Oklab pooled 1/16) replaced by oklab, L1 in Oklab at full
+# resolution, and ms_ssim, 1 - MS-SSIM on Oklab L. RGB L1 weighs every
+# channel and level of brightness alike; Oklab is close to perceptually
+# uniform, so a step in the dark counts about as much as one in the light, and
+# a and b are weighed on their own. MS-SSIM rewards local contrast and
+# structure, which L1 smooths away. A fresh run, compare with vae2e by
+# val/psnr and val/noise_psnr_* (val/loss is a different sum).
+#
+# Weights: the same share of the image terms against VGG as pixel 1 + color
+# 5.5 had, measured on 32 val frames in eval mode (21.10.2026):
+#   vae2d step 15755: pixel 0.00757, color 0.00183, vgg relu2_2 0.1261 /
+#     relu3_4 0.1851 (weighted 0.0577); Oklab |dL| 0.00578, |da| 0.00162,
+#     |db| 0.00200, oklab raw (1/3/3) 0.00238; 1 - MS-SSIM 0.00326.
+#     old pixel + color 0.0176 = 23.4% beside VGG; new 6 x 0.00238 +
+#     1 x 0.00326 = 0.0175 = 23.3%.
+#   vae2e step 250: old 0.094 = 40.6%, new 0.138 = 50.1% (1 - MS-SSIM is 0.060
+#     there and falls faster than L1, so it weighs more early).
+#   vae2e step 0: old 1.17 = 86%, new 1.02 = 85%.
+# scale_eq reuses these weights on the pooled frames; ms_ssim drops the scales
+# a pooled frame is too small for (852x480 / 4 keeps 4 of 5).
+#
+# vae2e: vae2d with relu, see configs/vae2e-spark.yaml.
+#
+# vae2d: vae2c-color with 16 latent channels instead of 8. vae2c-color
+# (runs/train-20261019-224852) reached
+# about 35.5-35.9 dB val/psnr with 8 channels; vae2d tests whether the
+# bottleneck of the latent is what limits the quality. The 256-wide trunk at
+# the latent projects to 16 channels instead of 8, nothing else in the model
+# changes. patience goes from 4 to 8 and val_count from 32 to 96: the val loss
+# on 32 frames is noisy, and patience 4 cut the lr too early. 96 frames are a
+# different val set than 32, so compare val/psnr with vae2c-color loosely.
+# Everything else is the vae2c-color recipe, summed up below.
+#
+# vae2c-color: color moves from 1/8 pooled YCbCr to Oklab, pooled 1/16 in
+# linear light, at weight 5.5: on step 2416 of vae2c raw oklab/16 is 0.00845
+# against 0.0104 for ycbcr/8, so 5.5 weighs flat colours about 1.5 times what
+# ycbcr/8 at 3 would (0.046 against 0.031, pixel L1 0.020). mu_l2 is 5e-4
+# instead of 1e-4, against the drift of the latent scale seen in vae2c
+# (mu_std 0.6 -> 7.3).
+#
+# vae2c: the vae2b layout with a fixed (deterministic) posterior and no KL.
+# Robustness comes from training noise instead: the decoder has to read a
+# latent that is a little off, as a later upscaler (low frame -> latent, fixed
+# decoder) will hand it one. beta 5e-3 split the code into 2 deterministic
+# channels and 6 near noise and lost VGG; KL small or off plus explicit latent
+# noise avoids that split (RAE, Zheng 2025, arXiv 2510.11690; l-DeTok, Yang
+# 2025, arXiv 2507.15856; sigma-VAE / LatentLM, arXiv 2412.08635). Compare
+# runs by val/noise_psnr_* and val/psnr, not by the loss. The decoder is
+# unchanged for the Neural Engine: the noise and the extra terms are training
+# only.
+
+model:
+  arch: vae2
+  blocks: 6          # dilated residual blocks at the latent, in encoder and decoder
+  channels: 64       # full resolution; 128 at 1/2, 256 from 1/4 down
+  latent: 16         # vae2c: 8
+  factor: 8
+  encoder_blocks: [1, 2, 2]   # full, 1/2, 1/4, as in vae2
+  decoder_blocks: [2, 3, 2]   # one more block at full and at 1/2 resolution, as vae2b
+  widths: [1, 2, 4, 4]        # multiples of channels, full resolution to the latent
+  posterior: fixed   # the encoder gives μ only: no σ, no KL, no beta
+  activation: relu   # vae2d: silu (the default when left out)
+
+# Each frame adds s * std_c * N(0, 1) to the latent, s ~ |N(0, 0.4^2)|, std_c
+# the running std of μ per channel, so the noise follows the code's own scale
+# and the encoder cannot outgrow it. Encoder and decoder train through it.
+# Not part of the loss recipe: a resume may change it, tau 0 is off for a
+# clean fine-tune at the end.
+latent_noise:
+  tau: 0.2         # vae2d had 0.4; gentler this time (21.10.2026)
+
+batch: 6          # Spark, vae2c-color: batch 6 ~72 GiB on the GPU, ~41 GB RAM left;
+                  # batch 8 ~107 GiB, only ~4.5 GB left. No swap used either way.
+lr: 1.0e-4
+schedule:
+  kind: plateau
+  patience: 8        # validations, 8 x 250 = 2000 steps (vae2c: 4)
+  factor: 0.5
+  min_delta: 0.01    # relative improvement over best that counts
+  min_lr: 1.0e-6
+holdout: 0.1
+val_every: 250
+val_count: 96     # vae2c: 32. 3x the frames, ~1.7x (sqrt 3) lower std of the
+                  # val loss, less noise for the plateau scheduler
+seed: 42
+# The loss is the sum of weight x raw term. The weights are multipliers, not
+# shares. vgg keeps the vae2b weights; oklab and ms_ssim are set against it
+# as measured above.
+loss:
+  terms:
+    - name: oklab      # L1 on Oklab at full resolution, replaces pixel and color
+      weight: 4.5        # 1/1/1: raw 0.00313 on vae2d (mean of channels), 4.5 keeps ~23% beside VGG
+      channels: [1.0, 1.0, 1.0]   # L, a, b: Oklab is already roughly perceptually uniform; no extra chroma weight
+    - name: ms_ssim    # 1 - MS-SSIM on Oklab L, 5 scales
+      weight: 1.0
+      scales: 5
+    - name: vgg
+      layers:
+        relu2_2: 0.230
+        relu3_4: 0.155
+    # Pulls μ toward 0 so the latent scale does not drift (vae2c: mu_std
+    # 0.6 -> 7.3 at 1e-4). At mean(μ^2) ~25-50 this is 0.01-0.025 of the
+    # step loss. The relative noise makes the scale itself free for the
+    # model. Not in val.
+    - name: mu_l2
+      weight: 5.0e-4
+    # Decode the 2x2 or 4x4 average-pooled latent and compare it with the
+    # pooled frame under the same oklab, ms_ssim, and VGG weights. Keeps the
+    # latent spatially smooth and close to an image at every scale
+    # (Skorokhodov 2025, arXiv 2502.14831). Not in val; see val/scale_eq_psnr.
+    - name: scale_eq
+      weight: 0.25
+      factors: [2, 4]

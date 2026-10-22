@@ -2,7 +2,8 @@
 
 The page is served from this process. ``show`` copies the newest images and
 returns; a background thread encodes PNG with Pillow. Closing the browser
-does not stop the caller.
+does not stop the caller. Boxes passed to ``show`` (face boxes in training)
+are drawn into the PNG on that thread and listed in state.json.
 """
 
 import json
@@ -20,6 +21,8 @@ from whoodeo.video import png_bytes
 _PAGE = (Path(__file__).with_name("live.html")).read_bytes()
 _COPY_INTERVAL = 0.2
 _NAME = re.compile(r"[A-Za-z0-9_-]+")
+_BOX_COLOR = (255, 214, 0)
+_BOX_LINE = 2
 
 
 class _Server(ThreadingHTTPServer):
@@ -79,6 +82,7 @@ class Live:
         self._stop = threading.Event()
         self._pending = None
         self._pngs = {}
+        self._boxes = {}
         self._status = ""
         self._generation = 0
         self._next_copy = 0.0
@@ -102,11 +106,13 @@ class Live:
         self._server_thread.start()
         print(f"live {self.url}", flush=True)
 
-    def show(self, frames):
+    def show(self, frames, boxes=None):
         """Replace the images on the page. ``frames`` maps a name to HWC uint8 RGB.
 
-        Calls closer than five per second are dropped, and this never waits
-        for a browser or for the PNG encoder.
+        ``boxes`` maps a frame name to rows of x, y, w, h (and a score) in
+        that frame's pixels; they are drawn as outlines. Calls closer than
+        five per second are dropped, and this never waits for a browser or
+        for the PNG encoder.
         """
         if not isinstance(frames, dict) or not frames:
             raise ValueError("show() needs at least one named frame")
@@ -131,8 +137,15 @@ class Live:
             name: np.array(image, dtype=np.uint8, copy=True, order="C")
             for name, image in frames.items()
         }
+        rows = {}
+        for name, found in (boxes or {}).items():
+            if name not in copied or found is None:
+                continue
+            array = np.asarray(found, dtype=np.float32)
+            array = array.reshape(len(array), -1) if array.size else np.zeros((0, 4), np.float32)
+            rows[name] = [[round(float(value), 1) for value in row[:5]] for row in array]
         with self._lock:
-            self._pending = copied
+            self._pending = (copied, rows)
         self._wake.set()
 
     def status(self, text):
@@ -176,6 +189,7 @@ class Live:
                 "status": self._status,
                 "generation": self._generation,
                 "frames": list(self._pngs),
+                "boxes": self._boxes,
             }
 
     def _encode_loop(self):
@@ -187,8 +201,11 @@ class Live:
                 self._wake.wait(timeout=0.5)
                 self._wake.clear()
                 continue
+            images, rows = pending
             try:
-                encoded = {name: png_bytes(image) for name, image in pending.items()}
+                for name, found in rows.items():
+                    _draw_boxes(images[name], found)
+                encoded = {name: png_bytes(image) for name, image in images.items()}
             except Exception as exc:
                 with self._lock:
                     if not self._reported_encode_error:
@@ -198,7 +215,23 @@ class Live:
             with self._lock:
                 self._reported_encode_error = False
                 self._pngs = encoded
+                self._boxes = rows
                 self._generation += 1
+
+
+def _draw_boxes(image, rows):
+    """Outline each x, y, w, h row in place, clipped to the image."""
+    height, width = image.shape[:2]
+    line = _BOX_LINE
+    for row in rows:
+        x0 = int(np.clip(round(row[0]), 0, width - 1))
+        y0 = int(np.clip(round(row[1]), 0, height - 1))
+        x1 = int(np.clip(round(row[0] + row[2]), x0 + 1, width))
+        y1 = int(np.clip(round(row[1] + row[3]), y0 + 1, height))
+        image[y0:min(y0 + line, y1), x0:x1] = _BOX_COLOR
+        image[max(y1 - line, y0):y1, x0:x1] = _BOX_COLOR
+        image[y0:y1, x0:min(x0 + line, x1)] = _BOX_COLOR
+        image[y0:y1, max(x1 - line, x0):x1] = _BOX_COLOR
 
 
 def _url_host(host):

@@ -6,6 +6,7 @@ requires-python = ">=3.14"
 dependencies = [
     "av",
     "numpy",
+    "opencv-python-headless>=5.0.0.93",
     "pillow>=12.3.0",
     "pyyaml>=6.0.3",
     "tensorboard",

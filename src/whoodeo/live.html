@@ -154,7 +154,9 @@ function render() {
   for (const pane of PANES) {
     const el = paneEls.get(pane.id);
     const name = pane.names.find((candidate) => frames.has(candidate)) || null;
-    el.querySelector(".tag").textContent = name || pane.names[0];
+    const boxes = name && state.boxes ? state.boxes[name] : null;
+    const faces = boxes && boxes.length ? "  \u00b7  " + boxes.length + (boxes.length === 1 ? " face" : " faces") : "";
+    el.querySelector(".tag").textContent = (name || pane.names[0]) + faces;
     const img = el.querySelector("img");
     if (!name || !state.generation) {
       if (img.dataset.shown) {

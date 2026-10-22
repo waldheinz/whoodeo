@@ -47,6 +47,19 @@ batches. A frame read opens the video and closes it before the next read.
 An unreadable training clip is logged and the loader draws a new batch.
 The step copies a batch onto the device. Validation reads on the main thread.
 
+faces: {weight, score, expand, feather} (vae, vae2, and latent_up) runs
+OpenCV YuNet on the CPU on every final training frame, in the loader thread,
+and on the validation frames; for latent_up on the master of each pair. The soft face mask rides in the batch; the step turns it
+into 1 + (weight - 1) x mask divided by its mean per frame and weighs oklab,
+ms_ssim, and vgg with it (scale_eq, mu_l2 and the KL stay unweighted).
+train_raw/face_fraction and val_raw/face_fraction are the share of face
+pixels, val/psnr_face and val/psnr_nonface the PSNR over face and other
+pixels. The live page draws the boxes on recon (upscale) and master. latent_up
+also weighs its latent L1 with the map area-pooled by the vae2 factor 8 to
+the latent grid, again divided by its mean per frame, and logs
+val_ref/vae_psnr_face and val_ref/vae_psnr_nonface beside val_ref/vae_psnr.
+Weight 1 or no faces: section runs no detector. See whoodeo.faces.
+
 The loss is the sum of weight * raw over the terms in the file. A weight
 is a multiplier, not a share, and nothing is calibrated on the network.
 vgg weighs each of its layers. A vae adds beta times the KL, a gan term
@@ -112,7 +125,7 @@ checkpoint; the config stores the checkpoint it resolved to, so a resume
 decodes with the same one. The vae2 stays in eval mode with no gradient on
 its weights and no latent noise. Each step encodes the master with it under
 no_grad for the target code. The `latent` term is L1 between the predicted
-and that target code. The pixel, vgg, and color terms compare
+and that target code. The image terms (pixel, vgg, color, oklab, ms_ssim) compare
 decode(z / scale + shift), cut to the master size, with the master, and their
 gradient runs through the frozen decoder into z. The step skips the decode
 when no image term is set and the live page is off. train_raw/latent and
@@ -139,6 +152,7 @@ still present has to match the file, beta aside. Keep it to change beta.
 """
 
 import argparse
+import math
 import queue
 import random
 import shutil
@@ -158,7 +172,7 @@ from whoodeo.checkpoint import (
     build_generator, continue_run, load_generator, load_resume, run_directory, save_run,
 )
 from whoodeo.config import (
-    LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
+    IMAGE_TERMS, LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
     load_config, restore_plateau, shape_text,
 )
 from whoodeo.films import (
@@ -172,7 +186,10 @@ from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.models.latent_up import FACTOR as LATENT_FACTOR
 from whoodeo.models.latent_up import init_from_vae
 from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
-from whoodeo.objective import Objective, color_loss, pixel_loss, raw_scalars
+from whoodeo.faces import FACE_LEVEL, FaceDetector, detect_batch, face_fraction, weight_map
+from whoodeo.objective import (
+    Objective, color_loss, ms_ssim_loss, oklab_full, oklab_loss, pixel_loss, raw_scalars,
+)
 from whoodeo.video import png_bytes, rgb_image
 
 
@@ -269,6 +286,9 @@ class PreparedBatch:
     width: int
     height: int
     box: tuple | None
+    # latent_up faces: the soft mask (B, 1, H, W) of the masters and the YuNet boxes.
+    faces: torch.Tensor | None = None
+    boxes: list | None = None
 
 
 class BatchLoader:
@@ -449,23 +469,40 @@ def describe_loss(cfg, objective):
             detail = term.kind
         elif term.name == "color":
             detail = f"{term.space}/{term.pool}"
+        elif term.name == "oklab":
+            detail = "L/a/b " + "/".join(f"{value:g}" for value in term.channels)
+        elif term.name == "ms_ssim":
+            detail = f"oklab L, {term.scales} scales"
         else:
             detail = f"crop {term.crop}"
         print(f"  {term.name} {detail}  weight {term.weight:g}", flush=True)
 
 
-def raw_terms(objective, cfg, pred, high, discriminator, box):
-    """Unweighted terms, and the vgg L1 of each layer. All still in the graph."""
+def raw_terms(objective, cfg, pred, high, discriminator, box, pixel_weight=None):
+    """Unweighted terms, and the vgg L1 of each layer. All still in the graph.
+
+    `pixel_weight` (B, 1, H, W), the faces map, weighs oklab, ms_ssim, and vgg.
+    """
     raw = {}
     layer_raw = {}
     pixel = cfg.term("pixel")
     if pixel is not None:
         raw["pixel"] = pixel_loss(pred, high, pixel.kind)
     if cfg.term("vgg") is not None:
-        layer_raw = objective.vgg_layers(pred, high)
+        layer_raw = objective.vgg_layers(pred, high, pixel_weight)
     color = cfg.term("color")
     if color is not None:
         raw["color"] = color_loss(pred, high, color.space, color.pool)
+    lab = cfg.term("oklab")
+    structure = cfg.term("ms_ssim")
+    if lab is not None or structure is not None:
+        pred_lab = oklab_full(pred)
+        with torch.no_grad():
+            high_lab = oklab_full(high)
+        if lab is not None:
+            raw["oklab"] = oklab_loss(pred_lab, high_lab, lab.channels, pixel_weight)
+        if structure is not None:
+            raw["ms_ssim"] = ms_ssim_loss(pred_lab, high_lab, structure.scales, pixel_weight)
     if "gan" in objective.names:
         raw["gan"] = gan_bce(discriminator(take(pred, box)), True)
     return raw, layer_raw
@@ -475,6 +512,19 @@ def psnr_sum(pred, target):
     """Sum over the batch of each frame's PSNR in dB, the prediction clamped to [0, 1]."""
     error = (pred.clamp(0, 1) - target).square().flatten(1).mean(1)
     return (-10.0 * torch.log10(error.clamp_min(1e-10))).sum().item()
+
+
+def masked_error(pred, target, inside):
+    """Squared error summed over the pixels of `inside` (B, 1, H, W), and their count."""
+    error = (pred.clamp(0, 1) - target).square().mean(1, keepdim=True)
+    weight = inside.to(error.dtype)
+    return float((error * weight).sum()), float(weight.sum())
+
+
+def pooled_psnr(error, count):
+    if count <= 0:
+        return None
+    return -10.0 * math.log10(max(error / count, 1e-10))
 
 
 # Noise levels of val_noise/psnr_<s>, in units of the per-channel std of μ.
@@ -719,8 +769,12 @@ def load_master(film, index):
         raise unreadable(f"master {film.orig.path.name}", index, exc) from exc
 
 
-def vae_batch(films, specs, crop, rng):
-    """Stack master frames. The crop is drawn only after every frame is read."""
+def vae_batch(films, specs, crop, rng, detector=None, faces=None):
+    """Stack master frames. The crop is drawn only after every frame is read.
+
+    With a detector, YuNet runs on the final frames (after the crop), and the
+    batch carries the boxes and the soft face mask of `faces`.
+    """
     frames = [load_master(films[film_index], index) for film_index, index in specs]
     if crop is not None:
         cropped = []
@@ -729,7 +783,11 @@ def vae_batch(films, specs, crop, rng):
             cropped.append(take(batched, exact_box(batched, crop, rng))[0])
         frames = cropped
     image = torch.stack(frames)
-    return FrameBatch(image, int(image.shape[-1]), int(image.shape[-2]))
+    boxes = None
+    mask = None
+    if detector is not None:
+        boxes, mask = detect_batch(detector, image, faces.expand, faces.feather)
+    return FrameBatch(image, int(image.shape[-1]), int(image.shape[-2]), mask, boxes)
 
 
 def prior_image(model, image):
@@ -748,11 +806,13 @@ def prior_image(model, image):
     return recon[0, :, :height, :width]
 
 
-def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, image_dir=None, step=None):
+def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, image_dir=None, step=None, detector=None):
     """Mean of the weighted objective. The KL is returned beside it.
 
     The extras hold the raw term means and val/psnr of the clamped reconstruction,
-    and for a vae2 the noise and scale_eq PSNRs of `robustness`.
+    and for a vae2 the noise and scale_eq PSNRs of `robustness`. With faces the
+    objective is face-weighted as in training, and val/psnr_face and
+    val/psnr_nonface are the PSNR pooled over all face and all other pixels.
 
     master.png is written once. recon-<step>.png is the reconstruction.
     """
@@ -760,7 +820,7 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
     loss_acc = 0.0
     pixel_acc = 0.0
     vgg_acc = 0.0
-    color_acc = 0.0
+    image_acc = {}
     kl_acc = 0.0
     saw_kl = False
     raw_acc = {}
@@ -771,10 +831,16 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
     mus = []
     frames_cpu = []
     width = max(2, len(str(max(len(specs) - 1, 0))))
+    faces = cfg.faces
+    if faces is not None and detector is None:
+        detector = FaceDetector(faces.score)
+    face_acc = [0.0, 0.0, 0.0, 0.0]  # face error, face pixels, other error, other pixels
     with torch.no_grad():
         for start in range(0, len(specs), batch_size):
             chunk = specs[start:start + batch_size]
-            image = vae_batch(films, chunk, crop, None).image.to(device)
+            batch = vae_batch(films, chunk, crop, None, detector if faces is not None else None, faces)
+            image = batch.image.to(device)
+            pixel_weight = None
             pred = model(image)
             tally.add(model.mu, model.logvar, sample=True)
             if robust:
@@ -787,7 +853,17 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
                     save_still(folder, "master", image[offset])
                     save_step_image(folder, "recon", step, pred[offset])
                 saved += len(chunk)
-            raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None)
+            if batch.faces is not None:
+                mask = batch.faces.to(device)
+                pixel_weight = weight_map(mask, faces.weight)
+                inside = mask >= FACE_LEVEL
+                error, pixels = masked_error(pred, image, inside)
+                face_acc[0] += error
+                face_acc[1] += pixels
+                error, pixels = masked_error(pred, image, ~inside)
+                face_acc[2] += error
+                face_acc[3] += pixels
+            raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None, pixel_weight)
             total, weighted = objective.combine(raw, layer_raw)
             frames = len(chunk)
             loss_acc += total.item() * frames
@@ -797,22 +873,32 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
                 pixel_acc += weighted["pixel"].item() * frames
             if "vgg" in weighted:
                 vgg_acc += weighted["vgg"].item() * frames
-            if "color" in weighted:
-                color_acc += weighted["color"].item() * frames
+            for name in IMAGE_TERMS:
+                if name in weighted:
+                    image_acc[name] = image_acc.get(name, 0.0) + weighted[name].item() * frames
             if model.kl is not None:
                 kl_acc += float(model.kl) * frames
                 saw_kl = True
             count += frames
     report = tally.report()
     extras = {tag: value / count for tag, value in raw_acc.items()}
+    if faces is not None:
+        total_pixels = face_acc[1] + face_acc[3]
+        extras["val_raw/face_fraction"] = face_acc[1] / total_pixels if total_pixels else 0.0
+        for tag, value in (
+            ("val/psnr_face", pooled_psnr(face_acc[0], face_acc[1])),
+            ("val/psnr_nonface", pooled_psnr(face_acc[2], face_acc[3])),
+        ):
+            if value is not None:
+                extras[tag] = value
     if robust and report is not None:
         std = [row[0] for row in report["channels"]]
         extras.update(robustness(model, mus, frames_cpu, std))
     model.train()
     pixel_mean = pixel_acc / count if cfg.term("pixel") is not None else None
     vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
-    if cfg.term("color") is not None:
-        extras["val/color"] = color_acc / count
+    for name, value in image_acc.items():
+        extras[f"val/{name}"] = value / count
     return EvalResult(
         loss_acc / count,
         (pixel_mean, vgg_mean, None, None),
@@ -828,6 +914,9 @@ class FrameBatch:
     image: torch.Tensor
     width: int
     height: int
+    # faces: the soft mask (B, 1, H, W) and the YuNet boxes per frame.
+    faces: torch.Tensor | None = None
+    boxes: list | None = None
 
 
 @dataclass
@@ -843,6 +932,8 @@ class StepOut:
     loss: torch.Tensor | None = None
     gan: float | None = None
     extras: dict | None = None
+    # Face boxes per shown image, for the live page.
+    boxes: dict | None = None
 
 
 @dataclass
@@ -1116,12 +1207,17 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                 message += f"  weight {usage['weight']:.5f}"
                 if usage.get("grad") is not None:
                     message += f"  grad {usage['grad']:.4f}"
-            if val_extras and "val/color" in val_extras:
-                message += f"  color {val_extras['val/color']:.6f}"
+            for name in IMAGE_TERMS:
+                if val_extras and f"val/{name}" in val_extras:
+                    message += f"  {name} {val_extras[f'val/{name}']:.6f}"
             if val_extras and "val_raw/latent" in val_extras:
                 message += f"  latent {val_extras['val_raw/latent']:.5f}"
             if val_extras and "val/psnr" in val_extras:
                 message += f"  psnr {val_extras['val/psnr']:.2f}"
+            if val_extras and "val/psnr_face" in val_extras:
+                message += f"  face {val_extras['val/psnr_face']:.2f}"
+            if val_extras and "val/psnr_nonface" in val_extras:
+                message += f"  nonface {val_extras['val/psnr_nonface']:.2f}"
             if val_extras and "val_noise/psnr_0.3" in val_extras:
                 message += (
                     "  noise " + "/".join(
@@ -1231,8 +1327,9 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                     f"lr {lr:.4g}  loss {loss.item():.6f}  {part_text(*batch_parts)}  "
                     f"{work.width}x{work.height}"
                 )
-                if "train/color" in train_extras:
-                    line += f"  color {train_extras['train/color']:.6f}"
+                for name in IMAGE_TERMS:
+                    if f"train/{name}" in train_extras:
+                        line += f"  {name} {train_extras[f'train/{name}']:.6f}"
                 if "train_raw/latent" in train_extras:
                     line += f"  latent {train_extras['train_raw/latent']:.5f}"
                 if "train_raw/gan_weight" in train_extras:
@@ -1241,6 +1338,8 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                     line += f"  scale_eq {train_extras['train/scale_eq']:.6f}"
                 if "train/mu_l2" in train_extras:
                     line += f"  mu_l2 {train_extras['train/mu_l2']:.3g}"
+                if "train_raw/face_fraction" in train_extras:
+                    line += f"  faces {train_extras['train_raw/face_fraction']:.3f}"
                 if train_kl is not None:
                     line += f"  kl {train_kl:.6f}"
                 print(line, flush=True)
@@ -1250,7 +1349,7 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
                     if work.images is not None:
                         live.show({
                             name: rgb_image(tensor) for name, tensor in work.images.items()
-                        })
+                        }, boxes=work.boxes)
 
                 finished = updates_done()
                 result = None
@@ -1383,6 +1482,15 @@ def vae_hooks(run):
     counter = {"step": run.start_step}
     mu_l2 = cfg.term("mu_l2")
     scale_eq = cfg.term("scale_eq")
+    faces = cfg.faces
+    detector = None
+    if faces is not None:
+        detector = FaceDetector(faces.score)
+        print(
+            f"faces weight {faces.weight:g}  score {faces.score:g}  expand {faces.expand:g}  "
+            f"feather {faces.feather:g}  oklab, ms_ssim, vgg  mean 1 per frame  {detector.path}",
+            flush=True,
+        )
 
     def side_terms(objective, image):
         """mu_l2 and scale_eq: the weighted sum for the step loss, and what to log."""
@@ -1417,7 +1525,7 @@ def vae_hooks(run):
     def make_loader():
         def produce():
             specs = make_vae_specs(rng, films, "train", cfg.batch, cfg.crop)
-            return vae_batch(films, specs, cfg.crop, rng)
+            return vae_batch(films, specs, cfg.crop, rng, detector, faces)
 
         return BatchLoader(produce)
 
@@ -1452,8 +1560,14 @@ def vae_hooks(run):
         counter["step"] += 1
         prepared = loader.get()
         image = prepared.image.to(run.device)
+        pixel_weight = None
+        face_extras = {}
+        if prepared.faces is not None:
+            mask = prepared.faces.to(run.device)
+            pixel_weight = weight_map(mask, faces.weight)
+            face_extras["train_raw/face_fraction"] = face_fraction(mask).item()
         pred = run.model(image)
-        raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None)
+        raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None, pixel_weight)
         d_value = None
         added = None
         gan_value = None
@@ -1465,22 +1579,27 @@ def vae_hooks(run):
             added = side if added is None else added + side
         if side_extras:
             extras = {**(extras or {}), **side_extras}
+        if face_extras:
+            extras = {**(extras or {}), **face_extras}
         images = None
+        boxes = None
         if show:
             images = {
                 "sample": prior_image(run.model, image),
                 "recon": pred[0],
                 "master": image[0],
             }
+            if prepared.boxes is not None:
+                boxes = {"recon": prepared.boxes[0], "master": prepared.boxes[0]}
         return StepOut(
             raw, layer_raw, d_value, images, prepared.width, prepared.height,
-            added, gan_value, extras,
+            added, gan_value, extras, boxes,
         )
 
     def evaluate_split(objective, specs, image_dir, step):
         result = evaluate_vae(
             run.model, films, specs, cfg.crop, cfg.batch, run.device, cfg, objective,
-            image_dir=image_dir, step=step,
+            image_dir=image_dir, step=step, detector=detector,
         )
         if hasattr(run.model, "set_latent_stats") and result.latent is not None:
             channels = result.latent["channels"]
@@ -1545,8 +1664,32 @@ def latent_hooks(run):
             print(init_from_vae(run.model, vae), flush=True)
     shift = vae.latent_shift.view(1, -1, 1, 1)
     scale = vae.latent_scale.view(1, -1, 1, 1)
-    need_image = any(cfg.term(name) is not None for name in ("pixel", "vgg", "color"))
+    need_image = any(cfg.term(name) is not None for name in ("pixel", "vgg", *IMAGE_TERMS))
     pending = {"baselines": True}
+    faces = cfg.faces
+    detector = None
+    if faces is not None:
+        detector = FaceDetector(faces.score)
+        print(
+            f"faces weight {faces.weight:g}  score {faces.score:g}  expand {faces.expand:g}  "
+            f"feather {faces.feather:g}  oklab, ms_ssim, vgg, latent (area 1/{vae.factor})  "
+            f"mean 1 per frame  {detector.path}",
+            flush=True,
+        )
+
+    def face_weights(mask, code):
+        """The pixel weight map of the master and its area-pooled copy on the latent grid."""
+        pixel_weight = weight_map(mask, faces.weight)
+        # ceil_mode: the last cell of a master that is not a multiple of the
+        # factor (852 -> 107 cells) averages the pixels it has.
+        latent_weight = F.avg_pool2d(pixel_weight, vae.factor, ceil_mode=True)
+        latent_weight = latent_weight / latent_weight.mean(dim=(-2, -1), keepdim=True)
+        if latent_weight.shape[-2:] != code.shape[-2:]:
+            raise SystemExit(
+                f"faces: latent weight {tuple(latent_weight.shape[-2:])} does not match "
+                f"the code {tuple(code.shape[-2:])}"
+            )
+        return pixel_weight, latent_weight
 
     def target_code(high):
         """(μ - shift) * scale of the master, no gradient."""
@@ -1571,11 +1714,14 @@ def latent_hooks(run):
     def bicubic(low):
         return F.interpolate(low, scale_factor=2, mode="bicubic", align_corners=False).clamp(0, 1)
 
-    def terms(objective, code, target, pred, high):
-        raw = {"latent": F.l1_loss(code, target)}
+    def terms(objective, code, target, pred, high, pixel_weight=None, latent_weight=None):
+        if latent_weight is None:
+            raw = {"latent": F.l1_loss(code, target)}
+        else:
+            raw = {"latent": ((code - target).abs() * latent_weight).mean()}
         layer_raw = {}
         if need_image:
-            image_raw, layer_raw = raw_terms(objective, cfg, pred, high, None, None)
+            image_raw, layer_raw = raw_terms(objective, cfg, pred, high, None, None, pixel_weight)
             raw.update(image_raw)
         return raw, layer_raw
 
@@ -1592,7 +1738,13 @@ def latent_hooks(run):
             film_index, variant_index, _index = specs[0]
             variant = films[film_index].variants[variant_index]
             low, high = batch_from_specs(films, specs, 0)
-            return PreparedBatch(low, high, variant.low.width, variant.low.height, None)
+            boxes = None
+            mask = None
+            if detector is not None:
+                boxes, mask = detect_batch(detector, high, faces.expand, faces.feather)
+            return PreparedBatch(
+                low, high, variant.low.width, variant.low.height, None, mask, boxes,
+            )
 
         return BatchLoader(produce)
 
@@ -1602,25 +1754,35 @@ def latent_hooks(run):
         high = prepared.high.to(device)
         height, width = high.shape[-2:]
         code, target, _mu = predict(low, high)
+        pixel_weight = None
+        latent_weight = None
+        extras = {"train_latent/z_std": float(code.detach().std())}
+        if prepared.faces is not None:
+            mask = prepared.faces.to(device)
+            pixel_weight, latent_weight = face_weights(mask, code)
+            extras["train_raw/face_fraction"] = face_fraction(mask).item()
         pred = None
         if need_image:
             pred = decode(code, height, width)
         elif show:
             with torch.no_grad():
                 pred = decode(code, height, width)
-        raw, layer_raw = terms(objective, code, target, pred, high)
+        raw, layer_raw = terms(objective, code, target, pred, high, pixel_weight, latent_weight)
         if cfg.term("latent") is None:
             raw["latent"] = raw["latent"].detach()
         images = None
+        boxes = None
         if show:
             images = {
                 "low": bicubic(low[:1])[0],
                 "upscale": pred[0].detach(),
                 "master": high[0],
             }
-        extras = {"train_latent/z_std": float(code.detach().std())}
+            if prepared.boxes is not None:
+                boxes = {"upscale": prepared.boxes[0], "master": prepared.boxes[0]}
         return StepOut(
-            raw, layer_raw, None, images, prepared.width, prepared.height, extras=extras,
+            raw, layer_raw, None, images, prepared.width, prepared.height,
+            extras=extras, boxes=boxes,
         )
 
     def evaluate_split(objective, specs, image_dir, step):
@@ -1633,15 +1795,34 @@ def latent_hooks(run):
         z_std_acc = 0.0
         count = 0
         saved = 0
+        # face error, face pixels, other error, other pixels; the same for the vae2 roundtrip
+        face_acc = [0.0, 0.0, 0.0, 0.0]
+        vae_face_acc = [0.0, 0.0, 0.0, 0.0]
         digits = max(2, len(str(max(len(specs) - 1, 0))))
         with torch.no_grad():
             for start in range(0, len(specs), cfg.batch):
                 chunk = specs[start:start + cfg.batch]
-                low, high = batch_on_device(films, chunk, 0, device)
+                low_cpu, high_cpu = batch_from_specs(films, chunk, 0)
+                low = low_cpu.to(device)
+                high = high_cpu.to(device)
                 height, width = high.shape[-2:]
                 code, target, mu = predict(low, high)
                 pred = decode(code, height, width)
-                raw, layer_raw = terms(objective, code, target, pred, high)
+                pixel_weight = None
+                latent_weight = None
+                inside = None
+                if detector is not None:
+                    _boxes, mask = detect_batch(detector, high_cpu, faces.expand, faces.feather)
+                    mask = mask.to(device)
+                    pixel_weight, latent_weight = face_weights(mask, code)
+                    inside = mask >= FACE_LEVEL
+                    error, pixels = masked_error(pred, high, inside)
+                    face_acc[0] += error
+                    face_acc[1] += pixels
+                    error, pixels = masked_error(pred, high, ~inside)
+                    face_acc[2] += error
+                    face_acc[3] += pixels
+                raw, layer_raw = terms(objective, code, target, pred, high, pixel_weight, latent_weight)
                 total, weighted = objective.combine(raw, layer_raw)
                 frames = len(chunk)
                 loss_acc += total.item() * frames
@@ -1661,6 +1842,13 @@ def latent_hooks(run):
                         ("val_ref/vae_psnr", roundtrip),
                     ):
                         raw_acc[tag] = raw_acc.get(tag, 0.0) + psnr_sum(image, high)
+                    if inside is not None:
+                        error, pixels = masked_error(roundtrip, high, inside)
+                        vae_face_acc[0] += error
+                        vae_face_acc[1] += pixels
+                        error, pixels = masked_error(roundtrip, high, ~inside)
+                        vae_face_acc[2] += error
+                        vae_face_acc[3] += pixels
                 if image_dir is not None:
                     for offset in range(frames):
                         save_val_images(
@@ -1675,6 +1863,21 @@ def latent_hooks(run):
         run.model.train()
         extras = {tag: value / count for tag, value in raw_acc.items()}
         extras["val_latent/z_std"] = z_std_acc / count
+        if detector is not None:
+            total_pixels = face_acc[1] + face_acc[3]
+            extras["val_raw/face_fraction"] = face_acc[1] / total_pixels if total_pixels else 0.0
+            found = [
+                ("val/psnr_face", pooled_psnr(face_acc[0], face_acc[1])),
+                ("val/psnr_nonface", pooled_psnr(face_acc[2], face_acc[3])),
+            ]
+            if baselines:
+                found += [
+                    ("val_ref/vae_psnr_face", pooled_psnr(vae_face_acc[0], vae_face_acc[1])),
+                    ("val_ref/vae_psnr_nonface", pooled_psnr(vae_face_acc[2], vae_face_acc[3])),
+                ]
+            for tag, value in found:
+                if value is not None:
+                    extras[tag] = value
         for name, value in weighted_acc.items():
             if name not in ("pixel", "vgg"):
                 extras[f"val/{name}"] = value / count
@@ -1684,7 +1887,19 @@ def latent_hooks(run):
                 f"step {step:06d}  baselines on {count} val frames  psnr  "
                 f"bicubic {extras['val_ref/bicubic_psnr']:.2f}  "
                 f"bilinear {extras['val_ref/bilinear_psnr']:.2f}  "
-                f"vae2 roundtrip {extras['val_ref/vae_psnr']:.2f}",
+                f"vae2 roundtrip {extras['val_ref/vae_psnr']:.2f}"
+                + (
+                    f"  face {extras['val_ref/vae_psnr_face']:.2f}"
+                    if "val_ref/vae_psnr_face" in extras else ""
+                )
+                + (
+                    f"  nonface {extras['val_ref/vae_psnr_nonface']:.2f}"
+                    if "val_ref/vae_psnr_nonface" in extras else ""
+                )
+                + (
+                    f"  faces {extras['val_raw/face_fraction']:.3f}"
+                    if "val_raw/face_fraction" in extras else ""
+                ),
                 flush=True,
             )
         print(f"step {step:06d}  validation {count} frames  {time.perf_counter() - started:.1f}s", flush=True)
