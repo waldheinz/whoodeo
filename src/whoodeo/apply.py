@@ -12,10 +12,24 @@ The network runs on each full frame. A 5-frame model sees the center frame
 plus two neighbors on either side, repeating the first or last frame at the
 ends. The live page shows the input and the reconstruction. Audio
 streams are copied packet for packet, without re-encoding.
+
+A latent_up checkpoint runs with the vae2 its config names (a path under
+/mnt/home-storinator-trem is looked up under /Volumes/home, --vae overrides
+it): latent_up predicts the code, the vae2 decodes it, the frame is clamped
+and cropped to 2h x 2w, exactly as training validates. PyTorch picks MPS,
+then CUDA, then the CPU.
+
+--coreml runs a package from whoodeo-coreml instead of PyTorch, on the unit
+--unit names: gpu (CPU_AND_GPU, the default), ane (CPU_AND_NE), cpu, or all.
+A .mlpackage as the model does the same. The frame is padded on the bottom
+and the right to the package's whoodeo.pad (reflect) and must fit its size
+range; the result is cropped to 2h x 2w, as in the macOS app. Without --out a
+package writes <stem>-recon-<package>-<unit>.mkv into the current directory.
 """
 
 import argparse
 import os
+import time
 import unicodedata
 from pathlib import Path
 
@@ -37,7 +51,7 @@ def get_device():
     return torch.device("cpu")
 
 
-def load_checkpoint(path, device):
+def load_checkpoint(path, device, vae=None):
     spec = load_generator(path)
     if spec.architecture.get("arch") in ("vae", "vae2"):
         raise SystemExit(
@@ -45,15 +59,130 @@ def load_checkpoint(path, device):
             "whoodeo-apply upscales video"
         )
     if spec.architecture.get("arch") == "latent_up":
-        raise SystemExit(
-            f"{path}: a latent_up checkpoint predicts a vae2 code. "
-            "whoodeo-apply does not decode it yet"
-        )
+        # coreml imports coremltools only when it converts or benches.
+        from whoodeo.coreml import load_latent_up
+        from whoodeo.models.latent_up import LatentUpReference
+
+        model, label, step, vae_model, vae_label, _vae_spec, vae_path = load_latent_up(spec, device, vae)
+        print(f"vae2 {vae_path}", flush=True)
+        reference = LatentUpReference(model, vae_model).eval()
+        return reference, f"{label} + {vae_label} decoder", 1, step, spec.path
+    if vae is not None:
+        raise SystemExit("--vae is for a latent_up checkpoint")
     return build_generator(spec, device)
 
 
-def iter_reconstructions(model, frames, radius, device):
-    """Yield (low, recon) for every input frame. Neighbors outside the clip repeat the edge frame."""
+COREML_UNITS = ("gpu", "ane", "cpu", "all")
+
+
+class CoreMLModel:
+    """A whoodeo-coreml package as a callable on NCHW float tensors in [0, 1].
+
+    Pads to the package's whoodeo.pad (reflect, as pad_to), checks the size
+    against its range or enumerated sizes, feeds the input dtype the package
+    declares, and crops the result to 2h x 2w.
+    """
+
+    def __init__(self, package, unit="gpu"):
+        try:
+            import coremltools as ct
+        except ImportError as exc:
+            raise SystemExit(
+                "coremltools is not installed. On the Mac: "
+                "uv pip install --python .venv/bin/python 'coremltools==9.1.dev1'"
+            ) from exc
+        from coremltools.models.utils import load_spec
+
+        package = Path(package)
+        if not package.exists():
+            raise SystemExit(f"no package: {package}")
+        units = {
+            "gpu": ct.ComputeUnit.CPU_AND_GPU,
+            "ane": ct.ComputeUnit.CPU_AND_NE,
+            "cpu": ct.ComputeUnit.CPU_ONLY,
+            "all": ct.ComputeUnit.ALL,
+        }
+        spec = load_spec(str(package))
+        meta = dict(spec.description.metadata.userDefined)
+        inputs = {item.name: item for item in spec.description.input}
+        if "frames" not in inputs:
+            raise SystemExit(f"{package}: no input named frames ({', '.join(inputs)})")
+        array_type = inputs["frames"].type.multiArrayType
+        # ArrayDataType FLOAT16 is 65552, FLOAT32 65568.
+        self.dtype = np.float16 if array_type.dataType == 65552 else np.float32
+        self.package = package
+        self.unit = unit
+        self.meta = meta
+        self.arch = meta.get("whoodeo.arch", "")
+        self.step = int(meta["whoodeo.step"]) if meta.get("whoodeo.step", "").isdigit() else None
+        self.in_frames = int(meta.get("whoodeo.in_frames", "1") or 1)
+        self.pad = int(meta.get("whoodeo.pad", "1") or 1)
+        self.sizes = []
+        for part in meta.get("whoodeo.sizes", "").split(","):
+            if "x" in part:
+                width, height = (int(item) for item in part.split("x"))
+                self.sizes.append((height, width))
+        self.range = None
+        if not self.sizes and "whoodeo.width_max" in meta:
+            self.range = (
+                int(meta["whoodeo.height_min"]), int(meta["whoodeo.height_max"]),
+                int(meta["whoodeo.width_min"]), int(meta["whoodeo.width_max"]),
+            )
+        self.label = (
+            f"{package.name}  {self.arch or 'model'}  step {self.step}  unit {unit}  "
+            f"conv scale {meta.get('whoodeo.conv_scale', '?')}"
+        )
+        self.model = ct.models.MLModel(
+            str(package),
+            compute_units=units[unit],
+            optimization_hints={"reshapeFrequency": ct.ReshapeFrequency.Infrequent},
+        )
+
+    def check_size(self, height, width):
+        """The padded size, or SystemExit with what the package takes."""
+        pad_h = height + (-height) % self.pad
+        pad_w = width + (-width) % self.pad
+        if self.sizes and (pad_h, pad_w) not in self.sizes:
+            known = ", ".join(f"{w}x{h}" for h, w in self.sizes)
+            raise SystemExit(f"{self.package.name}: {pad_w}x{pad_h} is not one of its sizes: {known}")
+        if self.range is not None:
+            min_h, max_h, min_w, max_w = self.range
+            if not (min_h <= pad_h <= max_h and min_w <= pad_w <= max_w):
+                raise SystemExit(
+                    f"{self.package.name}: {pad_w}x{pad_h} is outside its range "
+                    f"{min_w}x{min_h} to {max_w}x{max_h}. Scale the video down or export with --max-low"
+                )
+        return pad_h, pad_w
+
+    def eval(self):
+        return self
+
+    def __call__(self, frames):
+        from whoodeo.models.common import pad_to
+
+        height, width = frames.shape[-2:]
+        self.check_size(height, width)
+        padded, _h, _w = pad_to(frames.float().cpu(), self.pad) if self.pad > 1 else (frames, height, width)
+        batch = padded.numpy().astype(self.dtype, copy=False)
+        result = self.model.predict({"frames": batch})
+        image = result.get("image")
+        if image is None:
+            raise SystemExit(f"{self.package.name}: output names {', '.join(result)}")
+        array = np.asarray(image, dtype=np.float32)
+        if array.ndim == 3:
+            array = array[None]
+        return torch.from_numpy(array[:, :, :2 * height, :2 * width].copy())
+
+
+def is_package(path):
+    return path is not None and Path(path).suffix == ".mlpackage"
+
+
+def iter_reconstructions(model, frames, radius, device, timings=None):
+    """Yield (low, recon) for every input frame. Neighbors outside the clip repeat the edge frame.
+
+    `timings`, a list, gets the seconds each model call took, the copy back included.
+    """
     buf = []
     abs_start = 0
     emitted = 0
@@ -73,8 +202,11 @@ def iter_reconstructions(model, frames, radius, device):
                 for dt in range(-radius, radius + 1)
             ], dim=0)
             low = buf[center_local]
+            started = time.perf_counter()
             with torch.inference_mode():
                 recon = model(stacked.unsqueeze(0).to(device)).squeeze(0).detach().cpu()
+            if timings is not None:
+                timings.append(time.perf_counter() - started)
             emitted += 1
             while emitted - radius > abs_start:
                 buf.pop(0)
@@ -190,8 +322,21 @@ def apply(args):
     args.input = resolve_video(args.input)
     if not args.input.is_file():
         raise SystemExit(f"no video: {args.input}")
-    device = get_device()
-    model, label, in_frames, step, checkpoint_path = load_checkpoint(args.model, device)
+    package = args.coreml
+    if package is None and is_package(args.model):
+        package = args.model
+    if package is not None:
+        if args.vae is not None:
+            raise SystemExit("--vae is for a PyTorch latent_up checkpoint; a package has its decoder built in")
+        device = torch.device("cpu")
+        model = CoreMLModel(package, args.unit or "gpu")
+        label, in_frames, step = model.label, model.in_frames, model.step
+        checkpoint_path = None
+    else:
+        if args.unit is not None:
+            raise SystemExit("--unit picks the Core ML unit. Pass --coreml PACKAGE (whoodeo-coreml writes one)")
+        device = get_device()
+        model, label, in_frames, step, checkpoint_path = load_checkpoint(args.model, device, args.vae)
     if in_frames % 2 != 1:
         raise SystemExit(f"checkpoint uses {in_frames} input frames; that count has to be odd")
     source = av.open(str(args.input))
@@ -199,13 +344,20 @@ def apply(args):
     fps = source_rate(video_in)
     width = video_in.codec_context.width
     height = video_in.codec_context.height
+    if package is not None:
+        model.check_size(height, width)
     out = args.out
-    if out is None:
+    if out is None and package is not None:
+        out = Path.cwd() / f"{args.input.stem}-recon-{Path(package).stem}-{model.unit}.mkv"
+    elif out is None:
         out = reconstruction_path(checkpoint_path, step, args.input)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"device {device}", flush=True)
-    print(f"checkpoint {checkpoint_path}  step {step}  {label}", flush=True)
+    if package is not None:
+        print(f"core ml {label}", flush=True)
+    else:
+        print(f"device {device}", flush=True)
+        print(f"checkpoint {checkpoint_path}  step {step}  {label}", flush=True)
     print(f"input {args.input}  {width}x{height}  {float(fps):g} fps", flush=True)
     if source.streams.audio:
         codecs = " ".join(
@@ -229,11 +381,13 @@ def apply(args):
             out.unlink(missing_ok=True)
             raise SystemExit(f"cannot copy audio into {out.name}: {exc}") from exc
         configured = [False]
+        timings = []
         frames = iter_reconstructions(
             model,
             read_video_frames(args.input),
             in_frames // 2,
             device,
+            timings,
         )
         count = 0
         interrupted = False
@@ -274,6 +428,14 @@ def apply(args):
                 container.close()
                 source.close()
         print(f"wrote {count} frames  {out}", flush=True)
+        if len(timings) > 1:
+            # The first call pays for the compiler (Core ML) or the kernels (MPS).
+            steady = sorted(timings[1:])
+            print(
+                f"model {steady[len(steady) // 2] * 1000:.1f} ms per frame (median), "
+                f"first {timings[0] * 1000:.0f} ms",
+                flush=True,
+            )
     finally:
         if live is not None:
             live.close()
@@ -288,7 +450,8 @@ def parse_args(argv=None):
         "model",
         nargs="?",
         type=Path,
-        help="checkpoint, run directory, model.pt, or train.pt (default: latest in the runs directory)",
+        help="checkpoint, run directory, model.pt, train.pt, or a .mlpackage "
+             "(default: latest in the runs directory)",
     )
     parser.add_argument("input", nargs="?", type=Path, help="video to reconstruct")
     parser.add_argument(
@@ -298,6 +461,25 @@ def parse_args(argv=None):
         help="mkv to write (default: <stem>-recon-<step>.mkv in the run directory)",
     )
     parser.add_argument("--frames", type=int, default=0, help="stop after this many frames; 0 means the whole video")
+    parser.add_argument(
+        "--vae",
+        type=Path,
+        default=None,
+        help="latent_up: the vae2 checkpoint. Default: the one the checkpoint names, "
+             "/mnt/home-storinator-trem mapped to /Volumes/home",
+    )
+    parser.add_argument(
+        "--coreml",
+        type=Path,
+        default=None,
+        help="run this whoodeo-coreml package instead of PyTorch",
+    )
+    parser.add_argument(
+        "--unit",
+        choices=COREML_UNITS,
+        default=None,
+        help="Core ML compute unit: gpu (default), ane (Neural Engine), cpu, or all",
+    )
     add_live_args(parser)
     args = parser.parse_args(argv)
     if args.input is None and args.model is not None:
@@ -305,7 +487,7 @@ def parse_args(argv=None):
         args.model = None
     if args.input is None:
         parser.error("pass the video to reconstruct")
-    if args.model is None:
+    if args.model is None and args.coreml is None:
         args.model = latest_link()
         if not args.model.exists():
             raise SystemExit(
