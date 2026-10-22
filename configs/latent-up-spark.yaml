@@ -1,25 +1,35 @@
-# latent-up on the DGX Spark: a first trial of a 2x upscaler that predicts the
-# code of the frozen vae2d (runs/train-20261020-093437, step 15755) instead of
-# pixels. The low frame h x w goes to the normalized code
-# z = (mu - shift) * scale at h/4 x w/4, which is the vae2 latent of the
-# 2h x 2w master; the frozen decoder turns z / scale + shift into the picture.
-# Whole frames, every low variant of the catalog (no variants filter).
+# latent-up on the DGX Spark: a 2x upscaler that predicts the code of the
+# frozen vae2g (relu, 16 latents) instead of pixels. The vae2g is the
+# fine-tune runs/train-20261022-003147 (from runs/train-20261021-121504 step
+# 9442) at step 500, its last validated checkpoint (val/psnr 37.58, face
+# 38.31). Not the newer 000638 written at Ctrl-C: on 12 latent_up val frames
+# its roundtrip was 1-6 dB below 000500 (and below bicubic on most), and its
+# latent shift and scale are still those measured on the step-500 encoder
+# (22.10.2026). The low
+# frame h x w goes to the normalized code z = (mu - shift) * scale at
+# h/4 x w/4, which is the vae2 latent of the 2h x 2w master; the frozen
+# decoder turns z / scale + shift into the picture. Whole frames, every low
+# variant of the catalog (no variants filter).
+#
+# Before (runs/train-20261021-064120 and the trials around it): the frozen
+# vae2d (silu, runs/train-20261020-093437 step 15755) and the vae2d image
+# recipe pixel / vgg / color times 0.75, see the loss comment below.
 
 model:
   arch: latent_up
-  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261020-093437/checkpoints/015755
-  latent: 16                # the vae2d's channels
+  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261022-003147/checkpoints/000500
+  latent: 16                # the vae2g's channels (16 since vae2d)
   channels: 64              # low resolution; 128 at 1/2, 256 at 1/4
   widths: [1, 2, 4]         # multiples of channels: low, 1/2, 1/4
   encoder_blocks: [2, 4]    # residual blocks at low and at 1/2
   blocks: 12                # residual blocks at 1/4, dilations 1, 2, 4 in turn
   # relu instead of silu, for the Neural Engine (see vae2e-spark.yaml). The
   # step-2669 run (runs/train-20261021-064120) is silu and does not resume
-  # under this. vae: above still names the silu vae2d; it moves to the vae2e
-  # run once that is trained.
+  # under this. The vae2g decoder above is relu too, so the whole Core ML
+  # program is relu.
   activation: relu
 
-# Copy the vae2d's 6 latent blocks into the last 6 blocks at 1/4 and its head
+# Copy the vae2's 6 latent blocks into the last 6 blocks at 1/4 and its head
 # (shift and scale folded in). Fresh runs only.
 init_from_vae: false
 
@@ -37,27 +47,45 @@ val_every: 250
 val_count: 96
 seed: 42
 # The loss is the sum of weight x raw. latent, L1 on the normalized code, is
-# the main term. The image terms are the vae2d recipe (pixel 1, vgg 0.230 /
-# 0.155, oklab color 5.5 on 1/16) times 0.75, so their balance is the one
-# that decoder was trained under. Measured on a 200-step trial with the full
-# vae2d weights (96 val frames): at step 0 the image part was 0.60 against
-# latent 0.74 (an untrained decode), at step 100 0.26 against 0.59, at step
-# 200 0.22 against 0.52, about 42%, vgg 0.15 of it and barely moving. Times
-# 0.75 is about 1/3 of the latent term over the first few hundred steps.
-# vgg has a floor at the vae2d roundtrip, so as the latent L1 falls the
-# image part will gain share; lower these if it starts to dominate.
+# the main term. The image terms are the vae2g recipe as it is, without a
+# factor: oklab 4.5 (channels 1/1/1), ms_ssim 1, vgg relu2_2 0.230 / relu3_4
+# 0.155, the weights vae2f/vae2g were calibrated with on vae2d (32 val
+# frames, 21.10.2026: oklab + ms_ssim about 23% beside VGG, the share pixel 1
+# + color 5.5 had), so the balance among them is the one this decoder was
+# trained under. See configs/vae2g-spark.yaml.
+#
+# Before: pixel 0.75 (l1), vgg relu2_2 0.1725 / relu3_4 0.11625, color 4.125
+# (oklab, pool 16), that is the vae2d recipe (pixel 1, vgg 0.230 / 0.155,
+# color 5.5) times 0.75. Measured on a 200-step trial with the full vae2d
+# weights (96 val frames): at step 0 the image part was 0.60 against latent
+# 0.74 (an untrained decode), at step 100 0.26 against 0.59, at step 200 0.22
+# against 0.52, about 42%, vgg 0.15 of it and barely moving. Times 0.75 was
+# about 1/3 of the latent term over the first few hundred steps. Here the
+# image terms are at full weight; vgg has a floor at the vae2g roundtrip, so
+# as the latent L1 falls the image part will gain share; lower these if it
+# starts to dominate.
 loss:
   terms:
-    - name: latent       # L1 on the normalized code against the vae2d code of the master
+    - name: latent       # L1 on the normalized code against the vae2g code of the master, face-weighted
       weight: 1.0
-    - name: pixel
-      weight: 0.75
-      kind: l1
-    - name: vgg
+    - name: oklab        # L1 on Oklab at full resolution, replaces pixel (0.75) and color (4.125)
+      weight: 4.5          # vae2g: 1/1/1, raw 0.00313 on vae2d, 4.5 keeps ~23% beside VGG
+      channels: [1.0, 1.0, 1.0]   # L, a, b: no extra chroma weight, as in vae2g
+    - name: ms_ssim      # 1 - MS-SSIM on Oklab L, 5 scales, as in vae2g
+      weight: 1.0
+      scales: 5
+    - name: vgg          # the vae2g weights; before 0.1725 / 0.11625 (x 0.75)
       layers:
-        relu2_2: 0.1725
-        relu3_4: 0.11625
-    - name: color      # L1 on 1/16 pooled Oklab, a and b weighted twice
-      weight: 4.125
-      space: oklab
-      pool: 16
+        relu2_2: 0.230
+        relu3_4: 0.155
+
+# Face weighting, the vae2g values. YuNet runs on the master of each pair in
+# the loader thread (validation: main thread). oklab, ms_ssim, and vgg take
+# the weight map of the master (mean 1 per frame), the latent L1 the same map
+# area-pooled by 8 onto the latent grid, again mean 1 per frame. Not part of
+# the loss recipe: a resume may change it, weight 1 is off.
+faces:
+  weight: 3.0      # inside a face, before the mean-1 normalisation per frame
+  score: 0.6       # YuNet threshold; a missed face only means weight 1 there
+  expand: 1.2      # each box grows by this about its center
+  feather: 0.1     # Gaussian edge, sigma as a share of the grown box's shorter side
