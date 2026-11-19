@@ -43,7 +43,10 @@ the 2 x 2 pooled frame. `python -m whoodeo.eval_latent <checkpoint>` computes
 the same numbers for a saved checkpoint.
 
 Training batches are decoded on one side thread into a queue of three CPU
-batches. A frame read opens the video and closes it before the next read.
+batches. The frames of a batch are read at the same time, on a pool of
+_READ_THREADS threads, in the order of the draw. A frame read opens the video
+and closes it, so over a network mount each read pays the latency of the open
+and the seek, and parallel reads hide it.
 An unreadable training clip is logged and the loader draws a new batch.
 The step copies a batch onto the device. Validation reads on the main thread.
 
@@ -158,6 +161,7 @@ import random
 import shutil
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, wait
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -256,15 +260,33 @@ def make_batch_specs(rng, films, split, count):
     return specs
 
 
+# Frame reads in flight at once. A read is mostly waiting: on spark-03 over
+# the VPN mount (19.11.2026) a random master frame took about 0.09 s to open
+# and 0.25 s to seek and decode for 0.7 MB on the wire, so a batch of 6 read
+# one by one took about 2 s. The pool is shared by the loader thread and
+# validation; PyAV releases the GIL while it reads and decodes.
+_READ_THREADS = 8
+_READS = ThreadPoolExecutor(max_workers=_READ_THREADS, thread_name_prefix="whoodeo-read")
+
+
+def read_all(read, items):
+    """read(item) for each item, in parallel, results in the order of items.
+
+    The first failure in that order is raised once every read has finished.
+    """
+    futures = [_READS.submit(read, item) for item in items]
+    wait(futures)
+    return [future.result() for future in futures]
+
+
 def batch_from_specs(films, specs, radius):
-    lows = []
-    highs = []
-    for film_index, variant_index, index in specs:
+    def read(spec):
+        film_index, variant_index, index = spec
         film = films[film_index]
-        low, high = load_sample(film, film.variants[variant_index], index, radius)
-        lows.append(low)
-        highs.append(high)
-    return torch.stack(lows), torch.stack(highs)
+        return load_sample(film, film.variants[variant_index], index, radius)
+
+    samples = read_all(read, specs)
+    return torch.stack([low for low, _ in samples]), torch.stack([high for _, high in samples])
 
 
 def batch_on_device(films, specs, radius, device):
@@ -775,7 +797,7 @@ def vae_batch(films, specs, crop, rng, detector=None, faces=None):
     With a detector, YuNet runs on the final frames (after the crop), and the
     batch carries the boxes and the soft face mask of `faces`.
     """
-    frames = [load_master(films[film_index], index) for film_index, index in specs]
+    frames = read_all(lambda spec: load_master(films[spec[0]], spec[1]), specs)
     if crop is not None:
         cropped = []
         for frame in frames:
