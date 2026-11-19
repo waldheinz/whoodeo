@@ -126,6 +126,15 @@ Each vae2 validation also logs `val_noise/psnr_{0.1,0.3,0.5}` (PSNR of decode(μ
 
 `configs/vae2.yaml` is the current recipe: the layout above with 16 latent channels, `posterior: fixed`, latent noise with tau 0.4, Oklab color, `mu_l2` at 5e-4, and `scale_eq` at 0.25, at batch 2. `configs/vae2d-spark.yaml` is the same recipe at batch 6 for the DGX Spark, and its comments say where each choice comes from. `configs/vae2e-spark.yaml` is vae2d with `activation: relu` and nothing else changed, a fresh run to see what relu costs in quality; relu is for the Neural Engine, see the Core ML section below. A 40-step smoke run on the Spark (21.10.2026) took 2.3–2.6 s/step at 480p and 5.2–5.9 s at 720p, left about 60 GB RAM available, and went from val/psnr 5.9 to 19.0. The loader reads the frames of a training batch on 8 threads at once (`_READ_THREADS` in `train.py`), because each read opens its video, seeks, and closes it again: over the VPN mount on spark-03 (19.11.2026) a random master frame cost about 0.34 s and 0.7 MB on the wire, and a batch of 6 took 1.83 s read one by one against 0.57 s in parallel.
 
+The user config `~/.config/whoodeo/config.yaml` (`$XDG_CONFIG_HOME/whoodeo`) names the machine's directories and the live page, every key optional: `data`, the folder with `orig/`, `low/` and `catalog.json`; `runs`, the folder of the runs and `latest`; `events`, a folder for the TensorBoard events, one subfolder per run name, which otherwise stay in the run directory; and `live`, the `host:port` of the live page of `whoodeo-train` and `whoodeo-apply` (default `127.0.0.1:8765`, `0.0.0.0:8765` serves it to the network, port 0 picks a free one). On a network mount each TensorBoard event is its own append, which made each step wait about 5 s over the VPN mount on spark-03, so there `events` points to the local disk. spark-03:
+
+```
+data: /mnt/home-storinator-trem/whoodeo/train
+runs: /mnt/home-storinator-trem/whoodeo/runs
+events: ~/whoodeo-events
+live: 0.0.0.0:8765
+```
+
 A vae2 may add a `gan` term with the U-Net discriminator. Its weight is not a share of the objective. The generator term is the latent diffusion adaptive weight, the gradient norm of the objective over that of the GAN loss at the last decoder convolution, times `weight`. The discriminator trains from the first step. The generator term joins at `start`. The validation objective leaves the GAN out. `freeze_encoder: true` trains the decoder alone. `configs/vae2-gan.yaml` combines the two as a fine-tune of a vae2 run:
 
 ```

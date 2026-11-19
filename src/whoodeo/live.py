@@ -16,6 +16,7 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 
+from whoodeo.catalog import live_bind
 from whoodeo.video import png_bytes
 
 _PAGE = (Path(__file__).with_name("live.html")).read_bytes()
@@ -61,17 +62,13 @@ def bind_address(text):
 
 def add_live_args(parser):
     parser.add_argument("--no-preview", action="store_true", help="do not serve the live page")
-    parser.add_argument(
-        "--live-bind",
-        default="127.0.0.1:8765",
-        help="host:port for the live page (default 127.0.0.1:8765; port 0 picks a free port)",
-    )
 
 
-def open_live(bind, enabled=True):
+def open_live(enabled=True):
+    """The live page at the `live` address of the user config (default 127.0.0.1:8765)."""
     if not enabled:
         return None
-    host, port = bind_address(bind)
+    host, port = bind_address(live_bind())
     return Live(host, port)
 
 

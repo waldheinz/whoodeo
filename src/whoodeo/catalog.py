@@ -8,6 +8,16 @@ under $XDG_DATA_HOME/whoodeo, runs under $XDG_STATE_HOME/whoodeo. An empty
 or relative value in those variables is ignored, and the spec default
 under the home directory is used instead.
 
+`events` is optional: the directory for the TensorBoard events of each run,
+one folder per run name. Without it the events stay in the run directory.
+On a network mount each TensorBoard event is its own append, which made the
+training step wait (about 5 s a step over the VPN mount of spark-03,
+19.11.2026), so there the events go to a local disk.
+
+`live` is the host:port the live page of training and whoodeo-apply binds,
+127.0.0.1:8765 when absent; 0.0.0.0:8765 serves it to the network, port 0
+picks a free port.
+
 Rungs and the degrade recipe live in the data directory's catalog.json,
 not in this file.
 """
@@ -17,7 +27,9 @@ from pathlib import Path
 
 import yaml
 
-_PATH_KEYS = ("data", "runs")
+_PATH_KEYS = ("data", "runs", "events")
+_LIVE_KEY = "live"
+DEFAULT_LIVE = "127.0.0.1:8765"
 
 
 class EnvPath:
@@ -58,6 +70,22 @@ def runs_root():
     return _xdg_home("XDG_STATE_HOME", ".local/state") / "whoodeo"
 
 
+def events_root():
+    """Directory for the TensorBoard events of the runs, or None for the run directory."""
+    return _configured("events")
+
+
+def live_bind():
+    """host:port for the live page, from the config or the default."""
+    data = _document()
+    if _LIVE_KEY not in data:
+        return DEFAULT_LIVE
+    value = data[_LIVE_KEY]
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"{config_path()}: {_LIVE_KEY} must be host:port")
+    return value.strip()
+
+
 def resolve_data(path):
     if isinstance(path, EnvPath):
         return path.resolve()
@@ -70,7 +98,7 @@ def _configured(key):
 
 
 def _document():
-    """The config mapping. Only data and runs are read."""
+    """The config mapping. Only data, runs, events, and live are read."""
     path = config_path()
     if not path.exists():
         return {}
@@ -84,7 +112,7 @@ def _document():
         return {}
     if not isinstance(data, dict):
         raise SystemExit(f"{path}: expected a mapping")
-    unknown = [str(name) for name in data if name not in _PATH_KEYS]
+    unknown = [str(name) for name in data if name not in _PATH_KEYS and name != _LIVE_KEY]
     if unknown:
         names = ", ".join(sorted(unknown))
         raise SystemExit(f"{path}: unknown keys: {names}")

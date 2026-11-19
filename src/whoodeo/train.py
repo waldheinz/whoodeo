@@ -171,7 +171,7 @@ import av
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
-from whoodeo.catalog import data_root, runs_root
+from whoodeo.catalog import data_root, events_root, runs_root
 from whoodeo.checkpoint import (
     build_generator, continue_run, load_generator, load_resume, run_directory, save_run,
 )
@@ -1140,7 +1140,7 @@ def open_run(cfg, resume, finetune, load):
     return run
 
 
-def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evaluate_split):
+def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
     """The live page and the step loop.
 
     Validation specs are drawn before the loader starts. The plateau follows
@@ -1159,8 +1159,11 @@ def drive(run, preview, live_bind, make_val_specs, make_loader, one_step, evalua
         describe_loss(cfg, objective)
         describe_schedule(cfg, run.plateau, run.plateau_note)
 
-        live = open_live(live_bind, preview)
-        writer = SummaryWriter(log_dir=run.out_dir)
+        live = open_live(preview)
+        events = events_root()
+        events_dir = run.out_dir if events is None else events / run.out_dir.name
+        print(f"tensorboard events: {events_dir}", flush=True)
+        writer = SummaryWriter(log_dir=str(events_dir))
 
         def logged_parts(weighted, work):
             gan_value = work.gan
@@ -1952,7 +1955,7 @@ def load_vae(cfg):
     return found.films
 
 
-def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=None):
+def train(cfg, preview=True, resume=None, finetune=None):
     if cfg.arch in VAE_ARCHS:
         def load():
             return load_vae(cfg)
@@ -1971,7 +1974,7 @@ def train(cfg, preview=True, live_bind="127.0.0.1:8765", resume=None, finetune=N
     run = open_run(cfg, resume, finetune, load)
     if run is None:
         return
-    drive(run, preview, live_bind, *hooks(run))
+    drive(run, preview, *hooks(run))
 
 
 def main():
@@ -2011,7 +2014,6 @@ def main():
     train(
         load_config(args.config, architecture, architecture_from),
         preview=not args.no_preview,
-        live_bind=args.live_bind,
         resume=args.resume,
         finetune=finetune,
     )

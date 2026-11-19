@@ -368,7 +368,7 @@ def apply(args):
         print("audio none", flush=True)
     print(f"output {out}  libx265 main10 yuv420p10le crf 25", flush=True)
 
-    live = open_live(args.live_bind, not args.no_preview)
+    live = open_live(not args.no_preview)
     try:
         container = av.open(str(out), "w")
         stream = container.add_stream("libx265", rate=fps)
