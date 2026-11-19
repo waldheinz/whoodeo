@@ -436,8 +436,12 @@ nonisolated final class FrameStore: @unchecked Sendable {
 
     /// The write handle. Callers already hold `lock`, so this stays off the playback reader.
     private func readUnlocked(_ slot: Slot) throws -> Data {
-        try dataHandle.seek(toOffset: slot.offset)
-        guard let data = try dataHandle.read(upToCount: Int(slot.length)), data.count == slot.length else {
+        // The read hands back autoreleased bytes. Export loops are async and never drain a pool on their own.
+        let data = try autoreleasepool {
+            try dataHandle.seek(toOffset: slot.offset)
+            return try dataHandle.read(upToCount: Int(slot.length))
+        }
+        guard let data, data.count == slot.length else {
             throw CLIError("Cachebild ist abgeschnitten")
         }
         return data
@@ -448,8 +452,11 @@ nonisolated final class FrameStore: @unchecked Sendable {
     private func read(_ slot: Slot) throws -> Data {
         readLock.lock()
         defer { readLock.unlock() }
-        try readHandle.seek(toOffset: slot.offset)
-        guard let data = try readHandle.read(upToCount: Int(slot.length)), data.count == slot.length else {
+        let data = try autoreleasepool {
+            try readHandle.seek(toOffset: slot.offset)
+            return try readHandle.read(upToCount: Int(slot.length))
+        }
+        guard let data, data.count == slot.length else {
             throw CLIError("Cachebild ist abgeschnitten")
         }
         return data

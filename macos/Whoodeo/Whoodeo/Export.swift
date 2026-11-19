@@ -251,7 +251,9 @@ nonisolated enum Export {
             if cancelled() { throw CLIError("abgebrochen") }
             let time = film.time(for: index)
             let prepared = try await materialize(index, film: film, predictor: predictor, store: store, stored: stored)
-            let sample = try store.sampleBuffer(prepared.data, time: time, duration: film.duration(at: index))
+            let sample = try autoreleasepool {
+                try store.sampleBuffer(prepared.data, time: time, duration: film.duration(at: index))
+            }
             try await receiver.append(CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample))
             done += 1
             pulse.tick()
@@ -283,12 +285,13 @@ nonisolated enum Export {
             if cancelled() { throw CLIError("abgebrochen") }
             let time = film.time(for: index)
             let prepared = try await materialize(index, film: film, predictor: predictor, store: store, stored: stored)
-            let buffer: CVPixelBuffer
-            if let rgb = prepared.rgb {
-                buffer = try transfer.convert(rgb, width: width, height: height, format: format, pool: nil)
-            } else {
+            // The cache decode and the color transfer autorelease per frame; drain them before the await.
+            let buffer: CVPixelBuffer = try autoreleasepool {
+                if let rgb = prepared.rgb {
+                    return try transfer.convert(rgb, width: width, height: height, format: format, pool: nil)
+                }
                 let cached = try store.image(at: index)
-                buffer = try transfer.convert(cached, format: format, pool: nil)
+                return try transfer.convert(cached, format: format, pool: nil)
             }
             try await receiver.append(CVReadOnlyPixelBuffer(unsafeBuffer: buffer), with: time)
             done += 1
