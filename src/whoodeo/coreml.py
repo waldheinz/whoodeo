@@ -18,6 +18,12 @@ enumerated sizes instead. The app pads a frame on the bottom and the right
 (reflect) to the next multiple of 4 and crops the result to 2h x 2w. The vae2
 is the one the checkpoint names; a path under /mnt/home-storinator-trem is
 looked up under /Volumes/home, and --vae overrides it.
+A latent_up with condition (FiLM) is exported for one codec: --codec h264,
+mpeg4, mpeg2, or unknown (the default, all zero). γ and β of that codec are
+computed once and sit in the graph as constants, a multiply and an add behind
+each residual block; the frame stays the only input. The metadata names the
+codec, the package name ends in it, so one package per codec can live side by
+side. --bench compares with PyTorch under the same codec.
 The Neural Engine loses conv products below about 2^-14, which the residual
 convolutions that start at zero produce in numbers. --conv-scale k (16 by
 default for vae2 and latent_up, off for vote and edsr) multiplies each
@@ -172,7 +178,7 @@ def _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote):
 
 def convert(
     checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=None, vae=None, plan=False,
-    conv_scale=None, max_low=LOW_MAX,
+    conv_scale=None, max_low=LOW_MAX, codec=None,
 ):
     """Write an mlprogram with a flexible input, a vae2 decoder, or latent_up with its decoder.
 
@@ -184,10 +190,12 @@ def convert(
     arch = spec.architecture.get("arch")
     if conv_scale is None:
         conv_scale = CONV_SCALE if arch in ("vae2", "latent_up") else 1.0
+    if codec is not None and arch != "latent_up":
+        raise SystemExit(f"--codec is for a latent_up with condition, not {arch}")
     if arch == "vae2":
         return convert_decoder(ct, spec, output, latent_sizes, conv_scale)
     if arch == "latent_up":
-        return convert_latent_up(ct, spec, output, low_sizes, vae, plan, conv_scale, max_low)
+        return convert_latent_up(ct, spec, output, low_sizes, vae, plan, conv_scale, max_low, codec)
     if arch not in ("vote", "edsr"):
         raise SystemExit(
             f"{checkpoint}: whoodeo-coreml converts vote, edsr, vae2, and latent_up, not {arch}"
@@ -351,8 +359,13 @@ def _smooth_frames(height, width, seed=0):
     return torch.nn.functional.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
 
 
-def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan, conv_scale=CONV_SCALE, max_low=LOW_MAX):
-    """Write latent_up and its vae2 decoder as one program, flexible up to `max_low` or enumerated."""
+def convert_latent_up(
+    ct, spec, output, low_sizes, vae_override, plan, conv_scale=CONV_SCALE, max_low=LOW_MAX, codec=None,
+):
+    """Write latent_up and its vae2 decoder as one program, flexible up to `max_low` or enumerated.
+
+    With condition, `codec` (None is unknown) is fixed into the graph.
+    """
     from whoodeo.models.latent_up import FACTOR, LatentUpExport, LatentUpReference
 
     model, label, step, vae, vae_label, vae_spec, vae_path = load_latent_up(
@@ -362,9 +375,13 @@ def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan, conv_scal
     for height, width in sizes or [max_low]:
         if height % FACTOR or width % FACTOR:
             raise SystemExit(f"low size {width}x{height}: both sides must divide by {FACTOR}")
-    folded = LatentUpExport(model, vae).eval()
+    condition = spec.architecture.get("condition")
+    if condition is not None:
+        codec = codec or "unknown"
+        print(f"condition {condition}: codec {codec} fixed into the graph", flush=True)
+    folded = LatentUpExport(model, vae, codec).eval()
     export = scale_convs(folded, conv_scale)
-    reference = LatentUpReference(model, vae).eval()
+    reference = LatentUpReference(model, vae, codec).eval()
     # Neither the fold nor the conv scale may change the picture. fp32 on the CPU, padded and unpadded.
     with torch.no_grad():
         for height, width in ((96, 128), (90, 130)):
@@ -434,6 +451,9 @@ def convert_latent_up(ct, spec, output, low_sizes, vae_override, plan, conv_scal
     if sizes is not None:
         # Width x height, the order the app reads.
         meta["whoodeo.sizes"] = ",".join(f"{width}x{height}" for height, width in sizes)
+    if condition is not None:
+        meta["whoodeo.condition"] = condition
+        meta["whoodeo.codec"] = codec
     _assign_metadata(mlmodel, meta)
     output = Path(output)
     if output.exists():
@@ -641,7 +661,7 @@ def _package_probes(package):
     return [size for size in LOW_PROBES if size[0] <= max_h and size[1] <= max_w]
 
 
-def bench(package, checkpoint, videos, vae=None):
+def bench(package, checkpoint, videos, vae=None, codec=None):
     """Compare the package with PyTorch fp32 on real frames. PSNR sets the default unit."""
     ct = _coremltools()
     spec = load_generator(checkpoint)
@@ -650,7 +670,7 @@ def bench(package, checkpoint, videos, vae=None):
     if arch == "latent_up":
         from whoodeo.models.latent_up import LatentUpReference
         model, label, _step, vae_model, _vae_label, _vae_spec, _vae_path = load_latent_up(spec, device, vae)
-        model = LatentUpReference(model, vae_model).eval()
+        model = LatentUpReference(model, vae_model, codec).eval()
         sizes = _package_sizes(package, ct) or _package_probes(package)
         cases = list(_cases_latent_up(videos, sizes))
         dtype = np.float16
@@ -804,8 +824,8 @@ def _safe_name(text):
     return cleaned or "model"
 
 
-def package_filename(checkpoint, spec):
-    """Stable name the sidebar can read without opening the package."""
+def package_filename(checkpoint, spec, codec=None):
+    """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in its codec."""
     arch = spec.architecture.get("arch") or "model"
     blocks = spec.architecture.get("blocks")
     channels = spec.architecture.get("channels")
@@ -813,11 +833,13 @@ def package_filename(checkpoint, spec):
     step = spec.step
     step_part = f"step{int(step):06d}" if step is not None else "step"
     kind = {"vae2": "decoder", "latent_up": "range"}.get(arch, "flex")
+    if spec.architecture.get("condition") is not None:
+        kind += f"-{codec or 'unknown'}"
     return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"
 
 
-def _default_output(checkpoint, spec):
-    return library_directory() / package_filename(checkpoint, spec)
+def _default_output(checkpoint, spec, codec=None):
+    return library_directory() / package_filename(checkpoint, spec, codec)
 
 
 def parse_args(argv=None):
@@ -877,6 +899,12 @@ def parse_args(argv=None):
         action="store_true",
         help="latent_up: print the Neural Engine plan of each low size",
     )
+    parser.add_argument(
+        "--codec",
+        choices=("h264", "mpeg4", "mpeg2", "unknown"),
+        default=None,
+        help="latent_up with condition: the codec fixed into the package. Default: unknown",
+    )
     return parser.parse_args(argv)
 
 
@@ -895,18 +923,20 @@ def main(argv=None):
     spec = load_generator(args.model)
     if args.bench and spec.architecture.get("arch") == "vae2":
         raise SystemExit("--bench compares upscalers. A vae2 decoder has no low frames")
+    if args.codec is not None and spec.architecture.get("condition") is None:
+        raise SystemExit(f"{args.model}: --codec needs a latent_up with condition")
     if args.out is not None:
         output = args.out
     else:
-        output = _default_output(args.model, spec)
+        output = _default_output(args.model, spec, args.codec)
     if args.conv_scale is not None and args.conv_scale <= 0:
         raise SystemExit("--conv-scale must be positive")
     package, _spec = convert(
         args.model, output, args.latent or LATENT_SIZES, args.low, args.vae, args.plan,
-        args.conv_scale, args.max_low,
+        args.conv_scale, args.max_low, args.codec,
     )
     if args.bench:
-        bench(package, args.model, args.bench, args.vae)
+        bench(package, args.model, args.bench, args.vae, args.codec)
 
 
 if __name__ == "__main__":

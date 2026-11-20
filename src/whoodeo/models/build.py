@@ -9,7 +9,7 @@ that adds a shared vote from the previous and next frame. `vae` reconstructs
 one frame through a spatial Gaussian. `vae2` does the same with tapered
 widths and no normalization, so its decoder runs on the Neural Engine.
 `latent_up` maps a low frame to the code of a frozen vae2, whose decoder
-gives the 2x picture. `swinir`,
+gives the 2x picture; `condition: codec` adds FiLM on the codec of the low frame. `swinir`,
 `swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
 reconstruction heads. The training config sets depth, width, and input frames.
 """
@@ -63,7 +63,7 @@ def build_model(
     bilinear=None, codes=None, patch=None, res_scale=None, vote=None,
     latent=None, factor=None, beta=None,
     encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None, activation=None,
+    posterior=None, activation=None, condition=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
@@ -122,7 +122,7 @@ def build_model(
     elif arch == "latent_up":
         if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
             raise SystemExit("latent must be a positive integer")
-        model = LatentUp(width, depth, latent, encoder_blocks, widths, activation)
+        model = LatentUp(width, depth, latent, encoder_blocks, widths, activation, condition)
     elif arch == "vae2":
         _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
         model = VAE2(
@@ -166,7 +166,8 @@ def build_model(
             f"latent_up {depth}x{width} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in chosen_blocks)} "
             f"widths {'/'.join(str(item) for item in chosen_widths)}"
-            f"{_activation_text(activation)} parameters {count}"
+            f"{_activation_text(activation)}"
+            f"{'' if condition is None else f' condition {condition}'} parameters {count}"
         )
     elif arch in ("vae", "vae2"):
         levels = ""

@@ -17,7 +17,8 @@ A latent_up checkpoint runs with the vae2 its config names (a path under
 /mnt/home-storinator-trem is looked up under /Volumes/home, --vae overrides
 it): latent_up predicts the code, the vae2 decodes it, the frame is clamped
 and cropped to 2h x 2w, exactly as training validates. PyTorch picks MPS,
-then CUDA, then the CPU.
+then CUDA, then the CPU. A latent_up with condition takes --codec (h264,
+mpeg4, mpeg2, or unknown, the default).
 
 --coreml runs a package from whoodeo-coreml instead of PyTorch, on the unit
 --unit names: gpu (CPU_AND_GPU, the default), ane (CPU_AND_NE), cpu, or all.
@@ -51,7 +52,7 @@ def get_device():
     return torch.device("cpu")
 
 
-def load_checkpoint(path, device, vae=None):
+def load_checkpoint(path, device, vae=None, codec=None):
     spec = load_generator(path)
     if spec.architecture.get("arch") in ("vae", "vae2"):
         raise SystemExit(
@@ -65,10 +66,14 @@ def load_checkpoint(path, device, vae=None):
 
         model, label, step, vae_model, vae_label, _vae_spec, vae_path = load_latent_up(spec, device, vae)
         print(f"vae2 {vae_path}", flush=True)
-        reference = LatentUpReference(model, vae_model).eval()
+        if spec.architecture.get("condition") is not None:
+            print(f"codec {codec or 'unknown'}", flush=True)
+        reference = LatentUpReference(model, vae_model, codec).eval()
         return reference, f"{label} + {vae_label} decoder", 1, step, spec.path
     if vae is not None:
         raise SystemExit("--vae is for a latent_up checkpoint")
+    if codec is not None:
+        raise SystemExit("--codec is for a latent_up checkpoint with condition")
     return build_generator(spec, device)
 
 
@@ -328,6 +333,8 @@ def apply(args):
     if package is not None:
         if args.vae is not None:
             raise SystemExit("--vae is for a PyTorch latent_up checkpoint; a package has its decoder built in")
+        if args.codec is not None:
+            raise SystemExit("--codec is for a PyTorch latent_up checkpoint; a package has its codec built in")
         device = torch.device("cpu")
         model = CoreMLModel(package, args.unit or "gpu")
         label, in_frames, step = model.label, model.in_frames, model.step
@@ -336,7 +343,7 @@ def apply(args):
         if args.unit is not None:
             raise SystemExit("--unit picks the Core ML unit. Pass --coreml PACKAGE (whoodeo-coreml writes one)")
         device = get_device()
-        model, label, in_frames, step, checkpoint_path = load_checkpoint(args.model, device, args.vae)
+        model, label, in_frames, step, checkpoint_path = load_checkpoint(args.model, device, args.vae, args.codec)
     if in_frames % 2 != 1:
         raise SystemExit(f"checkpoint uses {in_frames} input frames; that count has to be odd")
     source = av.open(str(args.input))
@@ -467,6 +474,12 @@ def parse_args(argv=None):
         default=None,
         help="latent_up: the vae2 checkpoint. Default: the one the checkpoint names, "
              "/mnt/home-storinator-trem mapped to /Volumes/home",
+    )
+    parser.add_argument(
+        "--codec",
+        choices=("h264", "mpeg4", "mpeg2", "unknown"),
+        default=None,
+        help="latent_up with condition: the codec of the input. Default: unknown",
     )
     parser.add_argument(
         "--coreml",

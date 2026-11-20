@@ -180,7 +180,7 @@ def build_generator(spec, device):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, _vae, activation,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, _vae, activation, condition,
     ) = parse_model(spec.architecture, f"{spec.path}: architecture")
     model, label = build_model(
         arch, blocks, channels, in_frames,
@@ -189,11 +189,33 @@ def build_generator(spec, device):
         latent=latent, factor=factor, beta=beta,
         encoder_blocks=encoder_blocks, decoder_blocks=decoder_blocks,
         widths=widths, decoder_widths=decoder_widths, posterior=posterior,
-        activation=activation,
+        activation=activation, condition=condition,
     )
     model.load_state_dict(spec.state_dict)
     model.eval().to(device)
     return model, label, in_frames, spec.step, spec.path
+
+
+def load_weights(model, spec):
+    """spec's weights into `model`. Returns the names of the new FiLM weights, empty when none.
+
+    A latent_up with condition takes the weights of one without: its FiLM
+    weights are the only ones missing and keep their start, the last layer at
+    zero, so the network gives what the loaded one gave. Anything else must
+    match exactly.
+    """
+    film = getattr(model, "film", None)
+    if film is None or spec.architecture.get("condition") is not None:
+        model.load_state_dict(spec.state_dict)
+        return []
+    result = model.load_state_dict(spec.state_dict, strict=False)
+    foreign = [name for name in result.missing_keys if not name.startswith("film.")]
+    if foreign or result.unexpected_keys:
+        raise SystemExit(
+            f"{spec.path}: does not load into this latent_up: "
+            f"missing {foreign or 'none'}, unexpected {result.unexpected_keys or 'none'}"
+        )
+    return list(result.missing_keys)
 
 
 def _publish_runs_latest(checkpoint_dir):

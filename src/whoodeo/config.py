@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 from whoodeo.models import PRESETS
-from whoodeo.models.latent_up import latent_layout
+from whoodeo.models.latent_up import CONDITIONS, latent_layout
 from whoodeo.models.vae2 import ACTIVATIONS, layout, layout_text
 
 VGG_LAYERS = {
@@ -178,6 +178,11 @@ class TrainConfig:
     # vae and vae2: face-weighted image terms. None (or weight 1) is off,
     # and then no detector runs.
     faces: Faces | None = None
+    # latent_up: FiLM on a condition vector (models.latent_up.CONDITIONS), None is off.
+    condition: str | None = None
+    # latent_up with condition: share of training frames whose codec is set
+    # to unknown (all zero). Not part of the loss recipe, so a resume may change it.
+    codec_unknown: float = 0.0
 
     def arch_key(self):
         return model_key(
@@ -186,7 +191,7 @@ class TrainConfig:
             self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
             self.latent, self.factor, self.beta,
             self.encoder_blocks, self.decoder_blocks, self.widths, self.decoder_widths,
-            self.posterior, self.vae, self.activation,
+            self.posterior, self.vae, self.activation, self.condition,
         )
 
     def loss_recipe(self):
@@ -239,7 +244,7 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"res_scale {res_scale:g}"
         )
     elif arch == LATENT_ARCH:
-        latent, encoder_blocks, widths, vae, activation = extra
+        latent, encoder_blocks, widths, vae, activation, condition = extra
         text = (
             f"{arch} {blocks}x{channels} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in encoder_blocks)} "
@@ -247,6 +252,8 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
         )
         if activation != "silu":
             text += f" activation {activation}"
+        if condition is not None:
+            text += f" condition {condition}"
     elif arch in VAE_ARCHS:
         latent, factor, *levels = extra
         text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
@@ -264,7 +271,7 @@ def model_key(
     arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
     bilinear, codes, patch, res_scale, vote, latent, factor, beta,
     encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None, vae=None, activation=None,
+    posterior=None, vae=None, activation=None, condition=None,
 ):
     key = (arch, blocks, channels, in_frames)
     if arch == "shift":
@@ -287,7 +294,9 @@ def model_key(
         return key + (latent, factor)
     if arch == LATENT_ARCH:
         # The vae2 is the checkpoint directory the config resolved to.
-        return key + (latent,) + latent_layout(encoder_blocks, widths) + (vae, activation or "silu")
+        return key + (latent,) + latent_layout(encoder_blocks, widths) + (
+            vae, activation or "silu", condition,
+        )
     return key
 
 
@@ -341,6 +350,8 @@ def architecture_dict(cfg):
         item["vae"] = cfg.vae
         if cfg.activation is not None:
             item["activation"] = cfg.activation
+        if cfg.condition is not None:
+            item["condition"] = cfg.condition
     return item
 
 
@@ -373,7 +384,7 @@ def load_config(path, architecture=None, architecture_from=None):
     (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation, condition,
     ) = _take_model(
         data, where, architecture, architecture_from,
     )
@@ -393,6 +404,7 @@ def load_config(path, architecture=None, architecture_from=None):
     init_from_vae = _take_flag(data, "init_from_vae", where)
     latent_noise_tau = _take_latent_noise(data, where, arch)
     faces = _take_faces(data, where, arch)
+    codec_unknown = _take_codec_unknown(data, where, condition)
     terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
         if variants is not None:
@@ -459,6 +471,8 @@ def load_config(path, architecture=None, architecture_from=None):
         init_from_vae=init_from_vae,
         latent_noise_tau=latent_noise_tau,
         faces=faces,
+        condition=condition,
+        codec_unknown=codec_unknown,
         crop=crop,
         freeze_encoder=freeze_encoder,
         schedule=schedule,
@@ -474,6 +488,10 @@ def _take_model(data, where, architecture, architecture_from):
         chosen = _resolve_vae(parse_model(raw, f"{where}: model"), f"{where}: model")
         if architecture is not None:
             from_file = parse_model(architecture, f"{source}: architecture")
+            if _adds_condition(from_file, chosen):
+                # A fine-tune may add FiLM to a latent_up without it: the
+                # FiLM weights start at zero, so step 0 is the loaded network.
+                return chosen
             if model_key(*from_file) != model_key(*chosen):
                 raise SystemExit(
                     f"{where}: model is {shape_text(*model_key(*chosen))}, "
@@ -487,13 +505,20 @@ def _take_model(data, where, architecture, architecture_from):
     return parse_model(architecture, f"{source}: architecture")
 
 
+def _adds_condition(from_file, chosen):
+    """The config is the model file's latent_up plus a condition, nothing else changed."""
+    if from_file[0] != LATENT_ARCH or from_file[-1] is not None or chosen[-1] is None:
+        return False
+    return model_key(*from_file[:-1], None) == model_key(*chosen[:-1], None)
+
+
 def _resolve_vae(parsed, where):
     """The latent_up vae as the checkpoint directory it names now.
 
     A run directory follows its latest link, as --model does. The saved
     architecture keeps that directory, so a resume decodes with the same vae2.
     """
-    *head, vae, activation = parsed
+    *head, vae, activation, condition = parsed
     if vae is None:
         return parsed
     from whoodeo.checkpoint import _model_file
@@ -502,7 +527,7 @@ def _resolve_vae(parsed, where):
         model_path = _model_file(Path(vae))
     except SystemExit as exc:
         raise SystemExit(f"{where}: vae: {exc}") from exc
-    return (*head, str(model_path.parent.resolve()), activation)
+    return (*head, str(model_path.parent.resolve()), activation, condition)
 
 
 def parse_model(model, where):
@@ -547,6 +572,7 @@ def parse_model(model, where):
     encoder_blocks, decoder_blocks, widths, decoder_widths = _take_levels(model, arch, factor, where)
     vae = _take_vae_path(model, arch, where)
     activation = _take_activation(model, arch, where)
+    condition = _take_condition(model, arch, where)
     vote = None
     if arch == "vote":
         stem = _take_int(model, "stem", where)
@@ -567,8 +593,29 @@ def parse_model(model, where):
     return (
         arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
         bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation,
+        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation, condition,
     )
+
+
+def _take_condition(data, arch, where):
+    """latent_up FiLM condition as written, None when left out (no FiLM)."""
+    if "condition" not in data:
+        return None
+    if arch != LATENT_ARCH:
+        raise SystemExit(f"{where}: only latent_up takes condition")
+    return _take_choice(data, "condition", where, CONDITIONS)
+
+
+def _take_codec_unknown(data, where, condition):
+    """codec_unknown: the share of training frames with the codec set to unknown."""
+    if "codec_unknown" not in data:
+        return 0.0
+    if condition is None:
+        raise SystemExit(f"{where}: codec_unknown needs a model with condition")
+    value = _take_float(data, "codec_unknown", where)
+    if not 0 <= value <= 1:
+        raise SystemExit(f"{where}: codec_unknown must be from 0 to 1")
+    return value
 
 
 def _take_activation(data, arch, where):

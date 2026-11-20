@@ -140,6 +140,18 @@ and master. init_from_vae: true starts the last blocks at 1/4 and the head
 from the vae2 encoder, the head with shift and scale folded in, on a fresh
 run only.
 
+A latent_up with `condition: codec` gets the codec of each low frame from
+its variant name (x264-* h264, mpeg4-* mpeg4) as a one-hot vector, all zero
+for unknown, and FiLM turns it into γ and β per residual block.
+codec_unknown sets that share of the training frames to unknown, drawn on
+a generator of its own (seed + 1), so the batches stay those of the seed.
+The step line ends in the frame count per codec (h264/mpeg4/mpeg2/unknown),
+train_codec/ holds each codec's share so far. Validation passes the true
+codec and logs val/psnr_unknown, the same frames with the codec unknown, and
+val_codec/psnr_<codec> and frames_<codec>. --model with a latent_up without
+condition starts the FiLM weights fresh; its last layer is zero, so step 0 is
+the loaded network.
+
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss weights, and the Adam state. The schedule comes from the
 file. A plateau resume keeps its rate and its miss count when lr
@@ -173,7 +185,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from whoodeo.catalog import data_root, events_root, runs_root
 from whoodeo.checkpoint import (
-    build_generator, continue_run, load_generator, load_resume, run_directory, save_run,
+    build_generator, continue_run, load_generator, load_resume, load_weights, run_directory, save_run,
 )
 from whoodeo.config import (
     IMAGE_TERMS, LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
@@ -188,7 +200,7 @@ from whoodeo.models import build_model
 from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.models.latent_up import FACTOR as LATENT_FACTOR
-from whoodeo.models.latent_up import init_from_vae
+from whoodeo.models.latent_up import CODECS, codec_of, condition_vector, init_from_vae
 from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
 from whoodeo.faces import FACE_LEVEL, FaceDetector, detect_batch, face_fraction, weight_map
 from whoodeo.objective import (
@@ -311,6 +323,9 @@ class PreparedBatch:
     # latent_up faces: the soft mask (B, 1, H, W) of the masters and the YuNet boxes.
     faces: torch.Tensor | None = None
     boxes: list | None = None
+    # latent_up condition: (B, size) and the codec of each frame (None unknown) as fed.
+    condition: torch.Tensor | None = None
+    codecs: list | None = None
 
 
 class BatchLoader:
@@ -528,6 +543,12 @@ def raw_terms(objective, cfg, pred, high, discriminator, box, pixel_weight=None)
     if "gan" in objective.names:
         raw["gan"] = gan_bce(discriminator(take(pred, box)), True)
     return raw, layer_raw
+
+
+def psnr_each(pred, target):
+    """Each frame's PSNR in dB as a list, the prediction clamped to [0, 1]."""
+    error = (pred.clamp(0, 1) - target).square().flatten(1).mean(1)
+    return (-10.0 * torch.log10(error.clamp_min(1e-10))).tolist()
 
 
 def psnr_sum(pred, target):
@@ -1079,7 +1100,7 @@ def open_run(cfg, resume, finetune, load):
         latent=cfg.latent, factor=cfg.factor, beta=cfg.beta,
         encoder_blocks=cfg.encoder_blocks, decoder_blocks=cfg.decoder_blocks,
         widths=cfg.widths, decoder_widths=cfg.decoder_widths, posterior=cfg.posterior,
-        activation=cfg.activation,
+        activation=cfg.activation, condition=cfg.condition,
     )
     model = model.train().to(device)
     if hasattr(model, "noise_tau"):
@@ -1096,7 +1117,13 @@ def open_run(cfg, resume, finetune, load):
     if cfg.freeze_encoder:
         print("encoder frozen", flush=True)
     if generator is not None:
-        model.load_state_dict(generator.state_dict)
+        fresh = load_weights(model, generator)
+        if fresh:
+            print(
+                f"condition {cfg.condition}: {generator.path} has no FiLM, "
+                f"{len(fresh)} FiLM tensors start fresh (last layer zero, same output)",
+                flush=True,
+            )
     if train_state is not None:
         optimizer.load_state_dict(train_state.optimizer)
         move_optimizer(optimizer, device)
@@ -1243,6 +1270,14 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 message += f"  face {val_extras['val/psnr_face']:.2f}"
             if val_extras and "val/psnr_nonface" in val_extras:
                 message += f"  nonface {val_extras['val/psnr_nonface']:.2f}"
+            if val_extras and "val/psnr_unknown" in val_extras:
+                message += f"  unknown codec {val_extras['val/psnr_unknown']:.2f}"
+                for codec in (*CODECS, "unknown"):
+                    if f"val_codec/psnr_{codec}" in val_extras:
+                        message += (
+                            f"  {codec} {val_extras[f'val_codec/psnr_{codec}']:.2f}"
+                            f" ({val_extras[f'val_codec/frames_{codec}']})"
+                        )
             if val_extras and "val_noise/psnr_0.3" in val_extras:
                 message += (
                     "  noise " + "/".join(
@@ -1365,6 +1400,9 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                     line += f"  mu_l2 {train_extras['train/mu_l2']:.3g}"
                 if "train_raw/face_fraction" in train_extras:
                     line += f"  faces {train_extras['train_raw/face_fraction']:.3f}"
+                if "train_codec/batch" in train_extras:
+                    # Frames per codec: h264/mpeg4/mpeg2/unknown. Text stays out of TensorBoard.
+                    line += f"  codecs {train_extras.pop('train_codec/batch')}"
                 if train_kl is not None:
                     line += f"  kl {train_kl:.6f}"
                 print(line, flush=True)
@@ -1702,6 +1740,32 @@ def latent_hooks(run):
             flush=True,
         )
 
+    conditioned = cfg.condition is not None
+    condition_size = getattr(run.model, "condition_size", 0)
+    # The unknown-codec draw has its own generator, so the batches are the
+    # ones the same seed draws without a condition.
+    unknown_rng = random.Random(cfg.seed + 1)
+    codec_tally = {codec: 0 for codec in (*CODECS, None)}
+    if conditioned:
+        names = sorted({variant.name for film in films for variant in film.variants})
+        mapping = "  ".join(f"{name} {codec_of(name) or 'unknown'}" for name in names)
+        print(f"condition {cfg.condition}  codec_unknown {cfg.codec_unknown:g}  variants {mapping}", flush=True)
+        for codec in (*CODECS, None):
+            having = sum(
+                1 for film in films if any(codec_of(variant.name) == codec for variant in film.variants)
+            )
+            if having:
+                print(f"codec {codec or 'unknown'}: in {having} of {len(films)} films", flush=True)
+
+    def codecs_of(specs):
+        return [codec_of(films[film_index].variants[variant_index].name) for film_index, variant_index, _ in specs]
+
+    def condition_of(codecs):
+        return torch.stack([condition_vector(codec, condition_size) for codec in codecs])
+
+    def codec_text(codecs):
+        return "/".join(str(sum(1 for item in codecs if item == codec)) for codec in (*CODECS, None))
+
     def face_weights(mask, code):
         """The pixel weight map of the master and its area-pooled copy on the latent grid."""
         pixel_weight = weight_map(mask, faces.weight)
@@ -1726,8 +1790,8 @@ def latent_hooks(run):
     def decode(code, height, width):
         return vae.decode(code / scale + shift)[:, :, :height, :width]
 
-    def predict(low, high):
-        code = run.model(low)
+    def predict(low, high, condition=None):
+        code = run.model(low) if condition is None else run.model(low, condition)
         target, mu = target_code(high)
         if code.shape != target.shape:
             raise SystemExit(
@@ -1767,8 +1831,17 @@ def latent_hooks(run):
             mask = None
             if detector is not None:
                 boxes, mask = detect_batch(detector, high, faces.expand, faces.feather)
+            condition = None
+            codecs = None
+            if conditioned:
+                codecs = [
+                    None if unknown_rng.random() < cfg.codec_unknown else codec
+                    for codec in codecs_of(specs)
+                ]
+                condition = condition_of(codecs)
             return PreparedBatch(
                 low, high, variant.low.width, variant.low.height, None, mask, boxes,
+                condition, codecs,
             )
 
         return BatchLoader(produce)
@@ -1778,10 +1851,25 @@ def latent_hooks(run):
         low = prepared.low.to(device)
         high = prepared.high.to(device)
         height, width = high.shape[-2:]
-        code, target, _mu = predict(low, high)
+        condition = None if prepared.condition is None else prepared.condition.to(device)
+        code, target, _mu = predict(low, high, condition)
         pixel_weight = None
         latent_weight = None
         extras = {"train_latent/z_std": float(code.detach().std())}
+        if prepared.codecs is not None:
+            first = sum(codec_tally.values()) == 0
+            for codec in prepared.codecs:
+                codec_tally[codec] += 1
+            total = sum(codec_tally.values())
+            # The share of each codec over the run so far, in the frames as fed.
+            for codec, count in codec_tally.items():
+                extras[f"train_codec/{codec or 'unknown'}"] = count / total
+            extras["train_codec/batch"] = codec_text(prepared.codecs)
+            if first:
+                print(
+                    f"first batch codecs {' '.join(codec or 'unknown' for codec in prepared.codecs)}",
+                    flush=True,
+                )
         if prepared.faces is not None:
             mask = prepared.faces.to(device)
             pixel_weight, latent_weight = face_weights(mask, code)
@@ -1820,6 +1908,9 @@ def latent_hooks(run):
         z_std_acc = 0.0
         count = 0
         saved = 0
+        # condition: PSNR sum and frames per codec as validated, and the PSNR with the codec unknown
+        codec_acc = {}
+        unknown_acc = 0.0
         # face error, face pixels, other error, other pixels; the same for the vae2 roundtrip
         face_acc = [0.0, 0.0, 0.0, 0.0]
         vae_face_acc = [0.0, 0.0, 0.0, 0.0]
@@ -1831,8 +1922,19 @@ def latent_hooks(run):
                 low = low_cpu.to(device)
                 high = high_cpu.to(device)
                 height, width = high.shape[-2:]
-                code, target, mu = predict(low, high)
+                condition = None
+                if conditioned:
+                    codecs = codecs_of(chunk)
+                    condition = condition_of(codecs).to(device)
+                code, target, mu = predict(low, high, condition)
                 pred = decode(code, height, width)
+                if conditioned:
+                    for codec, value in zip(codecs, psnr_each(pred, high)):
+                        found = codec_acc.setdefault(codec or "unknown", [0.0, 0])
+                        found[0] += value
+                        found[1] += 1
+                    blind = run.model(low, torch.zeros_like(condition))
+                    unknown_acc += psnr_sum(decode(blind, height, width), high)
                 pixel_weight = None
                 latent_weight = None
                 inside = None
@@ -1888,6 +1990,11 @@ def latent_hooks(run):
         run.model.train()
         extras = {tag: value / count for tag, value in raw_acc.items()}
         extras["val_latent/z_std"] = z_std_acc / count
+        if conditioned:
+            extras["val/psnr_unknown"] = unknown_acc / count
+            for codec, (total, frames) in codec_acc.items():
+                extras[f"val_codec/psnr_{codec}"] = total / frames
+                extras[f"val_codec/frames_{codec}"] = frames
         if detector is not None:
             total_pixels = face_acc[1] + face_acc[3]
             extras["val_raw/face_fraction"] = face_acc[1] / total_pixels if total_pixels else 0.0
