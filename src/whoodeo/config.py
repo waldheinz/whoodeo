@@ -492,6 +492,11 @@ def _take_model(data, where, architecture, architecture_from):
                 # A fine-tune may add FiLM to a latent_up without it: the
                 # FiLM weights start at zero, so step 0 is the loaded network.
                 return chosen
+            if _swaps_vae(from_file, chosen):
+                # A fine-tune may move a latent_up to another vae2 checkpoint
+                # of the same shape, e.g. a later one of the same vae2 run. Its
+                # latent shift and scale come with that checkpoint.
+                return chosen
             if model_key(*from_file) != model_key(*chosen):
                 raise SystemExit(
                     f"{where}: model is {shape_text(*model_key(*chosen))}, "
@@ -510,6 +515,20 @@ def _adds_condition(from_file, chosen):
     if from_file[0] != LATENT_ARCH or from_file[-1] is not None or chosen[-1] is None:
         return False
     return model_key(*from_file[:-1], None) == model_key(*chosen[:-1], None)
+
+
+def _swaps_vae(from_file, chosen):
+    """The config is the model file's latent_up with another vae2, nothing else changed.
+
+    The vae2 is checked for the same latent channels when it loads.
+    """
+    if from_file[0] != LATENT_ARCH or chosen[0] != LATENT_ARCH:
+        return False
+    *head_file, _vae_file, act_file, cond_file = from_file
+    *head_chosen, _vae_chosen, act_chosen, cond_chosen = chosen
+    return model_key(*head_file, None, act_file, cond_file) == model_key(
+        *head_chosen, None, act_chosen, cond_chosen
+    )
 
 
 def _resolve_vae(parsed, where):

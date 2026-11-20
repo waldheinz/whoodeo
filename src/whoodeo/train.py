@@ -150,7 +150,11 @@ train_codec/ holds each codec's share so far. Validation passes the true
 codec and logs val/psnr_unknown, the same frames with the codec unknown, and
 val_codec/psnr_<codec> and frames_<codec>. --model with a latent_up without
 condition starts the FiLM weights fresh; its last layer is zero, so step 0 is
-the loaded network.
+the loaded network. --model may also move a latent_up to another vae2
+checkpoint of the same shape (vae: in the config, e.g. the later checkpoints
+of the same vae2 run): the weights carry over, the latent shift and scale are
+those of the new vae2, and the optimizer starts over. --resume keeps the vae2
+of the run.
 
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss weights, and the Adam state. The schedule comes from the
