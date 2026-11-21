@@ -1,21 +1,23 @@
 # latent-up-3f-96 on the DGX Spark: latent-up-3f-spark.yaml at width 96
 # instead of 64 (96 at low resolution, 192 at 1/2, 384 at 1/4), 21.11.2026.
-# The 64-wide
-# runs plateaued at about 35.5 dB with the latent L1 near 0.35; this tests
-# whether more width helps. The 64-wide weights do not fit, so it starts
-# fresh (no --model):
+# The 64-wide runs plateaued at about 35.5 dB with the latent L1 near 0.35;
+# this tests whether more width helps. The 64-wide weights do not fit, so it
+# starts fresh (no --model):
 #
 #   whoodeo-train configs/latent-up-3f-96-spark.yaml
 #
 # in_frames 3: the previous, middle, and next low frame. The encoder up to
 # 1/4 is shared and runs once per frame; at 1/4, the grid of the code, a 1x1
 # convolution over the three frames' features, the activation, and a 1x1
-# convolution that starts at zero correct the middle frame's features (see
-# models/latent_up.py).
+# convolution with PyTorch's default start correct the middle frame's
+# features (see models/latent_up.py). The first 96 run
+# (train-20261121-103537) still had that last convolution at zero, and after
+# 3250 steps the neighbors changed the picture by only ~0.0003; this run
+# starts over with the mix live from step 0 (21.11.2026).
 #
-# vae below is the vae2 run train-20261119-180935 while it still trains; the
-# config stores the checkpoint latest points at when this run starts. Put
-# the final checkpoint here once that run has finished.
+# vae below is checkpoint 036500 of the vae2 run train-20261119-180935, which
+# still trains. Once it has finished, move to its final checkpoint with
+# --model (the weights carry over, latent shift and scale are recomputed).
 #
 # ema: validation, the validation images, and model.pt use the moving
 # average of the weights. The FiLM run's validation PSNR dipped by about
@@ -26,7 +28,7 @@ model:
   arch: latent_up
   # Pinned to the checkpoint this run started on, so --resume keeps working
   # while the vae2 run goes on (a run directory means its latest).
-  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261119-180935/checkpoints/031000
+  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261119-180935/checkpoints/036500
   latent: 16                # the vae2's channels (16 since vae2d)
   channels: 96              # low resolution; 192 at 1/2, 384 at 1/4
   widths: [1, 2, 4]         # multiples of channels: low, 1/2, 1/4
@@ -41,13 +43,15 @@ model:
   # Previous, middle, next low frame; the clip's edges repeat the middle one.
   in_frames: 3
 
-# Only the milder stages, from step ~2000 on (21.11.2026). Measured at step
-# 1750 on 60 holdout frames: the model beat bicubic by 0.3 dB at crf20 and
-# was worse in 25 of 60 frames, while crf30 and mpeg4-q16 gained ~1-1.6 dB.
-# Without a strength input the network smooths every frame alike; crf26 and
-# worse and mpeg4-q16 are harsher than the material it is meant for. The
+# Only the stages the target films look like (21.11.2026): x264 crf20-26 and
+# mpeg4-q08. Measured on the first 96 run at step 1750 on 60 holdout frames:
+# the model beat bicubic by 0.3 dB at crf20 and was worse in 25 of 60
+# frames, while crf30 and mpeg4-q16 gained ~1-1.6 dB. Without a strength
+# input the network smooths every frame alike; crf28 and worse and
+# mpeg4-q12/q16 are harsher than the films it is meant for, crf26 still
+# looks realistic. The
 # regex is searched against each path relative to low/ (training and val).
-variants: "^(x264-crf2[024]|mpeg4-q(08|12))/"
+variants: "^(x264-crf2[0246]|mpeg4-q08)/"
 
 # Share of training frames whose codec is set to unknown (all 0), so the
 # model also works without metadata. Drawn on its own generator: the batches
