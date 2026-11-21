@@ -39,6 +39,14 @@ model:
   # Previous, middle, next low frame; the clip's edges repeat the middle one.
   in_frames: 3
 
+# Only the milder stages, from step ~2000 on (21.11.2026). Measured at step
+# 1750 on 60 holdout frames: the model beat bicubic by 0.3 dB at crf20 and
+# was worse in 25 of 60 frames, while crf30 and mpeg4-q16 gained ~1-1.6 dB.
+# Without a strength input the network smooths every frame alike; crf26 and
+# worse and mpeg4-q16 are harsher than the material it is meant for. The
+# regex is searched against each path relative to low/ (training and val).
+variants: "^(x264-crf2[024]|mpeg4-q(08|12))/"
+
 # Share of training frames whose codec is set to unknown (all 0), so the
 # model also works without metadata. Drawn on its own generator: the batches
 # are those of seed 42 without a condition. Validation passes the true codec
