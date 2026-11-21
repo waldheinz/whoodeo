@@ -156,6 +156,26 @@ of the same vae2 run): the weights carry over, the latent shift and scale are
 those of the new vae2, and the optimizer starts over. --resume keeps the vae2
 of the run.
 
+A latent_up with `in_frames: 3` reads the previous, middle, and next low
+frame, one seek and one decode per sample as for the other multi-frame
+archs; the clip's edges repeat the middle frame. scene_cut (training only,
+on a generator of its own, seed + 2) swaps each neighbor with that chance
+for the middle frame of another frame of the batch, which has the same
+size, so the network learns to ignore a neighbor from another shot. The step
+line counts the swaps (cuts). --model with a one-frame latent_up starts the
+frame mix fresh; its last layer is zero, so step 0 is the loaded network.
+train_neighbor/weight and grad are the mean absolute kernel of the mix's
+last layer and its gradient over the head's, val_neighbor/image the mean
+absolute change of the validation frames when both neighbors are replaced
+by the middle frame.
+
+ema: d keeps a moving average of the generator weights (see whoodeo.ema).
+Validation, its images, and model.pt use the average; the live preview of
+a training step shows the trained weights. train.pt also holds the trained weights and the average's update count, so --resume
+continues both. A resume without ema in the file continues the trained
+weights; one with ema from a checkpoint without starts the average from
+the loaded weights. A fine-tune starts it from the loaded model.pt.
+
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss weights, and the Adam state. The schedule comes from the
 file. A plateau resume keeps its rate and its miss count when lr
@@ -171,6 +191,7 @@ still present has to match the file, beta aside. Keep it to change beta.
 """
 
 import argparse
+import contextlib
 import math
 import queue
 import random
@@ -191,6 +212,7 @@ from whoodeo.catalog import data_root, events_root, runs_root
 from whoodeo.checkpoint import (
     build_generator, continue_run, load_generator, load_resume, load_weights, run_directory, save_run,
 )
+from whoodeo.ema import WeightAverage
 from whoodeo.config import (
     IMAGE_TERMS, LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
     load_config, restore_plateau, shape_text,
@@ -330,6 +352,8 @@ class PreparedBatch:
     # latent_up condition: (B, size) and the codec of each frame (None unknown) as fed.
     condition: torch.Tensor | None = None
     codecs: list | None = None
+    # latent_up with neighbors: how many neighbors scene_cut swapped.
+    cuts: int | None = None
 
 
 class BatchLoader:
@@ -1019,6 +1043,8 @@ class Run:
     gan: object
     # The generator weights came from --resume or --model.
     loaded: bool = False
+    # The moving average of the generator weights, None without ema.
+    ema: WeightAverage | None = None
 
     def apply_rate(self, at_step):
         rate = learning_rate(self.cfg, at_step, self.plateau)
@@ -1122,12 +1148,38 @@ def open_run(cfg, resume, finetune, load):
         print("encoder frozen", flush=True)
     if generator is not None:
         fresh = load_weights(model, generator)
-        if fresh:
+        film = [name for name in fresh if name.startswith("film.")]
+        mix = [name for name in fresh if name.startswith("mix.")]
+        if film:
             print(
                 f"condition {cfg.condition}: {generator.path} has no FiLM, "
-                f"{len(fresh)} FiLM tensors start fresh (last layer zero, same output)",
+                f"{len(film)} FiLM tensors start fresh (last layer zero, same output)",
                 flush=True,
             )
+        if mix:
+            print(
+                f"in_frames {cfg.in_frames}: {generator.path} reads one frame, "
+                f"{len(mix)} frame mix tensors start fresh (last layer zero, same output)",
+                flush=True,
+            )
+    ema = None
+    saved_weights = None if train_state is None else train_state.weights
+    if cfg.ema is not None:
+        # model holds model.pt: on a resume with an average that is the average.
+        updates = 0
+        if train_state is not None and train_state.ema is not None and saved_weights is not None:
+            updates = int(train_state.ema.get("updates", 0))
+        ema = WeightAverage(model, cfg.ema, updates)
+        if saved_weights is None:
+            print(f"ema {cfg.ema:g}  starts from the loaded weights" if generator is not None
+                  else f"ema {cfg.ema:g}", flush=True)
+        else:
+            print(f"ema {cfg.ema:g}  resumed after {updates} updates", flush=True)
+    if saved_weights is not None:
+        # model.pt is the average; the optimizer goes on with the trained weights.
+        model.load_state_dict(saved_weights)
+        if ema is None:
+            print("ema off: continuing the trained weights, the average is dropped", flush=True)
     if train_state is not None:
         optimizer.load_state_dict(train_state.optimizer)
         move_optimizer(optimizer, device)
@@ -1165,7 +1217,7 @@ def open_run(cfg, resume, finetune, load):
     run = Run(
         cfg, out_dir, device, rng, model, optimizer, start_step, plateau, plateau_note,
         train_state, films, discriminator, disc_optimizer, gan,
-        loaded=generator is not None,
+        loaded=generator is not None, ema=ema,
     )
     run.apply_rate(start_step)
     return run
@@ -1307,11 +1359,27 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
         def checkpoint():
             nonlocal saved_at
             schedule_state = None if run.plateau is None else run.plateau.state_dict(cfg.lr)
-            saved_at = save_run(
-                run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
-                cfg.loss_recipe(),
-                run.discriminator, run.disc_optimizer, schedule_state,
-            )
+            if run.ema is None:
+                saved_at = save_run(
+                    run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
+                    cfg.loss_recipe(),
+                    run.discriminator, run.disc_optimizer, schedule_state,
+                )
+                return
+            # model.pt gets the average, train.pt the trained weights beside it.
+            extra = {"weights": run.model.state_dict(), "ema": run.ema.state()}
+            with run.ema.applied(run.model):
+                saved_at = save_run(
+                    run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
+                    cfg.loss_recipe(),
+                    run.discriminator, run.disc_optimizer, schedule_state, extra,
+                )
+
+        def averaged():
+            """The generator as validation sees it: the average with ema."""
+            if run.ema is None:
+                return contextlib.nullcontext()
+            return run.ema.applied(run.model)
 
         step = run.start_step
         steps_done = 0
@@ -1327,7 +1395,8 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
 
         def validate():
             """Validation loss, images, and a checkpoint at the current step."""
-            result = evaluate_split(objective, val_specs, run.out_dir / "val", step)
+            with averaged():
+                result = evaluate_split(objective, val_specs, run.out_dir / "val", step)
             old = None if run.plateau is None else run.plateau.lr
             decision = None if run.plateau is None else run.plateau.observe(result.loss)
             if decision == "drop":
@@ -1381,6 +1450,8 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 loss.backward()
                 usage = run.model.neighbor_usage() if hasattr(run.model, "neighbor_usage") else None
                 run.optimizer.step()
+                if run.ema is not None:
+                    run.ema.update(run.model)
                 if run.discriminator is not None:
                     for parameter in run.discriminator.parameters():
                         parameter.requires_grad_(True)
@@ -1404,6 +1475,8 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                     line += f"  mu_l2 {train_extras['train/mu_l2']:.3g}"
                 if "train_raw/face_fraction" in train_extras:
                     line += f"  faces {train_extras['train_raw/face_fraction']:.3f}"
+                if "train_raw/scene_cuts" in train_extras:
+                    line += f"  cuts {train_extras['train_raw/scene_cuts']}"
                 if "train_codec/batch" in train_extras:
                     # Frames per codec: h264/mpeg4/mpeg2/unknown. Text stays out of TensorBoard.
                     line += f"  codecs {train_extras.pop('train_codec/batch')}"
@@ -1761,6 +1834,33 @@ def latent_hooks(run):
             if having:
                 print(f"codec {codec or 'unknown'}: in {having} of {len(films)} films", flush=True)
 
+    radius = cfg.in_frames // 2
+    # The scene cut draw has its own generator too, so the batches stay those of the seed.
+    cut_rng = random.Random(cfg.seed + 2)
+    if cfg.in_frames > 1:
+        print(f"in_frames {cfg.in_frames}  scene_cut {cfg.scene_cut:g}", flush=True)
+
+    def middle(low):
+        """The middle low frame of (B, 3 * in_frames, H, W)."""
+        return low[:, 3 * radius:3 * radius + 3]
+
+    def scene_cuts(low):
+        """Swap neighbors for the middle frame of another frame of the batch. Returns the swap count."""
+        count = len(low)
+        if cfg.scene_cut <= 0 or count < 2:
+            return 0
+        swapped = 0
+        source = low.clone()
+        for row in range(count):
+            for slot in range(cfg.in_frames):
+                if slot == radius or cut_rng.random() >= cfg.scene_cut:
+                    continue
+                other = cut_rng.randrange(count - 1)
+                other += other >= row
+                low[row, 3 * slot:3 * slot + 3] = source[other, 3 * radius:3 * radius + 3]
+                swapped += 1
+        return swapped
+
     def codecs_of(specs):
         return [codec_of(films[film_index].variants[variant_index].name) for film_index, variant_index, _ in specs]
 
@@ -1830,7 +1930,8 @@ def latent_hooks(run):
             specs = make_batch_specs(rng, films, "train", cfg.batch)
             film_index, variant_index, _index = specs[0]
             variant = films[film_index].variants[variant_index]
-            low, high = batch_from_specs(films, specs, 0)
+            low, high = batch_from_specs(films, specs, radius)
+            cuts = scene_cuts(low) if radius else None
             boxes = None
             mask = None
             if detector is not None:
@@ -1845,7 +1946,7 @@ def latent_hooks(run):
                 condition = condition_of(codecs)
             return PreparedBatch(
                 low, high, variant.low.width, variant.low.height, None, mask, boxes,
-                condition, codecs,
+                condition, codecs, cuts,
             )
 
         return BatchLoader(produce)
@@ -1860,6 +1961,8 @@ def latent_hooks(run):
         pixel_weight = None
         latent_weight = None
         extras = {"train_latent/z_std": float(code.detach().std())}
+        if prepared.cuts is not None:
+            extras["train_raw/scene_cuts"] = prepared.cuts
         if prepared.codecs is not None:
             first = sum(codec_tally.values()) == 0
             for codec in prepared.codecs:
@@ -1891,7 +1994,7 @@ def latent_hooks(run):
         boxes = None
         if show:
             images = {
-                "low": bicubic(low[:1])[0],
+                "low": bicubic(middle(low[:1]))[0],
                 "upscale": pred[0].detach(),
                 "master": high[0],
             }
@@ -1915,6 +2018,7 @@ def latent_hooks(run):
         # condition: PSNR sum and frames per codec as validated, and the PSNR with the codec unknown
         codec_acc = {}
         unknown_acc = 0.0
+        neighbor_acc = 0.0
         # face error, face pixels, other error, other pixels; the same for the vae2 roundtrip
         face_acc = [0.0, 0.0, 0.0, 0.0]
         vae_face_acc = [0.0, 0.0, 0.0, 0.0]
@@ -1922,7 +2026,7 @@ def latent_hooks(run):
         with torch.no_grad():
             for start in range(0, len(specs), cfg.batch):
                 chunk = specs[start:start + cfg.batch]
-                low_cpu, high_cpu = batch_from_specs(films, chunk, 0)
+                low_cpu, high_cpu = batch_from_specs(films, chunk, radius)
                 low = low_cpu.to(device)
                 high = high_cpu.to(device)
                 height, width = high.shape[-2:]
@@ -1932,6 +2036,11 @@ def latent_hooks(run):
                     condition = condition_of(codecs).to(device)
                 code, target, mu = predict(low, high, condition)
                 pred = decode(code, height, width)
+                if radius:
+                    # Both neighbors replaced by the middle frame: what the neighbors change.
+                    still = middle(low).repeat(1, cfg.in_frames, 1, 1)
+                    alone = run.model(still) if condition is None else run.model(still, condition)
+                    neighbor_acc += float((decode(alone, height, width) - pred).abs().mean()) * len(chunk)
                 if conditioned:
                     for codec, value in zip(codecs, psnr_each(pred, high)):
                         found = codec_acc.setdefault(codec or "unknown", [0.0, 0])
@@ -1966,9 +2075,9 @@ def latent_hooks(run):
                 if baselines:
                     roundtrip = vae.decode(mu)[:, :, :height, :width]
                     for tag, image in (
-                        ("val_ref/bicubic_psnr", bicubic(low)),
+                        ("val_ref/bicubic_psnr", bicubic(middle(low))),
                         ("val_ref/bilinear_psnr", F.interpolate(
-                            low, scale_factor=2, mode="bilinear", align_corners=False,
+                            middle(low), scale_factor=2, mode="bilinear", align_corners=False,
                         )),
                         ("val_ref/vae_psnr", roundtrip),
                     ):
@@ -1984,7 +2093,7 @@ def latent_hooks(run):
                     for offset in range(frames):
                         save_val_images(
                             image_dir, step, saved + offset,
-                            low[offset], pred[offset], high[offset], digits,
+                            middle(low)[offset], pred[offset], high[offset], digits,
                         )
                         if roundtrip is not None:
                             folder = image_dir / f"{saved + offset:0{digits}d}"
@@ -2041,7 +2150,8 @@ def latent_hooks(run):
         print(f"step {step:06d}  validation {count} frames  {time.perf_counter() - started:.1f}s", flush=True)
         pixel = weighted_acc["pixel"] / count if "pixel" in weighted_acc else None
         vgg = weighted_acc["vgg"] / count if "vgg" in weighted_acc else None
-        return EvalResult(loss_acc / count, (pixel, vgg, None, None), None, None, None, extras)
+        neighbor = neighbor_acc / count if radius else None
+        return EvalResult(loss_acc / count, (pixel, vgg, None, None), neighbor, None, None, extras)
 
     return make_val_specs, make_loader, one_step, evaluate_split
 

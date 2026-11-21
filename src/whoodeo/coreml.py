@@ -24,6 +24,9 @@ computed once and sit in the graph as constants, a multiply and an add behind
 each residual block; the frame stays the only input. The metadata names the
 codec, the package name ends in it, so one package per codec can live side by
 side. --bench compares with PyTorch under the same codec.
+A latent_up with in_frames 3 takes the previous, middle, and next low frame
+on 9 channels, in that order (whoodeo.in_frames in the metadata); the clip's
+edges repeat the middle frame.
 The Neural Engine loses conv products below about 2^-14, which the residual
 convolutions that start at zero produce in numbers. --conv-scale k (16 by
 default for vae2 and latent_up, off for vote and edsr) multiplies each
@@ -352,10 +355,10 @@ def load_latent_up(spec, device, vae_override=None):
     return model, label, step, vae, vae_label, vae_spec, vae_path
 
 
-def _smooth_frames(height, width, seed=0):
-    """A picture-like test input: coarse noise, upsampled, in [0, 1]."""
+def _smooth_frames(height, width, seed=0, frames=1):
+    """A picture-like test input: coarse noise, upsampled, in [0, 1]. `frames` stacks that many."""
     generator = torch.Generator().manual_seed(seed)
-    coarse = torch.rand(1, 3, max(height // 8, 1), max(width // 8, 1), generator=generator)
+    coarse = torch.rand(1, 3 * frames, max(height // 8, 1), max(width // 8, 1), generator=generator)
     return torch.nn.functional.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
 
 
@@ -371,6 +374,7 @@ def convert_latent_up(
     model, label, step, vae, vae_label, vae_spec, vae_path = load_latent_up(
         spec, torch.device("cpu"), vae_override,
     )
+    channels = 3 * model.in_frames
     sizes = None if low_sizes is None else [tuple(size) for size in low_sizes]
     for height, width in sizes or [max_low]:
         if height % FACTOR or width % FACTOR:
@@ -385,7 +389,7 @@ def convert_latent_up(
     # Neither the fold nor the conv scale may change the picture. fp32 on the CPU, padded and unpadded.
     with torch.no_grad():
         for height, width in ((96, 128), (90, 130)):
-            frames = _smooth_frames(height, width)
+            frames = _smooth_frames(height, width, frames=model.in_frames)
             want = reference(frames)
             padded, _h, _w = _pad(frames)
             got = export(padded)[:, :, :2 * height, :2 * width]
@@ -396,26 +400,26 @@ def convert_latent_up(
     trace_h, trace_w = 360, 640
     if sizes is not None and (trace_h, trace_w) not in sizes:
         trace_h, trace_w = sizes[len(sizes) // 2]
-    example = torch.zeros(1, 3, trace_h, trace_w)
+    example = torch.zeros(1, channels, trace_h, trace_w)
     with torch.no_grad():
         traced = torch.jit.trace(export, example)
     if sizes is None:
         max_h, max_w = max_low
         shape = ct.Shape(shape=(
             1,
-            3,
+            channels,
             ct.RangeDim(lower_bound=LOW_MIN, upper_bound=max_h, default=min(trace_h, max_h)),
             ct.RangeDim(lower_bound=LOW_MIN, upper_bound=max_w, default=min(trace_w, max_w)),
         ))
         kind = "range"
         widths, heights = (LOW_MIN, max_w), (LOW_MIN, max_h)
     elif len(sizes) == 1:
-        shape = (1, 3, trace_h, trace_w)
+        shape = (1, channels, trace_h, trace_w)
         kind = "fixed"
     else:
         shape = ct.EnumeratedShapes(
-            shapes=[(1, 3, height, width) for height, width in sizes],
-            default=(1, 3, trace_h, trace_w),
+            shapes=[(1, channels, height, width) for height, width in sizes],
+            default=(1, channels, trace_h, trace_w),
         )
         kind = "enumerated"
     if sizes is not None:
@@ -431,7 +435,7 @@ def convert_latent_up(
         "whoodeo.blocks": str(spec.architecture.get("blocks")),
         "whoodeo.channels": str(spec.architecture.get("channels")),
         "whoodeo.latent": str(spec.architecture.get("latent")),
-        "whoodeo.in_frames": "1",
+        "whoodeo.in_frames": str(model.in_frames),
         "whoodeo.scale": "2",
         "whoodeo.step": "" if spec.step is None else str(spec.step),
         "whoodeo.vae": str(vae_path),
@@ -466,7 +470,7 @@ def convert_latent_up(
         probes = sizes if sizes is not None else [
             size for size in LOW_PROBES if size[0] <= max_low[0] and size[1] <= max_low[1]
         ]
-        _plan_sizes(ct, traced, probes, conv_scale)
+        _plan_sizes(ct, traced, probes, conv_scale, channels)
     return output, spec
 
 
@@ -482,12 +486,12 @@ def _convert_latent_up_traced(ct, traced, shape, conv_scale=CONV_SCALE):
     )
 
 
-def _plan_sizes(ct, traced, sizes, conv_scale=CONV_SCALE):
+def _plan_sizes(ct, traced, sizes, conv_scale=CONV_SCALE, channels=3):
     """The Neural Engine plan of each size, from a fixed-shape copy of the program."""
     import tempfile
 
     for height, width in sizes:
-        fixed = _convert_latent_up_traced(ct, traced, (1, 3, height, width), conv_scale)
+        fixed = _convert_latent_up_traced(ct, traced, (1, channels, height, width), conv_scale)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "plan.mlpackage"
             fixed.save(str(path))
@@ -623,11 +627,11 @@ def _cases_upscaler(videos, radius):
         yield f"{Path(video).name} #{center}", stack.unsqueeze(0), width, height
 
 
-def _cases_latent_up(videos, sizes):
-    """Frame 100 of each video, resized to each enumerated low size."""
+def _cases_latent_up(videos, sizes, radius=0):
+    """Frame 100 of each video with `radius` neighbors, resized to each enumerated low size."""
     frames = []
     for video in videos:
-        stack, center = _read_window(video, 100, 0)
+        stack, center = _read_window(video, 100, radius)
         frames.append((f"{Path(video).name} #{center}", stack.unsqueeze(0)))
     for height, width in sizes:
         for name, frame in frames:
@@ -670,9 +674,10 @@ def bench(package, checkpoint, videos, vae=None, codec=None):
     if arch == "latent_up":
         from whoodeo.models.latent_up import LatentUpReference
         model, label, _step, vae_model, _vae_label, _vae_spec, _vae_path = load_latent_up(spec, device, vae)
+        radius = model.in_frames // 2
         model = LatentUpReference(model, vae_model, codec).eval()
         sizes = _package_sizes(package, ct) or _package_probes(package)
-        cases = list(_cases_latent_up(videos, sizes))
+        cases = list(_cases_latent_up(videos, sizes, radius))
         dtype = np.float16
         repeats = 5
     else:

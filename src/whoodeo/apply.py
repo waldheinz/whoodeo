@@ -69,7 +69,7 @@ def load_checkpoint(path, device, vae=None, codec=None):
         if spec.architecture.get("condition") is not None:
             print(f"codec {codec or 'unknown'}", flush=True)
         reference = LatentUpReference(model, vae_model, codec).eval()
-        return reference, f"{label} + {vae_label} decoder", 1, step, spec.path
+        return reference, f"{label} + {vae_label} decoder", model.in_frames, step, spec.path
     if vae is not None:
         raise SystemExit("--vae is for a latent_up checkpoint")
     if codec is not None:

@@ -28,6 +28,19 @@ network is exactly the one without it: a latent_up checkpoint without
 condition loads into it with the FiLM weights left at their start. The
 encoder keeps its parameter names. For an export the vector is fixed, and
 γ and β are computed once (`modulation`), a multiply and an add per block.
+
+`in_frames: 3` reads the previous, middle, and next low frame, stacked on
+the channels as the other multi-frame archs take them (9 channels). The
+encoder up to 1/4 (stem, the levels at low and 1/2, with FiLM) is shared and
+runs once per frame. At 1/4, the grid of the code, `FrameMix` mixes them: a
+1x1 convolution over the features of all frames, the activation, and a 1x1
+convolution that starts at zero, added onto the middle frame's features.
+The blocks at 1/4 and the head then run once. At the start the mix adds 0,
+so the network is exactly the one-frame latent_up: a one-frame checkpoint
+loads into it with the mix left at its start (see checkpoint.load_weights).
+The middle frame is in the mix's input, so the network can compare it with
+each neighbor and learn to ignore a neighbor from another shot. The clip's
+edges repeat the middle frame, as for every multi-frame arch.
 """
 
 import torch
@@ -88,6 +101,40 @@ def block_widths(encoder):
     return widths
 
 
+def front_count(encoder):
+    """Residual blocks above 1/4: the (γ, β) pairs `run_front` takes."""
+    return sum(len(stage.blocks) for stage in encoder.downs)
+
+
+def _blocks(hidden, sequence, pairs):
+    for block in sequence:
+        hidden = block(hidden)
+        if pairs is not None:
+            gamma, beta = next(pairs)
+            hidden = hidden * (1 + gamma) + beta
+    return hidden
+
+
+def run_front(encoder, image, modulation=None):
+    """The encoder up to 1/4: stem and levels, without the blocks at 1/4.
+
+    `modulation` holds the (γ, β) pairs of these blocks, the first
+    `front_count` of `block_widths`, or None.
+    """
+    pairs = None if modulation is None else iter(modulation)
+    hidden = encoder.stem(image)
+    for stage in encoder.downs:
+        hidden = stage.down(_blocks(hidden, stage.blocks, pairs))
+    return hidden
+
+
+def run_back(encoder, hidden, modulation=None):
+    """The blocks at 1/4 and the head; `modulation` holds their pairs or is None."""
+    pairs = None if modulation is None else iter(modulation)
+    hidden = _blocks(hidden, encoder.mid, pairs)
+    return encoder.to_stats(encoder.act(hidden))
+
+
 def run_encoder(encoder, image, modulation=None):
     """Encoder.forward, with x * (1 + γ) + β behind each residual block when modulated.
 
@@ -96,19 +143,61 @@ def run_encoder(encoder, image, modulation=None):
     """
     if modulation is None:
         return encoder(image)
-    pairs = iter(modulation)
+    count = front_count(encoder)
+    return run_back(encoder, run_front(encoder, image, modulation[:count]), modulation[count:])
 
-    def blocks(hidden, sequence):
-        for block in sequence:
-            gamma, beta = next(pairs)
-            hidden = block(hidden) * (1 + gamma) + beta
-        return hidden
 
-    hidden = encoder.stem(image)
-    for stage in encoder.downs:
-        hidden = stage.down(blocks(hidden, stage.blocks))
-    hidden = blocks(hidden, encoder.mid)
-    return encoder.to_stats(encoder.act(hidden))
+class FrameMix(nn.Module):
+    """Features of `frames` frames at 1/4 -> a correction of the middle frame's.
+
+    1x1 convolution over all frames' channels, activation, 1x1 convolution
+    that starts at zero: a fresh mix returns 0, so the middle frame's
+    features pass unchanged.
+    """
+
+    def __init__(self, width, frames, activation=None):
+        super().__init__()
+        self.frames = frames
+        self.inner = nn.Conv2d(width * frames, width, kernel_size=1)
+        self.act = activation_fn(activation)
+        self.outer = nn.Conv2d(width, width, kernel_size=1)
+        nn.init.zeros_(self.outer.weight)
+        nn.init.zeros_(self.outer.bias)
+
+    def forward(self, features):
+        """`features` (B, frames * C, h, w) in frame order -> (B, C, h, w)."""
+        return self.outer(self.act(self.inner(features)))
+
+
+def run_frames(encoder, mix, padded, frames, modulation=None):
+    """The multi-frame code of `padded` (B, 3 * frames, H, W): shared front, mix, back.
+
+    The frames run as one batch of B * frames through the front.
+    """
+    batch, _channels, height, width = padded.shape
+    stacked = padded.reshape(batch, frames, 3, height, width).transpose(0, 1).reshape(
+        frames * batch, 3, height, width,
+    )
+    front = back = None
+    if modulation is not None:
+        count = front_count(encoder)
+        front = [
+            (_per_frame(gamma, frames), _per_frame(beta, frames)) for gamma, beta in modulation[:count]
+        ]
+        back = modulation[count:]
+    hidden = run_front(encoder, stacked, front)
+    channels, rows, cols = hidden.shape[1:]
+    hidden = hidden.reshape(frames, batch, channels, rows, cols)
+    middle = hidden[frames // 2]
+    features = hidden.transpose(0, 1).reshape(batch, frames * channels, rows, cols)
+    return run_back(encoder, middle + mix(features), back)
+
+
+def _per_frame(value, frames):
+    """A (B, C, 1, 1) modulation for the frame-major batch of B * frames; (1, ...) broadcasts."""
+    if value.shape[0] == 1:
+        return value
+    return value.repeat(frames, 1, 1, 1)
 
 
 class FiLM(nn.Module):
@@ -145,14 +234,17 @@ class LatentUp(nn.Module):
 
     def __init__(
         self, channels, blocks, latent, encoder_blocks=None, widths=None, activation=None, condition=None,
+        in_frames=1,
     ):
         super().__init__()
         if channels < 1 or blocks < 0 or latent < 1:
             raise SystemExit("channels and latent must be positive, blocks zero or more")
         if condition is not None and condition not in CONDITIONS:
             raise SystemExit(f"condition must be one of {', '.join(CONDITIONS)}, not {condition!r}")
+        if in_frames < 1 or in_frames % 2 != 1:
+            raise SystemExit(f"latent_up in_frames must be odd, not {in_frames}")
         encoder_blocks, widths = latent_layout(encoder_blocks, widths)
-        self.in_frames = 1
+        self.in_frames = in_frames
         self.factor = FACTOR
         self.channels = channels
         self.blocks = blocks
@@ -166,6 +258,9 @@ class LatentUp(nn.Module):
         self.film = None
         if condition is not None:
             self.film = FiLM(self.condition_size, block_widths(self.encoder), activation)
+        self.mix = None
+        if in_frames > 1:
+            self.mix = FrameMix(self.widths[-1], in_frames, activation)
 
     def condition_batch(self, codecs, device=None):
         """(B, condition_size) for a list of codecs, None meaning unknown."""
@@ -179,15 +274,37 @@ class LatentUp(nn.Module):
         return self.film(condition)
 
     def forward(self, low, condition=None):
-        """`condition` (B, condition_size); None is the unknown codec, all zero."""
+        """`low` (B, 3 * in_frames, H, W); `condition` (B, condition_size), None is the unknown codec."""
+        if low.shape[1] != 3 * self.in_frames:
+            raise SystemExit(f"latent_up reads {self.in_frames} frame(s), {3 * self.in_frames} channels, not {low.shape[1]}")
         padded, _height, _width = pad_to(low, FACTOR)
+        modulation = None
         if self.film is None:
             if condition is not None:
                 raise SystemExit("this latent_up has no condition")
-            return self.encoder(padded)
-        if condition is None:
-            condition = torch.zeros(low.shape[0], self.condition_size, device=low.device, dtype=low.dtype)
-        return run_encoder(self.encoder, padded, self.film(condition))
+        else:
+            if condition is None:
+                condition = torch.zeros(low.shape[0], self.condition_size, device=low.device, dtype=low.dtype)
+            modulation = self.film(condition)
+        if self.mix is None:
+            return run_encoder(self.encoder, padded, modulation)
+        return run_frames(self.encoder, self.mix, padded, self.in_frames, modulation)
+
+    def neighbor_usage(self):
+        """Weight and gradient ratio of the frame mix's last layer, as vote reports its vote.
+
+        weight is the mean absolute kernel. grad is its mean absolute
+        gradient over the same on the head. None for one frame.
+        """
+        if self.mix is None:
+            return None
+        kernel = self.mix.outer.weight
+        stats = {"weight": float(kernel.detach().abs().mean())}
+        head_grad = self.encoder.to_stats.weight.grad
+        if kernel.grad is not None and head_grad is not None:
+            ratio = kernel.grad.detach().abs().mean() / head_grad.detach().abs().mean().clamp_min(1e-12)
+            stats["grad"] = float(ratio)
+        return stats
 
 
 @torch.no_grad()
@@ -254,6 +371,9 @@ class LatentUpExport(nn.Module):
     for unknown): γ and β are computed here once and stay in the graph as
     constants per block (Core ML folds 1 + γ), so the program has the frame
     as its only input and the MLP is not part of it.
+
+    With in_frames 3 the input is the previous, middle, and next frame on 9
+    channels, as training reads them; the front runs once per frame.
     """
 
     def __init__(self, model, vae, codec=None):
@@ -262,6 +382,8 @@ class LatentUpExport(nn.Module):
 
         self.encoder = copy.deepcopy(model.encoder)
         self.decoder = copy.deepcopy(vae.decoder)
+        self.in_frames = model.in_frames
+        self.mix = None if model.mix is None else copy.deepcopy(model.mix)
         head = self.encoder.to_stats
         inverse = vae.latent_scale.reciprocal().to(head.weight)
         shift = vae.latent_shift.to(head.weight)
@@ -280,13 +402,25 @@ class LatentUpExport(nn.Module):
             self.modulated = True
 
     def forward(self, frames):
-        if not self.modulated:
-            return self.decoder(self.encoder(frames)).clamp(0, 1)
-        pairs = [
-            (getattr(self, f"film_gamma_{index}"), getattr(self, f"film_beta_{index}"))
-            for index in range(self.film_count)
+        pairs = None
+        if self.modulated:
+            pairs = [
+                (getattr(self, f"film_gamma_{index}"), getattr(self, f"film_beta_{index}"))
+                for index in range(self.film_count)
+            ]
+        if self.mix is None:
+            return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
+        # One front per frame on its 3 channels, no batch reshape in the graph.
+        count = front_count(self.encoder)
+        front = None if pairs is None else pairs[:count]
+        back = None if pairs is None else pairs[count:]
+        features = [
+            run_front(self.encoder, frames[:, 3 * index:3 * index + 3], front)
+            for index in range(self.in_frames)
         ]
-        return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
+        middle = features[self.in_frames // 2]
+        hidden = middle + self.mix(torch.cat(features, dim=1))
+        return self.decoder(run_back(self.encoder, hidden, back)).clamp(0, 1)
 
 
 class LatentUpReference(nn.Module):

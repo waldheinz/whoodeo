@@ -183,6 +183,14 @@ class TrainConfig:
     # latent_up with condition: share of training frames whose codec is set
     # to unknown (all zero). Not part of the loss recipe, so a resume may change it.
     codec_unknown: float = 0.0
+    # Decay of the moving average of the generator weights, None is off.
+    # Validation, the preview, and model.pt use the average. Not part of the
+    # loss recipe, so a resume may change it.
+    ema: float | None = None
+    # latent_up with in_frames > 1: chance per neighbor and training frame
+    # that it is swapped for the middle frame of another frame of the batch,
+    # a stand-in for a scene cut. Not part of the loss recipe.
+    scene_cut: float = 0.0
 
     def arch_key(self):
         return model_key(
@@ -250,6 +258,8 @@ def shape_text(arch, blocks, channels, in_frames, *extra):
             f"encoder_blocks {'/'.join(str(item) for item in encoder_blocks)} "
             f"widths {'/'.join(str(item) for item in widths)} vae {vae}"
         )
+        if in_frames != 1:
+            text += f" in_frames {in_frames}"
         if activation != "silu":
             text += f" activation {activation}"
         if condition is not None:
@@ -405,6 +415,8 @@ def load_config(path, architecture=None, architecture_from=None):
     latent_noise_tau = _take_latent_noise(data, where, arch)
     faces = _take_faces(data, where, arch)
     codec_unknown = _take_codec_unknown(data, where, condition)
+    ema = _take_ema(data, where)
+    scene_cut = _take_scene_cut(data, where, arch, in_frames)
     terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
         if variants is not None:
@@ -473,6 +485,8 @@ def load_config(path, architecture=None, architecture_from=None):
         faces=faces,
         condition=condition,
         codec_unknown=codec_unknown,
+        ema=ema,
+        scene_cut=scene_cut,
         crop=crop,
         freeze_encoder=freeze_encoder,
         schedule=schedule,
@@ -488,13 +502,12 @@ def _take_model(data, where, architecture, architecture_from):
         chosen = _resolve_vae(parse_model(raw, f"{where}: model"), f"{where}: model")
         if architecture is not None:
             from_file = parse_model(architecture, f"{source}: architecture")
-            if _adds_condition(from_file, chosen):
-                # A fine-tune may add FiLM to a latent_up without it: the
-                # FiLM weights start at zero, so step 0 is the loaded network.
-                return chosen
-            if _swaps_vae(from_file, chosen):
-                # A fine-tune may move a latent_up to another vae2 checkpoint
-                # of the same shape, e.g. a later one of the same vae2 run. Its
+            if _grows_latent_up(from_file, chosen):
+                # A fine-tune may add FiLM to a latent_up without it, or the
+                # neighbor frames to a one-frame latent_up: the FiLM weights
+                # and the frame mix start at zero, so step 0 is the loaded
+                # network. It may also move to another vae2 checkpoint of the
+                # same shape, e.g. a later one of the same vae2 run. Its
                 # latent shift and scale come with that checkpoint.
                 return chosen
             if model_key(*from_file) != model_key(*chosen):
@@ -510,24 +523,25 @@ def _take_model(data, where, architecture, architecture_from):
     return parse_model(architecture, f"{source}: architecture")
 
 
-def _adds_condition(from_file, chosen):
-    """The config is the model file's latent_up plus a condition, nothing else changed."""
-    if from_file[0] != LATENT_ARCH or from_file[-1] is not None or chosen[-1] is None:
-        return False
-    return model_key(*from_file[:-1], None) == model_key(*chosen[:-1], None)
+def _grows_latent_up(from_file, chosen):
+    """The config is the model file's latent_up, grown in ways its weights load into.
 
-
-def _swaps_vae(from_file, chosen):
-    """The config is the model file's latent_up with another vae2, nothing else changed.
-
-    The vae2 is checked for the same latent channels when it loads.
+    Allowed: a condition where the file has none, more input frames where the
+    file reads one, another vae2. Everything else must be the same. The vae2
+    is checked for the same latent channels when it loads.
     """
     if from_file[0] != LATENT_ARCH or chosen[0] != LATENT_ARCH:
         return False
+    file_frames, chosen_frames = from_file[3], chosen[3]
+    if file_frames not in (1, chosen_frames):
+        return False
     *head_file, _vae_file, act_file, cond_file = from_file
     *head_chosen, _vae_chosen, act_chosen, cond_chosen = chosen
-    return model_key(*head_file, None, act_file, cond_file) == model_key(
-        *head_chosen, None, act_chosen, cond_chosen
+    if cond_file not in (None, cond_chosen):
+        return False
+    head_file[3] = head_chosen[3] = None
+    return model_key(*head_file, None, act_file, None) == model_key(
+        *head_chosen, None, act_chosen, None
     )
 
 
@@ -634,6 +648,28 @@ def _take_codec_unknown(data, where, condition):
     value = _take_float(data, "codec_unknown", where)
     if not 0 <= value <= 1:
         raise SystemExit(f"{where}: codec_unknown must be from 0 to 1")
+    return value
+
+
+def _take_ema(data, where):
+    """ema: the decay of the weight average, None when left out (off)."""
+    if "ema" not in data:
+        return None
+    value = _take_float(data, "ema", where)
+    if not 0 < value < 1:
+        raise SystemExit(f"{where}: ema is the decay of the weight average, above 0 and below 1")
+    return value
+
+
+def _take_scene_cut(data, where, arch, in_frames):
+    """scene_cut: the chance per neighbor that it comes from another frame of the batch."""
+    if "scene_cut" not in data:
+        return 0.0
+    if arch != LATENT_ARCH or in_frames < 3:
+        raise SystemExit(f"{where}: scene_cut needs a latent_up with in_frames 3 or more")
+    value = _take_float(data, "scene_cut", where)
+    if not 0 <= value <= 1:
+        raise SystemExit(f"{where}: scene_cut must be from 0 to 1")
     return value
 
 

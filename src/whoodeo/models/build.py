@@ -9,7 +9,8 @@ that adds a shared vote from the previous and next frame. `vae` reconstructs
 one frame through a spatial Gaussian. `vae2` does the same with tapered
 widths and no normalization, so its decoder runs on the Neural Engine.
 `latent_up` maps a low frame to the code of a frozen vae2, whose decoder
-gives the 2x picture; `condition: codec` adds FiLM on the codec of the low frame. `swinir`,
+gives the 2x picture; `condition: codec` adds FiLM on the codec of the low frame,
+`in_frames: 3` the previous and next frame. `swinir`,
 `swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
 reconstruction heads. The training config sets depth, width, and input frames.
 """
@@ -47,7 +48,7 @@ PRESETS = {
     "vote": {"blocks": 14, "channels": 64, "frames": 3},
     "vae": {"blocks": 4, "channels": 64, "frames": 1},
     "vae2": {"blocks": 6, "channels": 64, "frames": 1},
-    "latent_up": {"blocks": 12, "channels": 64, "frames": 1},
+    "latent_up": {"blocks": 12, "channels": 64, "frames": None},
     "swinir": {"blocks": 6, "channels": 180, "frames": 1},
     "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
     "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
@@ -122,7 +123,7 @@ def build_model(
     elif arch == "latent_up":
         if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
             raise SystemExit("latent must be a positive integer")
-        model = LatentUp(width, depth, latent, encoder_blocks, widths, activation, condition)
+        model = LatentUp(width, depth, latent, encoder_blocks, widths, activation, condition, in_frames)
     elif arch == "vae2":
         _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
         model = VAE2(
@@ -166,6 +167,7 @@ def build_model(
             f"latent_up {depth}x{width} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in chosen_blocks)} "
             f"widths {'/'.join(str(item) for item in chosen_widths)}"
+            f"{'' if in_frames == 1 else f' in_frames {in_frames}'}"
             f"{_activation_text(activation)}"
             f"{'' if condition is None else f' condition {condition}'} parameters {count}"
         )

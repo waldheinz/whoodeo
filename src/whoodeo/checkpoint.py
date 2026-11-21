@@ -12,7 +12,10 @@ this file.
 train.pt is everything else the same run needs in order to continue: the
 step again, both optimizers, the discriminator, the loss recipe, and the
 plateau schedule when that schedule is in use. --resume reads it. A
-fine-tune does not.
+fine-tune does not. With a weight average (ema in the config), model.pt
+holds the averaged weights, which validation and the preview use, and
+train.pt adds the weights the optimizer works on (`weights`) and the
+average's decay and update count (`ema`).
 
 A run directory follows its latest link. A checkpoint directory, model.pt,
 or train.pt names one step exactly. An older run that still keeps model.pt
@@ -57,6 +60,10 @@ class TrainState:
     discriminator: dict | None
     disc_optimizer: dict | None
     schedule: dict | None
+    # With a weight average: the trained weights (model.pt holds the average)
+    # and {"decay", "updates"}. None for a run without one.
+    weights: dict | None = None
+    ema: dict | None = None
 
 
 def latest_link():
@@ -74,13 +81,14 @@ def run_directory(model_path):
 
 def save_run(
     directory, model, architecture, step, optimizer, loss,
-    discriminator=None, disc_optimizer=None, schedule=None,
+    discriminator=None, disc_optimizer=None, schedule=None, extra=None,
 ):
     """Write checkpoints/<step>/ and point both latest links at it.
 
     A new step is published by renaming its directory into place, so a crash
     leaves the previous checkpoint alone. The same step replaces its own two
-    files, train.pt first. Returns the checkpoint directory.
+    files, train.pt first. `extra` adds keys to train.pt. Returns the
+    checkpoint directory.
     """
     directory = Path(directory)
     step = int(step)
@@ -95,6 +103,8 @@ def save_run(
         train_payload["disc_optimizer"] = disc_optimizer.state_dict()
     if schedule is not None:
         train_payload["schedule"] = schedule
+    if extra:
+        train_payload.update(extra)
     model_payload = {
         "architecture": architecture,
         "state_dict": model.state_dict(),
@@ -197,19 +207,25 @@ def build_generator(spec, device):
 
 
 def load_weights(model, spec):
-    """spec's weights into `model`. Returns the names of the new FiLM weights, empty when none.
+    """spec's weights into `model`. Returns the names of the weights that start fresh, empty when none.
 
     A latent_up with condition takes the weights of one without: its FiLM
-    weights are the only ones missing and keep their start, the last layer at
-    zero, so the network gives what the loaded one gave. Anything else must
-    match exactly.
+    weights are missing and keep their start, the last layer at zero. A
+    latent_up with neighbor frames takes the weights of a one-frame one: its
+    frame mix is missing and keeps its start, the last layer at zero. Either
+    way the network gives what the loaded one gave. Anything else must match
+    exactly.
     """
-    film = getattr(model, "film", None)
-    if film is None or spec.architecture.get("condition") is not None:
+    fresh = []
+    if getattr(model, "film", None) is not None and spec.architecture.get("condition") is None:
+        fresh.append("film.")
+    if getattr(model, "mix", None) is not None and int(spec.architecture.get("in_frames", 1)) == 1:
+        fresh.append("mix.")
+    if not fresh:
         model.load_state_dict(spec.state_dict)
         return []
     result = model.load_state_dict(spec.state_dict, strict=False)
-    foreign = [name for name in result.missing_keys if not name.startswith("film.")]
+    foreign = [name for name in result.missing_keys if not name.startswith(tuple(fresh))]
     if foreign or result.unexpected_keys:
         raise SystemExit(
             f"{spec.path}: does not load into this latent_up: "
@@ -377,6 +393,8 @@ def _train_state(path, data):
         discriminator,
         disc_optimizer,
         data.get("schedule"),
+        data.get("weights"),
+        data.get("ema"),
     )
 
 
