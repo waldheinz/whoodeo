@@ -1,6 +1,6 @@
 # latent-up-3f-96 on the DGX Spark: latent-up-3f-spark.yaml at width 96
-# instead of 64 (96 at low resolution, 192 at 1/2, 384 at 1/4) and batch 6
-# instead of 8, so it fits in the Spark's 121 GB (21.11.2026). The 64-wide
+# instead of 64 (96 at low resolution, 192 at 1/2, 384 at 1/4), 21.11.2026.
+# The 64-wide
 # runs plateaued at about 35.5 dB with the latent L1 near 0.35; this tests
 # whether more width helps. The 64-wide weights do not fit, so it starts
 # fresh (no --model):
@@ -61,8 +61,7 @@ ema: 0.999
 # (shift and scale folded in). Fresh runs only. Off, as in latent-up-spark.yaml.
 init_from_vae: false
 
-batch: 6          # 8 at width 64 used about 83 of 121 GB with 3 frames;
-                  # width 96 needs about 1.5x the network's activations
+batch: 8          # batch 6 used about 70 of 121 GB (6.5 s/step at 640x360)
 lr: 1.0e-4
 schedule:
   kind: plateau
