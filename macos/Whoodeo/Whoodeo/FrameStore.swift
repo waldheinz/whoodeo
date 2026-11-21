@@ -5,7 +5,7 @@ import Foundation
 import os
 import VideoToolbox
 
-/// Which frames of one film, model, and compute unit are already encoded.
+/// Which frames of one film and model are already encoded.
 nonisolated struct Coverage: Equatable {
     private(set) var count: Int
     private var words: [UInt64]
@@ -144,11 +144,15 @@ nonisolated final class FrameStore: @unchecked Sendable {
     }
 
     /// `filmID` is the digest stored on the film. Opening does not hash the file again.
-    static func open(filmID: String, model: URL, unit: Compute, count: Int) throws -> FrameStore {
+    /// Suffix of a model's cache folder. It named the compute unit when the app had a choice;
+    /// everything runs on the GPU now, and the suffix stays so the caches stay valid.
+    static let unitSuffix = "gpu"
+
+    static func open(filmID: String, model: URL, count: Int) throws -> FrameStore {
         guard count > 0 else { throw CLIError("der Film hat keine Bilder") }
         let root = cacheRoot
             .appendingPathComponent(filmID, isDirectory: true)
-            .appendingPathComponent("\(digest(identity(model)))-\(unit.rawValue)", isDirectory: true)
+            .appendingPathComponent("\(digest(identity(model)))-\(unitSuffix)", isDirectory: true)
         gate.lock()
         defer { gate.unlock() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

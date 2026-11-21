@@ -61,6 +61,12 @@
             <property name="codec" code="Wcod" type="text" access="rw" description="hevc, prores oder prores4444. Voreinstellung ist hevc.">
                 <cocoa key="scriptCodec"/>
             </property>
+            <property name="source codec" code="Wscd" type="text" access="rw" description="Codec-Bedingung des Upscalers mit FiLM: auto, h264, mpeg4, mpeg2 oder unknown. auto folgt dem Film.">
+                <cocoa key="scriptSourceCodec"/>
+            </property>
+            <property name="active codec" code="Wacd" type="text" access="r" description="Codec des geladenen Pakets: h264, mpeg4, mpeg2 oder unknown. Leer bei einem Modell ohne Codec-Bedingung.">
+                <cocoa key="scriptActiveCodec"/>
+            </property>
             <property name="in point" code="Winp" type="integer" access="rw" description="Erstes Bild des Exports, beginnend bei 1.">
                 <cocoa key="scriptInPoint"/>
             </property>

@@ -82,6 +82,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc var scriptSourceCodec: String {
+        get { MainActor.assumeIsolated { Session.current?.codecChoice.rawValue ?? "auto" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let problem = Session.current?.setCodecChoice(named: newValue) else { return }
+                NSScriptCommand.current()?.scriptErrorNumber = errAECoercionFail
+                NSScriptCommand.current()?.scriptErrorString = problem
+            }
+        }
+    }
+
+    @objc var scriptActiveCodec: String {
+        MainActor.assumeIsolated { Session.current?.activeCodec?.rawValue ?? "" }
+    }
+
     @objc var scriptInPoint: Int {
         get {
             MainActor.assumeIsolated {

@@ -17,6 +17,8 @@ int source_height(const SourceFile *file);
 int source_count(const SourceFile *file);
 int source_bits(const SourceFile *file);
 double source_fps(const SourceFile *file);
+// FFmpeg's short name of the picture codec, "h264", "mpeg4", "mpeg2video", and so on.
+const char *source_codec(const SourceFile *file);
 int source_time(const SourceFile *file, int index, int64_t *value, int32_t *timescale);
 
 // Writes planar float RGB, R then G then B, each sample in 0..1.

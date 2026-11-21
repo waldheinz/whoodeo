@@ -18,7 +18,7 @@ struct ContentView: View {
         .onChange(of: session.selection) { _, _ in
             session.openSelection()
         }
-        .onDrop(of: FilmDrop.contentTypes, isTargeted: $swiftDrop) { providers in
+        .onDrop(of: FilmDrop.dropTypes, isTargeted: $swiftDrop) { providers in
             FilmDrop.read(providers) { urls in
                 Task { @MainActor in
                     _ = session.openFilms(urls)
@@ -217,16 +217,18 @@ struct ContentView: View {
             ToolbarItemGroup {
                 ZoomSlider()
                     .disabled(session.frameCount == 0)
-                Picker("Rechenwerk", selection: Binding(
-                    get: { session.unit },
-                    set: { session.changeUnit($0) }
+                Picker("Codec", selection: Binding(
+                    get: { session.codecChoice },
+                    set: { session.changeCodec($0) }
                 )) {
-                    ForEach(Compute.allCases) { unit in
-                        Text(unit.title).tag(unit)
+                    ForEach(CodecChoice.allCases) { choice in
+                        Text(codecTitle(choice)).tag(choice)
                     }
                 }
                 .pickerStyle(.menu)
                 .fixedSize()
+                .disabled(!session.codecSelectable)
+                .help(codecHelp)
             }
         }
         .safeAreaBar(edge: .bottom) {
@@ -243,6 +245,21 @@ struct ContentView: View {
                 }
         }
         .onPreferenceChange(TransportInsetKey.self) { transportInset = $0 }
+    }
+
+    /// "Automatisch (h264)" names what automatic picks for the open film.
+    private func codecTitle(_ choice: CodecChoice) -> String {
+        guard choice == .auto else { return choice.title }
+        return "Automatisch (\(session.automaticCodec.title))"
+    }
+
+    private var codecHelp: String {
+        guard session.selectedModel?.hasCodecs == true else {
+            return "Dieses Modell hat keine Codec-Bedingung."
+        }
+        let film = session.filmCodec.map { "Film: \($0.title)" } ?? "kein Film"
+        let active = session.activeCodec.map { "Paket: \($0.title)" } ?? "kein Paket"
+        return "Codec, auf den der Upscaler eingestellt ist. \(film) · \(active)"
     }
 
     private var showsPicture: Bool {

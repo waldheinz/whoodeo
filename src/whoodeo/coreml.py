@@ -9,15 +9,20 @@ to [0, 1] out, both fp16. The input takes the enumerated latent sizes of
 --latent, 60x107, 90x160, and 135x240 by default (480p, 720p, and 1080p at
 factor 8), so the Neural Engine can run it. One size gives a fixed shape.
 The metadata carries the latent shift and scale, one value per channel.
+--part encoder gives the vae2 encoder instead: the frame in (sides 8 times the
+latent sizes), μ out, both fp16, the same metadata. --part pair writes both
+into ~/Library/Application Support/Whoodeo/VAE (or the folder -o names), for
+the app's VAE playground; the app's model list does not see that folder.
 A latent_up checkpoint gives one program with its vae2 decoder behind it: the
 low frame in, the 2x frame clamped to [0, 1] out, both fp16. The latent shift
 and scale fold into the head of latent_up, so the graph hands the decoder μ
-directly. The input takes any size from 64x64 to --max-low, 1136x640 by
-default; the Neural Engine aborts on a whole 1280x720 low frame. --low gives
-enumerated sizes instead. The app pads a frame on the bottom and the right
+directly. The input takes any size from 64x64 to --max-low, 1280x720 by
+default, so a 720p low frame fits. The app runs it on the GPU; the Neural
+Engine would abort on a whole 1280x720 low frame. --low gives enumerated sizes
+instead. The app pads a frame on the bottom and the right
 (reflect) to the next multiple of 4 and crops the result to 2h x 2w. The vae2
 is the one the checkpoint names; a path under /mnt/home-storinator-trem is
-looked up under /Volumes/home, and --vae overrides it.
+looked up under /Volumes/home, then ~/storinator/home, and --vae overrides it.
 A latent_up with condition (FiLM) is exported for one codec: --codec h264,
 mpeg4, mpeg2, or unknown (the default, all zero). γ and β of that codec are
 computed once and sit in the graph as constants, a multiply and an add behind
@@ -60,15 +65,19 @@ _FLEX_W = (64, 1920, 640)
 # Latent sides of 480p (856x480), 720p, and 1080p at factor 8.
 LATENT_SIZES = ((60, 107), (90, 160), (135, 240))
 LOW_PAD = 4
-# latent_up's flexible input: 64 up to this, height x width. 1280x720 aborts on the Neural Engine.
+# latent_up's flexible input: 64 up to this, height x width. The app runs it on the GPU;
+# a whole 1280x720 low frame aborts on the Neural Engine.
 LOW_MIN = 64
-LOW_MAX = (640, 1136)
+LOW_MAX = (720, 1280)
 # Sizes --plan and --bench use for a flexible latent_up package.
-LOW_PROBES = ((240, 428), (360, 640), (480, 852), (640, 1136))
+LOW_PROBES = ((240, 428), (360, 640), (480, 852), (640, 1136), (720, 1280))
 # Convolution weights and bias times this, with a multiply by its inverse behind.
 CONV_SCALE = 16.0
-# Where the Spark's runs mount lives on the Mac.
-VAE_MOUNTS = (("/mnt/home-storinator-trem", "/Volumes/home"),)
+# Where the Spark's runs mount lives on the Mac, in the order they are tried.
+VAE_MOUNTS = (
+    ("/mnt/home-storinator-trem", "/Volumes/home"),
+    ("/mnt/home-storinator-trem", str(Path.home() / "storinator" / "home")),
+)
 
 
 def _coremltools():
@@ -181,7 +190,7 @@ def _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote):
 
 def convert(
     checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=None, vae=None, plan=False,
-    conv_scale=None, max_low=LOW_MAX, codec=None,
+    conv_scale=None, max_low=LOW_MAX, codec=None, part="decoder",
 ):
     """Write an mlprogram with a flexible input, a vae2 decoder, or latent_up with its decoder.
 
@@ -195,7 +204,17 @@ def convert(
         conv_scale = CONV_SCALE if arch in ("vae2", "latent_up") else 1.0
     if codec is not None and arch != "latent_up":
         raise SystemExit(f"--codec is for a latent_up with condition, not {arch}")
+    if part != "decoder" and arch != "vae2":
+        raise SystemExit(f"--part {part} is for a vae2, not {arch}")
     if arch == "vae2":
+        if part == "encoder":
+            return convert_encoder(ct, spec, output, latent_sizes, conv_scale)
+        if part == "pair":
+            folder = Path(output)
+            convert_encoder(ct, spec, folder / package_filename(checkpoint, spec, part="encoder"),
+                            latent_sizes, conv_scale)
+            return convert_decoder(ct, spec, folder / package_filename(checkpoint, spec),
+                                   latent_sizes, conv_scale)
         return convert_decoder(ct, spec, output, latent_sizes, conv_scale)
     if arch == "latent_up":
         return convert_latent_up(ct, spec, output, low_sizes, vae, plan, conv_scale, max_low, codec)
@@ -282,12 +301,17 @@ def convert_decoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
     )
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} decoder"
-    _assign_metadata(mlmodel, {
+    _assign_metadata(mlmodel, _vae2_metadata(spec, model, "decoder", sizes, conv_scale))
+    return _save_vae2_part(ct, mlmodel, output, spec, f"{trace_h}x{trace_w}")
+
+
+def _vae2_metadata(spec, model, part, sizes, conv_scale):
+    return {
         "whoodeo.arch": "vae2",
-        "whoodeo.part": "decoder",
+        "whoodeo.part": part,
         "whoodeo.blocks": str(spec.architecture.get("blocks")),
         "whoodeo.channels": str(spec.architecture.get("channels")),
-        "whoodeo.latent": str(latent),
+        "whoodeo.latent": str(spec.architecture["latent"]),
         "whoodeo.factor": str(spec.architecture.get("factor")),
         "whoodeo.activation": spec.architecture.get("activation", "silu"),
         "whoodeo.step": "" if spec.step is None else str(spec.step),
@@ -297,7 +321,10 @@ def convert_decoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
         # One value per latent channel, comma separated.
         "whoodeo.latent_shift": ",".join(f"{float(v):.8g}" for v in model.latent_shift.reshape(-1)),
         "whoodeo.latent_scale": ",".join(f"{float(v):.8g}" for v in model.latent_scale.reshape(-1)),
-    })
+    }
+
+
+def _save_vae2_part(ct, mlmodel, output, spec, probe):
     output = Path(output)
     if output.exists():
         import shutil
@@ -309,8 +336,59 @@ def convert_decoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
         counts = _plan_counts(mlmodel, ct.ComputeUnit.CPU_AND_NE)
     except Exception as exc:
         counts = {"plan": str(exc)}
-    print(f"plan ane {trace_h}x{trace_w} {counts}", flush=True)
+    print(f"plan ane {probe} {counts}", flush=True)
     return output, spec
+
+
+class EncoderExport(torch.nn.Module):
+    """The vae2 encoder alone: the frame in, μ out (no log-variance, no sample), for tracing."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, image):
+        mu, _logvar = self.model.encode(image)
+        return mu
+
+
+def convert_encoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
+    """Write the vae2 encoder: frames 8x the latent sizes in, μ out, enumerated or one fixed size."""
+    model, label, _in_frames, step, _path = build_generator(spec, torch.device("cpu"))
+    _prepare(model)
+    latent = spec.architecture["latent"]
+    factor = int(spec.architecture.get("factor") or model.factor)
+    sizes = [tuple(size) for size in latent_sizes]
+    frames = [(height * factor, width * factor) for height, width in sizes]
+    trace_h, trace_w = frames[len(frames) // 2]
+    example = torch.rand(1, 3, trace_h, trace_w)
+    plain = EncoderExport(model).eval()
+    export = scale_convs(plain, conv_scale)
+    if conv_scale != 1:
+        _check_scaled(plain, export, torch.rand(1, 3, 96, 160), "encoder")
+    with torch.no_grad():
+        traced = torch.jit.trace(export, example)
+    if len(frames) == 1:
+        shape = (1, 3, trace_h, trace_w)
+    else:
+        shape = ct.EnumeratedShapes(
+            shapes=[(1, 3, height, width) for height, width in frames],
+            default=(1, 3, trace_h, trace_w),
+        )
+    print(f"convert {label}  step {step}  encoder -> {output}", flush=True)
+    mlmodel = ct.convert(
+        traced,
+        convert_to="mlprogram",
+        compute_precision=ct.precision.FLOAT16,
+        minimum_deployment_target=ct.target.iOS18,
+        inputs=[ct.TensorType(name="image", shape=shape, dtype=np.float16)],
+        outputs=[ct.TensorType(name="mu", dtype=np.float16)],
+        pass_pipeline=_pipeline(ct, conv_scale),
+    )
+    mlmodel.author = "whoodeo"
+    mlmodel.short_description = f"{label} encoder"
+    _assign_metadata(mlmodel, _vae2_metadata(spec, model, "encoder", sizes, conv_scale))
+    return _save_vae2_part(ct, mlmodel, output, spec, f"{trace_h}x{trace_w}")
 
 
 def resolve_vae(path, override=None):
@@ -813,6 +891,13 @@ def library_directory():
     return path
 
 
+def playground_directory():
+    """Where the app's VAE playground looks for an encoder and decoder pair. Created on demand."""
+    path = Path.home() / "Library" / "Application Support" / "Whoodeo" / "VAE"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _run_slug(checkpoint):
     path = Path(checkpoint)
     for parent in [path, *path.parents]:
@@ -829,7 +914,7 @@ def _safe_name(text):
     return cleaned or "model"
 
 
-def package_filename(checkpoint, spec, codec=None):
+def package_filename(checkpoint, spec, codec=None, part=None):
     """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in its codec.
 
     A model on more than one frame carries the count behind the step, "…-step003000-3f-hd-h264".
@@ -844,14 +929,19 @@ def package_filename(checkpoint, spec, codec=None):
     in_frames = int(spec.architecture.get("in_frames") or 1)
     if in_frames > 1:
         step_part += f"-{in_frames}f"
-    kind = {"vae2": "decoder", "latent_up": "range"}.get(arch, "flex")
+    # latent_up ends in "hd": flexible up to 1280x720, for the GPU. The app reads the old names too.
+    kind = {"vae2": "decoder", "latent_up": "hd"}.get(arch, "flex")
+    if arch == "vae2" and part == "encoder":
+        kind = "encoder"
     if spec.architecture.get("condition") is not None:
         kind += f"-{codec or 'unknown'}"
     return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"
 
 
-def _default_output(checkpoint, spec, codec=None):
-    return library_directory() / package_filename(checkpoint, spec, codec)
+def _default_output(checkpoint, spec, codec=None, part="decoder"):
+    if part == "pair":
+        return playground_directory()
+    return library_directory() / package_filename(checkpoint, spec, codec, part)
 
 
 def parse_args(argv=None):
@@ -890,7 +980,7 @@ def parse_args(argv=None):
         type=_latent_size,
         default=LOW_MAX,
         help="latent_up: largest low frame HxW of the flexible input, sides divisible by 4. "
-             "Default: 640x1136",
+             "Default: 720x1280",
     )
     parser.add_argument(
         "--conv-scale",
@@ -910,6 +1000,13 @@ def parse_args(argv=None):
         "--plan",
         action="store_true",
         help="latent_up: print the Neural Engine plan of each low size",
+    )
+    parser.add_argument(
+        "--part",
+        choices=("decoder", "encoder", "pair"),
+        default="decoder",
+        help="vae2: the decoder, the encoder, or both for the app's VAE playground "
+             "(-o is then a folder, default ~/Library/Application Support/Whoodeo/VAE)",
     )
     parser.add_argument(
         "--codec",
@@ -940,12 +1037,12 @@ def main(argv=None):
     if args.out is not None:
         output = args.out
     else:
-        output = _default_output(args.model, spec, args.codec)
+        output = _default_output(args.model, spec, args.codec, args.part)
     if args.conv_scale is not None and args.conv_scale <= 0:
         raise SystemExit("--conv-scale must be positive")
     package, _spec = convert(
         args.model, output, args.latent or LATENT_SIZES, args.low, args.vae, args.plan,
-        args.conv_scale, args.max_low, args.codec,
+        args.conv_scale, args.max_low, args.codec, args.part,
     )
     if args.bench:
         bench(package, args.model, args.bench, args.vae, args.codec)

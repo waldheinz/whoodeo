@@ -8,6 +8,11 @@ nonisolated struct FilmFacts: Sendable {
     var count: Int
     var fps: Double
     var bits: Int
+    /// FFmpeg's name of the picture codec, empty when unknown.
+    var codecName: String = ""
+
+    /// What the codec condition of a latent_up with FiLM calls this film.
+    var codec: SourceCodec { SourceCodec.detect(ffmpegName: codecName) }
 }
 
 nonisolated struct AudioFacts: Sendable {
@@ -73,7 +78,8 @@ nonisolated final class Film {
             height: height,
             count: count,
             fps: fps > 0 ? fps : 25,
-            bits: Int(source_bits(opened))
+            bits: Int(source_bits(opened)),
+            codecName: String(cString: source_codec(opened))
         )
         return Film(facts: facts, audio: audio, frameDuration: duration, reader: opened)
     }

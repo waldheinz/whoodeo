@@ -126,6 +126,14 @@ static int timeline_from_index(SourceFile *file, AVStream *stream) {
     if (big * 2 > count) return -1;
     int64_t declared = stream->nb_frames;
     if (declared > 0 && count < declared) return -1;
+    // Matroska often indexes only the keyframes it has seen so far, sometimes just
+    // the first. When the index holds far fewer pictures than duration times rate,
+    // read the packets instead.
+    double seconds = stream->duration != AV_NOPTS_VALUE && stream->duration > 0
+        ? (double)stream->duration * av_q2d(stream->time_base)
+        : (file->fmt->duration > 0 ? (double)file->fmt->duration / AV_TIME_BASE : 0);
+    double rate = av_q2d(av_guess_frame_rate(file->fmt, stream, NULL));
+    if (seconds > 0 && rate > 0 && count < 0.9 * seconds * rate) return -1;
     file->count = count;
     return 0;
 }
@@ -315,6 +323,11 @@ int source_height(const SourceFile *file) { return file->height; }
 int source_count(const SourceFile *file) { return file->count; }
 int source_bits(const SourceFile *file) { return file->bits; }
 double source_fps(const SourceFile *file) { return file->fps; }
+
+const char *source_codec(const SourceFile *file) {
+    if (file == NULL || file->fmt == NULL || file->video < 0) return "";
+    return avcodec_get_name(file->fmt->streams[file->video]->codecpar->codec_id);
+}
 
 int source_time(const SourceFile *file, int index, int64_t *value, int32_t *timescale) {
     if (index < 0 || index >= file->count) return -1;

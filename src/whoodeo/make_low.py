@@ -9,7 +9,9 @@ the audio is dropped. Smaller rungs are still encoded from that same
 source. Nothing is upscaled. The file is <title>.<rung>.mkv. Low variants
 come from the catalog's degrade list and are written unless `--no-degrade`
 is set, under the same filename. One master is finished, variants included,
-before the next master starts.
+before the next master starts. The missing variants of a master come
+from one ffmpeg run: the master is decoded and scaled once, and each
+variant encodes its own copy of those frames.
 
 The plain command writes the missing variants of masters already in the
 catalog. With no filenames it also encodes any rung the catalog's origin
@@ -165,94 +167,127 @@ def has_audio(path):
     return bool(text)
 
 
-def encode_one(src, low_dir, variant, ffmpeg_args, scale, scale_flags, pix_fmt, force, strict):
-    """Write one low variant. Return its frame count, -1 when ignored, None on failure."""
+def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, strict):
+    """Write several low variants of one master from a single decode.
+
+    jobs is a list of (variant, ffmpeg_args). The master is decoded and scaled
+    once, split, and each copy is encoded to its own file. Return a dict from
+    variant to its frame count, -1 when ignored, None on failure.
+    """
     name = src.name
-    label = f"{variant}/{name}"
-    if src.suffix.lower() not in VIDEO_EXTS:
-        if strict:
-            print(f"skip {label}: train does not read this extension", file=sys.stderr)
-            return None
-        return -1
-    codec = codec_of(ffmpeg_args)
-    if src.suffix.lower() == ".webm" and codec not in WEBM_CODECS:
-        print(
-            f"skip {label}: webm cannot hold codec {codec or '(unset)'}",
-            file=sys.stderr,
-        )
-        return None if strict else -1
+    results = {}
+    todo = []
+    for variant, ffmpeg_args in jobs:
+        label = f"{variant}/{name}"
+        if src.suffix.lower() not in VIDEO_EXTS:
+            if strict:
+                print(f"skip {label}: train does not read this extension", file=sys.stderr)
+                results[variant] = None
+            else:
+                results[variant] = -1
+            continue
+        codec = codec_of(ffmpeg_args)
+        if src.suffix.lower() == ".webm" and codec not in WEBM_CODECS:
+            print(
+                f"skip {label}: webm cannot hold codec {codec or '(unset)'}",
+                file=sys.stderr,
+            )
+            results[variant] = None if strict else -1
+            continue
+        out = low_dir / variant / name
+        if out.exists() and not force:
+            print(f"keep {label}", flush=True)
+            try:
+                results[variant] = packets_of(out)
+            except RuntimeError as exc:
+                print(f"{label}: {exc}", file=sys.stderr)
+                results[variant] = None
+            continue
+        todo.append((variant, ffmpeg_args, out))
+    if not todo:
+        return results
+
+    def fail_all(message):
+        for variant, _, _ in todo:
+            print(f"{variant}/{name}: {message}", file=sys.stderr)
+            results[variant] = None
+        return results
+
     sar = sample_aspect(src)
     if not square_pixels(sar):
-        print(
-            f"{label} has sample aspect ratio {sar}; stored pixels are not square",
-            file=sys.stderr,
-        )
-        return None
-
-    out_dir = low_dir / variant
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / name
-    if out.exists() and not force:
-        print(f"keep {label}", flush=True)
-        try:
-            return packets_of(out)
-        except RuntimeError as exc:
-            print(f"{label}: {exc}", file=sys.stderr)
-            return None
-
+        return fail_all(f"sample aspect ratio {sar}; stored pixels are not square")
     width, height = size_of(src)
     if width % (scale * 2) or height % (scale * 2):
-        print(
-            f"{label} is {width}x{height}. Both sides must be divisible by "
-            f"{scale * 2} so the 1/{scale} frame is even.",
-            file=sys.stderr,
+        return fail_all(
+            f"master is {width}x{height}. Both sides must be divisible by "
+            f"{scale * 2} so the 1/{scale} frame is even."
         )
-        return None
     low_w = width // scale
     low_h = height // scale
-    tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
-    tmp.unlink(missing_ok=True)
-    print(f"encode {label}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", flush=True)
+
+    count = len(todo)
+    labels = "".join(f"[v{index}]" for index in range(count))
+    graph = f"[0:v:0]scale={low_w}:{low_h}:flags={scale_flags},split={count}{labels}"
+    outputs = []
+    temps = []
+    for index, (variant, ffmpeg_args, out) in enumerate(todo):
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
+        tmp.unlink(missing_ok=True)
+        temps.append(tmp)
+        print(f"encode {variant}/{name}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", flush=True)
+        outputs += [
+            "-map", f"[v{index}]", "-an",
+            *shlex.split(ffmpeg_args),
+            "-pix_fmt", pix_fmt,
+            "-fps_mode", "passthrough",
+            str(tmp),
+        ]
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
         "-i", str(src),
-        "-map", "0:v:0", "-an",
-        "-vf", f"scale={low_w}:{low_h}:flags={scale_flags}",
-        *shlex.split(ffmpeg_args),
-        "-pix_fmt", pix_fmt,
-        "-fps_mode", "passthrough",
-        str(tmp),
+        "-filter_complex", graph,
+        *outputs,
     ]
     result = subprocess.run(command, check=False)
     if result.returncode != 0:
-        tmp.unlink(missing_ok=True)
-        print(f"{label}: ffmpeg failed", file=sys.stderr)
-        return None
+        for tmp in temps:
+            tmp.unlink(missing_ok=True)
+        return fail_all("ffmpeg failed")
 
     try:
-        out_size = size_of(tmp)
         in_packets = packets_of(src)
-        out_packets = packets_of(tmp)
-        audio = has_audio(tmp)
     except RuntimeError as exc:
-        tmp.unlink(missing_ok=True)
-        print(f"{label}: {exc}", file=sys.stderr)
-        return None
-    if out_size != (low_w, low_h):
-        tmp.unlink(missing_ok=True)
-        print(f"{label}: output is {out_size[0]}x{out_size[1]}, expected {low_w}x{low_h}", file=sys.stderr)
-        return None
-    if in_packets != out_packets:
-        tmp.unlink(missing_ok=True)
-        print(f"{label}: {in_packets} input frames, {out_packets} output frames", file=sys.stderr)
-        return None
-    if audio:
-        tmp.unlink(missing_ok=True)
-        print(f"{label}: output still has audio", file=sys.stderr)
-        return None
-    tmp.replace(out)
-    print(f"wrote {out}  {low_w}x{low_h}  {out_packets} frames", flush=True)
-    return out_packets
+        for tmp in temps:
+            tmp.unlink(missing_ok=True)
+        return fail_all(str(exc))
+    for (variant, _, out), tmp in zip(todo, temps):
+        label = f"{variant}/{name}"
+        try:
+            out_size = size_of(tmp)
+            out_packets = packets_of(tmp)
+            audio = has_audio(tmp)
+        except RuntimeError as exc:
+            tmp.unlink(missing_ok=True)
+            print(f"{label}: {exc}", file=sys.stderr)
+            results[variant] = None
+            continue
+        problem = None
+        if out_size != (low_w, low_h):
+            problem = f"output is {out_size[0]}x{out_size[1]}, expected {low_w}x{low_h}"
+        elif in_packets != out_packets:
+            problem = f"{in_packets} input frames, {out_packets} output frames"
+        elif audio:
+            problem = "output still has audio"
+        if problem:
+            tmp.unlink(missing_ok=True)
+            print(f"{label}: {problem}", file=sys.stderr)
+            results[variant] = None
+            continue
+        tmp.replace(out)
+        print(f"wrote {out}  {low_w}x{low_h}  {out_packets} frames", flush=True)
+        results[variant] = out_packets
+    return results
 
 
 def probe_video(path):
@@ -1005,15 +1040,19 @@ def degrade_master(
         print(f"{src.name}: low variants must be a list", file=sys.stderr)
         return False
     failed = False
+    jobs = []
     for variant, ffmpeg_args in selected:
         low_path = low_dir / variant / src.name
         if low_path.is_file() and not force and variant in master["low"]:
             print(f"keep {variant}/{src.name}", flush=True)
             continue
-        frames = encode_one(
-            src, low_dir, variant, ffmpeg_args,
-            scale, flags, pix_fmt, force, strict,
-        )
+        jobs.append((variant, ffmpeg_args))
+    encoded = encode_variants(
+        src, low_dir, jobs, scale, flags, pix_fmt, force, strict,
+    ) if jobs else {}
+    for variant, _ in jobs:
+        low_path = low_dir / variant / src.name
+        frames = encoded.get(variant)
         if frames is None:
             failed = True
             continue

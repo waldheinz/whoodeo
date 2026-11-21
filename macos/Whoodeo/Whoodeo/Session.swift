@@ -36,8 +36,13 @@ final class Session: ObservableObject {
     @Published var zoomToFit = true
     @Published var magnification: CGFloat = 1
     @Published private(set) var zoomPlacement = 0
-    @Published var unit: Compute = .gpu
     @Published var codec: Codec = .hevc
+    /// Codec condition of a latent_up with FiLM. Automatic follows the open film.
+    @Published private(set) var codecChoice: CodecChoice = .auto
+    /// The codec of the open film, from its picture stream. Nil without a film.
+    @Published private(set) var filmCodec: SourceCodec?
+    /// The codec the loaded package was exported for. Nil for a package without FiLM.
+    @Published private(set) var activeCodec: SourceCodec?
     @Published var index = 0
     @Published var frameCount = 0
     @Published var inPoint = 0
@@ -107,7 +112,6 @@ final class Session: ObservableObject {
     private var playFetching = false
     private var scrubTask: Task<Void, Never>?
     private var keys: Any?
-    private var honorPrefer = true
     private var recentDrop: (url: URL, at: Date)?
     private var sliderHoldingHundred = false
     private var filmList = FilmList.empty
@@ -121,6 +125,8 @@ final class Session: ObservableObject {
     private static let fillCacheKey = "fillCache"
     private static let lastModelKey = "lastModel"
     private var didRestoreModel = false
+    /// Counts model loads. A load that finishes after a newer one started is dropped.
+    private var modelLoad = 0
 
     init() {
         let stored = UserDefaults.standard.object(forKey: Self.fillCacheKey) as? Bool
@@ -475,6 +481,8 @@ final class Session: ObservableObject {
         keys = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             if event.modifierFlags.contains(.command) { return event }
+            // The playground has its own sliders; arrows and space stay there.
+            if event.window?.identifier?.rawValue.contains(PlaygroundView.windowID) == true { return event }
             switch event.keyCode {
             case 49:
                 self.togglePlay()
@@ -525,10 +533,77 @@ final class Session: ObservableObject {
     }
 
     func openSelection() {
-        guard let selection else { return }
+        guard let selection, let (url, codec) = resolvedPackage() else { return }
         UserDefaults.standard.set(selection.lastPathComponent, forKey: Self.lastModelKey)
-        if selection == modelURL { return }
-        loadModel(selection)
+        if url == modelURL { return }
+        if exporting {
+            failure = "Während des Exports bleibt das Modell."
+            status = failure!
+            return
+        }
+        loadModel(url, codec: codec)
+    }
+
+    /// The sidebar line that is selected.
+    var selectedModel: LibraryModel? {
+        guard let selection else { return nil }
+        return library.first { $0.url == selection }
+    }
+
+    /// The codec menu works for a latent_up with FiLM, and not while an export runs.
+    var codecSelectable: Bool { selectedModel?.hasCodecs == true && !exporting }
+
+    /// The codec automatic would pick now: that of the open film, unknown without one.
+    var automaticCodec: SourceCodec { filmCodec ?? .unknown }
+
+    /// The package of the selected line for the codec in force. The codec is nil without FiLM.
+    private func resolvedPackage() -> (url: URL, codec: SourceCodec?)? {
+        guard let selection else { return nil }
+        guard let model = selectedModel else { return (selection, nil) }
+        let wanted = codecChoice.resolve(film: filmCodec)
+        let picked = model.package(for: wanted)
+        if let got = picked.codec, got != wanted {
+            Log.model.info("kein Paket für Codec \(wanted.rawValue, privacy: .public), nehme \(got.rawValue, privacy: .public)")
+        }
+        return picked
+    }
+
+    /// Menu: automatic or a fixed codec. Swaps the package when it differs; the frame cache follows the package.
+    func changeCodec(_ next: CodecChoice) {
+        guard !exporting else {
+            failure = "Während des Exports bleibt der Codec."
+            status = failure!
+            return
+        }
+        codecChoice = next
+        Log.model.info("Codec-Wahl \(next.rawValue, privacy: .public)")
+        if !syncCodecPackage() {
+            showCurrent()
+        }
+    }
+
+    /// `auto`, `h264`, `mpeg4`, `mpeg2`, or `unknown`. Returns a message when the name is unknown.
+    func setCodecChoice(named name: String) -> String? {
+        guard let parsed = CodecChoice.parse(name) else {
+            return "Codec ist auto, h264, mpeg4, mpeg2 oder unknown."
+        }
+        changeCodec(parsed)
+        return nil
+    }
+
+    /// Load the package of the codec in force if it is not the one loaded. True when a load started.
+    @discardableResult
+    private func syncCodecPackage() -> Bool {
+        guard !exporting, let (url, codec) = resolvedPackage() else { return false }
+        guard url != modelURL else { return false }
+        Log.model.info("Codec \(codec?.rawValue ?? "-", privacy: .public): \(url.lastPathComponent, privacy: .public)")
+        loadModel(url, codec: codec)
+        return true
+    }
+
+    /// End of the line under the picture: the codec for a package with FiLM, empty otherwise.
+    private var codecNote: String {
+        activeCodec.map { " · \($0.title)" } ?? ""
     }
 
     func askDelete(_ url: URL? = nil) {
@@ -536,6 +611,7 @@ final class Session: ObservableObject {
         deleteTarget = url
         if let model = library.first(where: { $0.url == url }) {
             deleteName = "\(model.title), \(model.detail)"
+            if model.urls.count > 1 { deleteName += " (\(model.urls.count) Codec-Pakete)" }
         } else {
             deleteName = url.deletingPathExtension().lastPathComponent
         }
@@ -544,9 +620,11 @@ final class Session: ObservableObject {
 
     func deleteSelected() {
         guard let target = deleteTarget else { return }
-        let removingCurrent = target == modelURL
+        // A FiLM line is one package per codec. They go together.
+        let targets = library.first(where: { $0.url == target })?.urls ?? [target]
+        let removingCurrent = modelURL.map(targets.contains) ?? false
         let removingSelection = target == selection
-        NSWorkspace.shared.recycle([target]) { [weak self] _, error in
+        NSWorkspace.shared.recycle(targets) { [weak self] _, error in
             let message = error?.localizedDescription
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -569,13 +647,23 @@ final class Session: ObservableObject {
     }
 
     func openFilms(_ urls: [URL]) -> Bool {
-        guard let url = urls.first(where: FilmDrop.isFilm) else { return false }
+        guard let url = urls.first(where: FilmDrop.isFilm) else {
+            Log.drop.info("openFilms: kein Film unter \(urls.count) URL(s)")
+            return false
+        }
         let key = url.standardizedFileURL
         if let recentDrop, recentDrop.url == key, Date().timeIntervalSince(recentDrop.at) < 0.5 {
+            Log.drop.info("openFilms: doppelter Drop ignoriert")
             return true
         }
         recentDrop = (key, Date())
-        return addFilm(at: key.path) != nil
+        let opened = addFilm(at: key.path) != nil
+        if opened {
+            Log.drop.info("openFilms: geöffnet \(key.path, privacy: .public)")
+        } else {
+            Log.drop.error("openFilms: \(self.failure ?? "Fehler", privacy: .public) bei \(key.path, privacy: .public)")
+        }
+        return opened
     }
 
     func pickFilm() {
@@ -690,31 +778,19 @@ final class Session: ObservableObject {
         if outPoint < inPoint { inPoint = outPoint }
     }
 
-    func changeUnit(_ next: Compute) {
-        honorPrefer = false
-        unit = next
-        guard let modelURL else { return }
-        loadingModel = true
-        failure = nil
-        status = "lädt \(next.title)"
-        releaseArchive()
-        engine.setUnit(next, url: modelURL) { [weak self] result in
-            Task { @MainActor in
-                self?.applyModel(result)
-            }
-        }
-    }
-
-    private func loadModel(_ url: URL) {
-        honorPrefer = true
+    private func loadModel(_ url: URL, codec: SourceCodec? = nil) {
         loadingModel = true
         modelURL = url
+        activeCodec = codec
         failure = nil
         status = "lädt \(url.lastPathComponent)"
         releaseArchive()
-        engine.openModel(url, unit: unit) { [weak self] result in
+        modelLoad += 1
+        let token = modelLoad
+        engine.openModel(url) { [weak self] result in
             Task { @MainActor in
-                self?.applyModel(result)
+                guard let self, token == self.modelLoad else { return }
+                self.applyModel(result)
             }
         }
     }
@@ -723,15 +799,9 @@ final class Session: ObservableObject {
         switch result {
         case .success(let info):
             modelLabel = info.label
-            if honorPrefer && info.prefer != unit, let modelURL {
-                honorPrefer = false
-                unit = info.prefer
-                loadingModel = true
-                status = "lädt \(info.prefer.title)"
-                engine.setUnit(info.prefer, url: modelURL) { [weak self] result in
-                    Task { @MainActor in self?.applyModel(result) }
-                }
-                return
+            activeCodec = info.codec
+            if let codec = info.codec {
+                Log.model.info("Modell \(self.modelURL?.lastPathComponent ?? "", privacy: .public) · Codec \(codec.rawValue, privacy: .public) · Wahl \(self.codecChoice.rawValue, privacy: .public) · Film \(self.filmCodec?.rawValue ?? "-", privacy: .public)")
             }
             loadingModel = false
             failure = nil
@@ -770,8 +840,13 @@ final class Session: ObservableObject {
                     self.busy = false
                     self.failure = nil
                     self.status = "\(facts.width)×\(facts.height) · \(facts.count) Bilder"
+                    self.filmCodec = facts.codec
+                    Log.model.info("Film-Codec \(facts.codecName, privacy: .public) → \(facts.codec.rawValue, privacy: .public)")
                     self.rememberShownFacts(facts, id: id)
-                    self.showCurrent()
+                    // Automatic follows the film: another codec loads another package, and that shows the frame.
+                    if !self.syncCodecPackage() {
+                        self.showCurrent()
+                    }
                 case .failure(let error):
                     self.loadingFilmID = nil
                     self.busy = false
@@ -801,6 +876,7 @@ final class Session: ObservableObject {
     /// Drop the picture. The list entry and the cache stay.
     private func closeShownFilm() {
         shownFilmID = nil
+        filmCodec = nil
         loadingFilmID = nil
         facts = nil
         frameCount = 0
@@ -833,27 +909,39 @@ final class Session: ObservableObject {
 
     private func reloadLibrary() {
         library = ModelLibrary.models()
-        let urls = library.map(\.url)
+        // Every codec package of a FiLM line keeps its caches.
+        let urls = library.flatMap(\.urls)
         DispatchQueue.global(qos: .utility).async {
             FrameStore.pruneModelCaches(keep: Set(urls.map(FrameStore.modelKey(of:))))
         }
         if let selection, !library.contains(where: { $0.url == selection }) {
-            self.selection = nil
-            if selection == modelURL { clearModel() }
+            // A FiLM line names the package of another codec once more codecs arrive.
+            if let moved = library.first(where: { $0.urls.contains(selection) }) {
+                self.selection = moved.url
+            } else {
+                self.selection = nil
+            }
+        }
+        if let modelURL, !urls.contains(modelURL) { clearModel() }
+        if selection != nil, modelURL != nil, !loadingModel {
+            // A codec package that just arrived replaces the fallback.
+            syncCodecPackage()
         }
         guard !didRestoreModel else { return }
         didRestoreModel = true
         guard selection == nil,
               let name = UserDefaults.standard.string(forKey: Self.lastModelKey),
-              let match = library.first(where: { $0.url.lastPathComponent == name })
+              let match = library.first(where: { $0.urls.contains { $0.lastPathComponent == name } })
         else { return }
         selection = match.url
         openSelection()
     }
 
     private func clearModel() {
+        modelLoad += 1
         loadingModel = false
         modelURL = nil
+        activeCodec = nil
         modelLabel = ""
         pixelWidth = 0
         pixelHeight = 0
@@ -888,7 +976,7 @@ final class Session: ObservableObject {
     private func adoptStore() {
         guard store == nil, let facts, let modelURL, let shownFilmID, facts.count > 0 else { return }
         do {
-            let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, unit: unit, count: facts.count)
+            let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, count: facts.count)
             store = opened
             coverage = opened.coverage()
         } catch {
@@ -954,7 +1042,7 @@ final class Session: ObservableObject {
         Log.play.info("Pause bei Bild \(self.index + 1, privacy: .public)")
         if video {
             if coverage.contains(index) {
-                status = "Bild \(index + 1) von \(frameCount) · Cache · \(unit.title)"
+                status = "Bild \(index + 1) von \(frameCount) · Cache\(codecNote)"
             }
             attachSource()
             scheduleFill()
@@ -1102,10 +1190,10 @@ final class Session: ObservableObject {
         milliseconds = shown.milliseconds
         failure = nil
         if shown.fromCache {
-            status = "Bild \(shown.index + 1) von \(frameCount) · Cache · \(unit.title)"
+            status = "Bild \(shown.index + 1) von \(frameCount) · Cache\(codecNote)"
         } else {
             let timing = String(format: "%.0f ms", shown.milliseconds)
-            status = "Bild \(shown.index + 1) von \(frameCount) · \(timing) · \(unit.title)"
+            status = "Bild \(shown.index + 1) von \(frameCount) · \(timing)\(codecNote)"
         }
     }
 

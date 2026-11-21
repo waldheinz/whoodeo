@@ -1,4 +1,5 @@
 import AppKit
+import os
 import SwiftUI
 
 /// Draws one upright picture. Its frame is the picture.
@@ -491,7 +492,11 @@ final class PictureStage: NSView {
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         setHovering(false)
-        guard let url = FilmDrop.firstFilm(in: sender) else { return false }
+        guard let url = FilmDrop.firstFilm(in: sender) else {
+            Log.drop.info("Bildfläche: kein Film im Drop")
+            return false
+        }
+        Log.drop.info("Bildfläche: \(url.path, privacy: .public)")
         onFilm?(url)
         return true
     }

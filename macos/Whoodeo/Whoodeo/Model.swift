@@ -1,37 +1,6 @@
 import CoreML
 import Foundation
 
-nonisolated enum Compute: String, CaseIterable, Identifiable {
-    case gpu, ane, auto
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .gpu: "GPU"
-        case .ane: "Neural Engine"
-        case .auto: "Automatisch"
-        }
-    }
-
-    var units: MLComputeUnits {
-        switch self {
-        case .gpu: .cpuAndGPU
-        case .ane: .cpuAndNeuralEngine
-        case .auto: .all
-        }
-    }
-
-    static func parse(_ text: String) -> Compute? {
-        switch text {
-        case "gpu": .gpu
-        case "ane": .ane
-        case "all", "auto": .auto
-        default: nil
-        }
-    }
-}
-
 nonisolated struct FrameSize: Hashable {
     var width: Int
     var height: Int
@@ -51,7 +20,6 @@ nonisolated struct PackageInfo {
     var widthMax: Int
     var heightMin: Int
     var heightMax: Int
-    var prefer: Compute
     var inputName: String
     var outputName: String
     /// Enumerated input sizes, empty for a flexible range.
@@ -59,12 +27,15 @@ nonisolated struct PackageInfo {
     /// Both sides are padded (reflect, bottom and right) to a multiple of this, 1 for none.
     var pad: Int = 1
     var inputType: MLMultiArrayDataType = .float32
+    /// The codec fixed into a latent_up with FiLM (`whoodeo.codec`), nil without condition.
+    var codec: SourceCodec? = nil
 
     var label: String {
         var parts = ["\(arch) \(blocks)×\(channels)"]
         if let stem { parts.append("stem \(stem)") }
         if let vote { parts.append("vote \(vote)") }
         if let step { parts.append("Schritt \(step)") }
+        if let codec { parts.append("· Codec \(codec.title)") }
         return parts.joined(separator: " ")
     }
 
@@ -101,7 +72,6 @@ nonisolated struct PackageInfo {
         let outputs = model.modelDescription.outputDescriptionsByName
         let inputName = inputs["frames"] != nil ? "frames" : (inputs.keys.first ?? "frames")
         let outputName = outputs["image"] != nil ? "image" : (outputs.keys.first ?? "image")
-        let prefer = Compute.parse(meta["whoodeo.bench.prefer"] ?? "") ?? .gpu
         // "428x240,640x360": width x height.
         let sizes: [FrameSize] = (meta["whoodeo.sizes"] ?? "").split(separator: ",").compactMap { part in
             let sides = part.split(separator: "x")
@@ -123,12 +93,12 @@ nonisolated struct PackageInfo {
             widthMax: Int(meta["whoodeo.width_max"] ?? "") ?? 8192,
             heightMin: Int(meta["whoodeo.height_min"] ?? "") ?? 1,
             heightMax: Int(meta["whoodeo.height_max"] ?? "") ?? 8192,
-            prefer: prefer,
             inputName: inputName,
             outputName: outputName,
             sizes: sizes,
             pad: max(Int(meta["whoodeo.pad"] ?? "") ?? 1, 1),
-            inputType: inputType == .float16 ? .float16 : .float32
+            inputType: inputType == .float16 ? .float16 : .float32,
+            codec: meta["whoodeo.condition"] == nil ? nil : SourceCodec(rawValue: meta["whoodeo.codec"] ?? "unknown")
         )
     }
 }
@@ -143,14 +113,14 @@ nonisolated struct Prediction {
 nonisolated final class Predictor {
     let info: PackageInfo
     let model: MLModel
-    let unit: Compute
     private var inputArray: MLMultiArray?
 
-    init(url: URL, unit: Compute) throws {
+    /// The app runs every package on the GPU.
+    init(url: URL) throws {
         let config = MLModelConfiguration()
-        config.computeUnits = unit.units
+        config.computeUnits = .cpuAndGPU
         var hints = MLOptimizationHints()
-        // One film is one shape. Infrequent lets that shape onto the Neural Engine.
+        // One film is one shape.
         hints.reshapeFrequency = .infrequent
         hints.specializationStrategy = .fastPrediction
         config.optimizationHints = hints
@@ -158,7 +128,6 @@ nonisolated final class Predictor {
         let compiled = url.pathExtension == "mlmodelc" ? url : try MLModel.compileModel(at: url)
         model = try MLModel(contentsOf: compiled, configuration: config)
         info = try PackageInfo.read(model)
-        self.unit = unit
     }
 
     func predict(stack: [Float], width: Int, height: Int) throws -> Prediction {

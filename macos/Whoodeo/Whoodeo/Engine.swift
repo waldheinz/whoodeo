@@ -47,20 +47,16 @@ nonisolated final class Engine: @unchecked Sendable {
         }
     }
 
-    func openModel(_ url: URL, unit: Compute, done: @escaping (Result<PackageInfo, Error>) -> Void) {
+    func openModel(_ url: URL, done: @escaping (Result<PackageInfo, Error>) -> Void) {
         queue.async {
             do {
-                let predictor = try Predictor(url: url, unit: unit)
+                let predictor = try Predictor(url: url)
                 self.predictor = predictor
                 done(.success(predictor.info))
             } catch {
                 done(.failure(error))
             }
         }
-    }
-
-    func setUnit(_ unit: Compute, url: URL, done: @escaping (Result<PackageInfo, Error>) -> Void) {
-        openModel(url, unit: unit, done: done)
     }
 
     func request(_ index: Int, store: FrameStore?, need: FrameNeed, done: @escaping (Result<Shown, Error>) -> Void) {
