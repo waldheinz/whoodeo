@@ -13,7 +13,7 @@ nonisolated struct LibraryModel: Identifiable, Hashable {
     static func read(_ url: URL) -> LibraryModel {
         let stem = url.deletingPathExtension().lastPathComponent
         guard let match = stem.firstMatch(
-            of: /^(?:train-(\d{8})-(\d{4})\d{2}-)?(vote|edsr|latent_up)-(\d+)x(\d+)-step(\d+)-([a-z]+)$/
+            of: /^(?:train-(\d{8})-(\d{4})\d{2}-)?(vote|edsr|latent_up)-(\d+)x(\d+)-step(\d+)(?:-(\d+)f)?-([a-z]+)$/
         ) else {
             return LibraryModel(
                 url: url, title: stem, detail: "Core ML",
@@ -24,7 +24,9 @@ nonisolated struct LibraryModel: Identifiable, Hashable {
         let blocks = String(match.4)
         let channels = String(match.5)
         let step = Int(match.6) ?? 0
-        var detail = "Schritt \(step) · \(match.7)"
+        // "-3f" behind the step: a model on 3 frames, previous, current, next.
+        let frames = match.7.flatMap { Int($0) } ?? 1
+        var detail = "Schritt \(step) · \(match.8)"
         if let day = match.1, let time = match.2 {
             // Run started at, e.g. 22.10. 01:35
             let d = Array(day), t = Array(time)
@@ -32,7 +34,7 @@ nonisolated struct LibraryModel: Identifiable, Hashable {
         }
         return LibraryModel(
             url: url,
-            title: "\(arch) \(blocks)×\(channels)",
+            title: "\(arch) \(blocks)×\(channels)" + (frames > 1 ? " · \(frames) Bilder" : ""),
             detail: detail,
             symbol: "arrow.up.left.and.arrow.down.right",
             tint: arch == "latent_up" ? .purple : .blue

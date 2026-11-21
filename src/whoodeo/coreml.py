@@ -830,13 +830,20 @@ def _safe_name(text):
 
 
 def package_filename(checkpoint, spec, codec=None):
-    """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in its codec."""
+    """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in its codec.
+
+    A model on more than one frame carries the count behind the step, "…-step003000-3f-hd-h264".
+    """
     arch = spec.architecture.get("arch") or "model"
     blocks = spec.architecture.get("blocks")
     channels = spec.architecture.get("channels")
     shape = f"{blocks}x{channels}" if blocks and channels else "model"
     step = spec.step
     step_part = f"step{int(step):06d}" if step is not None else "step"
+    # More than one input frame, e.g. "-3f": the sidebar tells it from a one-frame model.
+    in_frames = int(spec.architecture.get("in_frames") or 1)
+    if in_frames > 1:
+        step_part += f"-{in_frames}f"
     kind = {"vae2": "decoder", "latent_up": "range"}.get(arch, "flex")
     if spec.architecture.get("condition") is not None:
         kind += f"-{codec or 'unknown'}"
