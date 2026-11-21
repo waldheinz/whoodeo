@@ -210,17 +210,21 @@ def load_weights(model, spec):
     """spec's weights into `model`. Returns the names of the weights that start fresh, empty when none.
 
     A latent_up with condition takes the weights of one without: its FiLM
-    weights are missing and keep their start, the last layer at zero. A
-    latent_up with neighbor frames takes the weights of a one-frame one: its
-    frame mix is missing and keeps its start, the last layer at zero. Either
-    way the network gives what the loaded one gave. Anything else must match
-    exactly.
+    weights are missing and keep their start, the last layer at zero, so the
+    network gives what the loaded one gave. Anything else must match exactly,
+    in_frames too.
     """
+    # Only latent_up has `mix` (None for one frame).
+    frames = model.in_frames if hasattr(model, "mix") else None
+    saved_frames = int(spec.architecture.get("in_frames", 1))
+    if frames is not None and frames != saved_frames:
+        raise SystemExit(
+            f"{spec.path}: reads in_frames {saved_frames}, this model in_frames {frames}; "
+            "--model needs the same in_frames"
+        )
     fresh = []
     if getattr(model, "film", None) is not None and spec.architecture.get("condition") is None:
         fresh.append("film.")
-    if getattr(model, "mix", None) is not None and int(spec.architecture.get("in_frames", 1)) == 1:
-        fresh.append("mix.")
     if not fresh:
         model.load_state_dict(spec.state_dict)
         return []

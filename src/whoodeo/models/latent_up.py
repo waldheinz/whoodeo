@@ -34,11 +34,10 @@ the channels as the other multi-frame archs take them (9 channels). The
 encoder up to 1/4 (stem, the levels at low and 1/2, with FiLM) is shared and
 runs once per frame. At 1/4, the grid of the code, `FrameMix` mixes them: a
 1x1 convolution over the features of all frames, the activation, and a 1x1
-convolution that starts at zero, added onto the middle frame's features.
-The blocks at 1/4 and the head then run once. At the start the mix adds 0,
-so the network is exactly the one-frame latent_up: a one-frame checkpoint
-loads into it with the mix left at its start (see checkpoint.load_weights).
-The middle frame is in the mix's input, so the network can compare it with
+convolution, added onto the middle frame's features. Both convolutions have
+PyTorch's default start, so the neighbors count from the first step. The
+blocks at 1/4 and the head then run once. A one-frame checkpoint does not
+load into it: in_frames must match. The middle frame is in the mix's input, so the network can compare it with
 each neighbor and learn to ignore a neighbor from another shot. The clip's
 edges repeat the middle frame, as for every multi-frame arch.
 """
@@ -150,9 +149,8 @@ def run_encoder(encoder, image, modulation=None):
 class FrameMix(nn.Module):
     """Features of `frames` frames at 1/4 -> a correction of the middle frame's.
 
-    1x1 convolution over all frames' channels, activation, 1x1 convolution
-    that starts at zero: a fresh mix returns 0, so the middle frame's
-    features pass unchanged.
+    1x1 convolution over all frames' channels, activation, 1x1 convolution,
+    both with PyTorch's default start.
     """
 
     def __init__(self, width, frames, activation=None):
@@ -161,8 +159,6 @@ class FrameMix(nn.Module):
         self.inner = nn.Conv2d(width * frames, width, kernel_size=1)
         self.act = activation_fn(activation)
         self.outer = nn.Conv2d(width, width, kernel_size=1)
-        nn.init.zeros_(self.outer.weight)
-        nn.init.zeros_(self.outer.bias)
 
     def forward(self, features):
         """`features` (B, frames * C, h, w) in frame order -> (B, C, h, w)."""

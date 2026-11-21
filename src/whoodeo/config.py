@@ -502,10 +502,14 @@ def _take_model(data, where, architecture, architecture_from):
         chosen = _resolve_vae(parse_model(raw, f"{where}: model"), f"{where}: model")
         if architecture is not None:
             from_file = parse_model(architecture, f"{source}: architecture")
+            if from_file[0] == chosen[0] == LATENT_ARCH and from_file[3] != chosen[3]:
+                raise SystemExit(
+                    f"{where}: model reads in_frames {chosen[3]}, {source} in_frames {from_file[3]}; "
+                    "--model needs the same in_frames"
+                )
             if _grows_latent_up(from_file, chosen):
-                # A fine-tune may add FiLM to a latent_up without it, or the
-                # neighbor frames to a one-frame latent_up: the FiLM weights
-                # and the frame mix start at zero, so step 0 is the loaded
+                # A fine-tune may add FiLM to a latent_up without it: the
+                # FiLM weights start at zero, so step 0 is the loaded
                 # network. It may also move to another vae2 checkpoint of the
                 # same shape, e.g. a later one of the same vae2 run. Its
                 # latent shift and scale come with that checkpoint.
@@ -526,14 +530,13 @@ def _take_model(data, where, architecture, architecture_from):
 def _grows_latent_up(from_file, chosen):
     """The config is the model file's latent_up, grown in ways its weights load into.
 
-    Allowed: a condition where the file has none, more input frames where the
-    file reads one, another vae2. Everything else must be the same. The vae2
-    is checked for the same latent channels when it loads.
+    Allowed: a condition where the file has none, another vae2. Everything
+    else must be the same, in_frames too. The vae2 is checked for the same
+    latent channels when it loads.
     """
     if from_file[0] != LATENT_ARCH or chosen[0] != LATENT_ARCH:
         return False
-    file_frames, chosen_frames = from_file[3], chosen[3]
-    if file_frames not in (1, chosen_frames):
+    if from_file[3] != chosen[3]:
         return False
     *head_file, _vae_file, act_file, cond_file = from_file
     *head_chosen, _vae_chosen, act_chosen, cond_chosen = chosen

@@ -162,8 +162,8 @@ archs; the clip's edges repeat the middle frame. scene_cut (training only,
 on a generator of its own, seed + 2) swaps each neighbor with that chance
 for the middle frame of another frame of the batch, which has the same
 size, so the network learns to ignore a neighbor from another shot. The step
-line counts the swaps (cuts). --model with a one-frame latent_up starts the
-frame mix fresh; its last layer is zero, so step 0 is the loaded network.
+line counts the swaps (cuts). The frame mix has PyTorch's default start;
+--model refuses a checkpoint with other in_frames.
 train_neighbor/weight and grad are the mean absolute kernel of the mix's
 last layer and its gradient over the head's, val_neighbor/image the mean
 absolute change of the validation frames when both neighbors are replaced
@@ -1149,17 +1149,10 @@ def open_run(cfg, resume, finetune, load):
     if generator is not None:
         fresh = load_weights(model, generator)
         film = [name for name in fresh if name.startswith("film.")]
-        mix = [name for name in fresh if name.startswith("mix.")]
         if film:
             print(
                 f"condition {cfg.condition}: {generator.path} has no FiLM, "
                 f"{len(film)} FiLM tensors start fresh (last layer zero, same output)",
-                flush=True,
-            )
-        if mix:
-            print(
-                f"in_frames {cfg.in_frames}: {generator.path} reads one frame, "
-                f"{len(mix)} frame mix tensors start fresh (last layer zero, same output)",
                 flush=True,
             )
     ema = None
