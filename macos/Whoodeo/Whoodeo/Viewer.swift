@@ -2,68 +2,44 @@ import AppKit
 import os
 import SwiftUI
 
-/// Draws one upright picture. Its frame is the picture.
-/// Cached playback sits in a video layer above this drawing. The layer is a subview that
-/// does not take clicks, and it is hidden while a still or the original is showing.
-final class PixelView: NSView {
-    var recon: CGImage?
-    var source: CGImage?
+/// Holds the picture. Its frame is the picture. The video layer inside shows every frame,
+/// still or playing, upscale or original. The layer does not take clicks; this view does.
+final class PictureView: NSView {
     var sharp = false {
         didSet {
             guard sharp != oldValue else { return }
-            playback?.setSharp(sharp)
+            created?.setSharp(sharp)
         }
     }
     weak var stage: PictureStage?
-    var showSource = false {
-        didSet {
-            guard showSource != oldValue else { return }
-            playback?.setCoveredByOriginal(showSource)
-        }
-    }
-    /// Created on the first cached playback. Absent until then, so a still does not build a video layer.
-    private var playback: CacheScreen?
+    /// Created with the first picture.
+    private var created: FrameScreen?
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
 
-    func cacheScreen() -> CacheScreen {
-        if let playback { return playback }
-        let screen = CacheScreen()
+    /// The screen, created on first use.
+    func screen() -> FrameScreen {
+        if let created { return created }
+        let screen = FrameScreen()
         screen.attach(to: self)
-        playback = screen
+        created = screen
         return screen
     }
 
-    func screenIsRunning() -> Bool {
-        playback?.isRunning == true
-    }
-
-    func existingScreen() -> CacheScreen? {
-        playback
+    /// The screen if a picture has been shown, else nil.
+    func screenIfCreated() -> FrameScreen? {
+        created
     }
 
     override func layout() {
         super.layout()
-        playback?.layout(in: bounds)
+        created?.layout(in: bounds)
     }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
-        playback?.updateScale()
-    }
-
-    override func draw(_ dirty: NSRect) {
-        if !showSource, playback?.isCoveringStill == true {
-            return
-        }
-        guard let ctx = NSGraphicsContext.current?.cgContext, let image = shown else { return }
-        ctx.interpolationQuality = sharp ? .none : .medium
-        ctx.saveGState()
-        ctx.translateBy(x: 0, y: bounds.height)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
-        ctx.restoreGState()
+        created?.updateScale()
     }
 
     override func resetCursorRects() {
@@ -83,17 +59,13 @@ final class PixelView: NSView {
     override func magnify(with event: NSEvent) {
         stage?.magnify(with: event)
     }
-
-    private var shown: CGImage? {
-        showSource ? (source ?? recon) : recon
-    }
 }
 
 /// The picture sits on the window background, which follows light and dark mode.
 /// Empty space stays that plain color. Once the picture is larger than the free area,
 /// dragging moves the real pixels under the sidebar and the bars.
 final class PictureStage: NSView {
-    let pixels = PixelView()
+    let picture = PictureView()
     var zoomToFit = true
     var magnification: CGFloat = 1
     var pixelWidth = 0
@@ -101,13 +73,11 @@ final class PictureStage: NSView {
     var onZoom: ((Bool, CGFloat) -> Void)?
     var onFilm: ((URL) -> Void)?
     var onHover: ((Bool) -> Void)?
-    var onOriginal: (() -> CGImage?)?
+    var onOriginal: ((Bool) -> Void)?
 
-    func cacheScreen() -> CacheScreen { pixels.cacheScreen() }
+    func screen() -> FrameScreen { picture.screen() }
 
-    func existingScreen() -> CacheScreen? { pixels.existingScreen() }
-
-    func screenIsRunning() -> Bool { pixels.screenIsRunning() }
+    func screenIfCreated() -> FrameScreen? { picture.screenIfCreated() }
 
     var fallbackTop: CGFloat = 0
     var fallbackLeading: CGFloat = 0
@@ -127,15 +97,15 @@ final class PictureStage: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        addSubview(pixels)
-        pixels.stage = self
+        addSubview(picture)
+        picture.stage = self
         registerForDraggedTypes(FilmDrop.pasteboardTypes)
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        addSubview(pixels)
-        pixels.stage = self
+        addSubview(picture)
+        picture.stage = self
         registerForDraggedTypes(FilmDrop.pasteboardTypes)
     }
 
@@ -182,7 +152,7 @@ final class PictureStage: NSView {
 
     func trackMouse(_ event: NSEvent) {
         let startWindow = event.locationInWindow
-        let startOrigin = pixels.frame.origin
+        let startOrigin = picture.frame.origin
         let movable = panAxes()
         var panning = false
         var showing = false
@@ -266,19 +236,18 @@ final class PictureStage: NSView {
             )
             pan = origin
         }
-        pixels.setFrameSize(size)
-        pixels.setFrameOrigin(origin)
-        pixels.sharp = !zoomToFit && magnification >= 0.999
+        picture.setFrameSize(size)
+        picture.setFrameOrigin(origin)
+        picture.sharp = !zoomToFit && magnification >= 0.999
         needsDisplay = true
-        pixels.needsDisplay = true
-        window?.invalidateCursorRects(for: pixels)
+        window?.invalidateCursorRects(for: picture)
         reportFitIfNeeded(size: size)
     }
 
     /// Keeps the point in the middle of the free area fixed. Used when the toolbar slider moves.
     func zoomAboutSafeCenter() {
         let safe = safeRect()
-        let old = pixels.frame
+        let old = picture.frame
         let anchor = CGPoint(x: safe.midX, y: safe.midY)
         let fraction: CGPoint
         if old.width > 1, old.height > 1 {
@@ -318,7 +287,7 @@ final class PictureStage: NSView {
 
     private func movePicture(by delta: CGPoint) {
         guard pixelWidth > 0 else { return }
-        let origin = pixels.frame.origin
+        let origin = picture.frame.origin
         pan = CGPoint(x: origin.x + delta.x, y: origin.y + delta.y)
         zoomToFit = false
         layoutPicture(recenter: false)
@@ -333,7 +302,7 @@ final class PictureStage: NSView {
     private func changeZoom(multiplier: CGFloat, windowPoint: NSPoint) {
         guard pixelWidth > 0, pixelHeight > 0, multiplier > 0 else { return }
         let scale = screenScale
-        let old = pixels.frame
+        let old = picture.frame
         let natural = CGFloat(pixelWidth) / scale
         let visual = zoomToFit && natural > 1 ? old.width / natural : magnification
         var next = min(max(visual * multiplier, ZoomScale.minimum), ZoomScale.maximum)
@@ -370,11 +339,7 @@ final class PictureStage: NSView {
     }
 
     private func showOriginal(_ show: Bool) {
-        if show, pixels.source == nil {
-            pixels.source = onOriginal?()
-        }
-        pixels.showSource = show
-        pixels.needsDisplay = true
+        onOriginal?(show)
     }
 
     private func pictureSize(in safe: CGRect) -> CGSize {
@@ -514,8 +479,6 @@ private struct Axis {
 }
 
 struct Viewer: NSViewRepresentable {
-    var recon: CGImage?
-    var source: CGImage?
     var zoomToFit: Bool
     var magnification: CGFloat
     var placement: Int
@@ -528,7 +491,7 @@ struct Viewer: NSViewRepresentable {
     var onFilm: (URL) -> Void
     var onHover: (Bool) -> Void
     var onZoom: (Bool, CGFloat) -> Void
-    var onOriginal: () -> CGImage?
+    var onOriginal: (Bool) -> Void
     var onStage: (PictureStage) -> Void
 
     func makeNSView(context: Context) -> PictureStage {
@@ -540,7 +503,6 @@ struct Viewer: NSViewRepresentable {
         stage.onHover = onHover
         stage.onZoom = onZoom
         stage.onOriginal = onOriginal
-        let samePicture = sameImage(stage.pixels.recon, recon) && sameImage(stage.pixels.source, source)
         let sameZoom = stage.zoomToFit == zoomToFit && abs(stage.magnification - magnification) < 0.0001
         let samePixels = stage.pixelWidth == pixelWidth && stage.pixelHeight == pixelHeight
         let sameInsets = stage.fallbackTop == fallbackTop
@@ -550,7 +512,7 @@ struct Viewer: NSViewRepresentable {
         let samePlacement = context.coordinator.placement == placement
         // The frame counter publishes on every film frame. Laying the picture out again marks it
         // dirty and the video layer drops frames to keep up with a window that is redrawing.
-        if samePicture && sameZoom && samePixels && sameInsets && samePlacement {
+        if sameZoom && samePixels && sameInsets && samePlacement {
             onStage(stage)
             return
         }
@@ -558,8 +520,6 @@ struct Viewer: NSViewRepresentable {
         stage.fallbackLeading = fallbackLeading
         stage.fallbackBottom = fallbackBottom
         stage.fallbackTrailing = fallbackTrailing
-        stage.pixels.recon = recon
-        stage.pixels.source = source
         let recenter = !samePlacement
         context.coordinator.placement = placement
         let wasFit = stage.zoomToFit
@@ -575,16 +535,7 @@ struct Viewer: NSViewRepresentable {
         } else {
             stage.layoutPicture(recenter: false)
         }
-        stage.pixels.needsDisplay = true
         onStage(stage)
-    }
-
-    private func sameImage(_ lhs: CGImage?, _ rhs: CGImage?) -> Bool {
-        switch (lhs, rhs) {
-        case (nil, nil): return true
-        case let (lhs?, rhs?): return lhs === rhs
-        default: return false
-        }
     }
 
     func makeCoordinator() -> Coordinator {

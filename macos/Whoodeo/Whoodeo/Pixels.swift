@@ -116,39 +116,6 @@ nonisolated enum Pixels {
         return buffer
     }
 
-    /// Nearest-neighbor enlargement, so a block stays a block.
-    static func nearest(_ rgb: [Float], width: Int, height: Int, scale: Int) -> [Float] {
-        if scale <= 1 { return rgb }
-        let dw = width * scale
-        let dh = height * scale
-        let srcCount = width * height
-        guard rgb.count >= srcCount * 3 else { return rgb }
-        var out = [Float](repeating: 0, count: dw * dh * 3)
-        rgb.withUnsafeBufferPointer { source in
-            out.withUnsafeMutableBufferPointer { dest in
-                guard let sample = source.baseAddress, let pixel = dest.baseAddress else { return }
-                for channel in 0..<3 {
-                    let from = sample.advanced(by: srcCount * channel)
-                    let to = pixel.advanced(by: dw * dh * channel)
-                    for y in 0..<height {
-                        let srcRow = from.advanced(by: y * width)
-                        for copy in 0..<scale {
-                            let dstRow = to.advanced(by: (y * scale + copy) * dw)
-                            for x in 0..<width {
-                                let value = srcRow[x]
-                                let start = x * scale
-                                for step in 0..<scale {
-                                    dstRow[start + step] = value
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return out
-    }
-
     static func stack(_ frames: [[Float]]) -> [Float] {
         var out: [Float] = []
         out.reserveCapacity(frames.reduce(0) { $0 + $1.count })

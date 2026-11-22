@@ -41,6 +41,11 @@ nonisolated final class Film {
 
     @concurrent
     static func load(_ url: URL) async throws -> Film {
+        try open(url)
+    }
+
+    /// Opens the file on the calling thread.
+    static func open(_ url: URL) throws -> Film {
         var message = [CChar](repeating: 0, count: 512)
         let opened = message.withUnsafeMutableBufferPointer { buffer in
             url.path.withCString { source_open($0, buffer.baseAddress, Int32(buffer.count)) }
@@ -134,6 +139,11 @@ nonisolated final class Film {
     }
 
     func frame(at index: Int) async throws -> Decoded {
+        try decode(at: index)
+    }
+
+    /// Decodes on the calling thread. One film is not safe to share between threads.
+    func decode(at index: Int) throws -> Decoded {
         let clamped = min(max(index, 0), max(facts.count - 1, 0))
         if let hit = held[clamped] { return hit }
         let plane = facts.width * facts.height

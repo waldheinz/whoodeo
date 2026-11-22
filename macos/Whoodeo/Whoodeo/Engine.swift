@@ -1,24 +1,14 @@
 import CoreGraphics
 import Foundation
 
+/// One frame the engine stored or found in the archive. The screen reads it from there.
 nonisolated struct Shown {
     var index: Int
-    var recon: Picture?
-    var source: Picture?
     var milliseconds: Double
     var width: Int
     var height: Int
     var fromCache: Bool
     var stored: Bool
-}
-
-nonisolated enum FrameNeed {
-    /// Show this frame, from the archive or by running the model. Includes the original.
-    case display
-    /// Store this frame and skip the preview pictures.
-    case fill
-    /// Show this frame only when the archive already has it.
-    case cached
 }
 
 /// The main actor only enqueues work. `queue` runs the model, and `lock` covers the request slot.
@@ -28,7 +18,6 @@ nonisolated final class Engine: @unchecked Sendable {
     private var wanted: Int?
     private var handler: ((Result<Shown, Error>) -> Void)?
     private var store: FrameStore?
-    private var need = FrameNeed.display
     private var busy = false
     private var hold = false
     private var film: Film?
@@ -59,7 +48,7 @@ nonisolated final class Engine: @unchecked Sendable {
         }
     }
 
-    func request(_ index: Int, store: FrameStore?, need: FrameNeed, done: @escaping (Result<Shown, Error>) -> Void) {
+    func request(_ index: Int, store: FrameStore?, done: @escaping (Result<Shown, Error>) -> Void) {
         lock.lock()
         // A request that has not started yet is replaced. Tell its caller, or the
         // session keeps believing that fill is still running and never asks again.
@@ -67,7 +56,6 @@ nonisolated final class Engine: @unchecked Sendable {
         wanted = index
         handler = done
         self.store = store
-        self.need = need
         let start = !busy && !hold
         if start { busy = true }
         lock.unlock()
@@ -163,7 +151,6 @@ nonisolated final class Engine: @unchecked Sendable {
             let index = wanted
             let done = handler
             let store = store
-            let need = need
             wanted = nil
             handler = nil
             if index == nil || done == nil {
@@ -174,7 +161,7 @@ nonisolated final class Engine: @unchecked Sendable {
             lock.unlock()
             let result: Result<Shown, Error>
             do {
-                result = .success(try make(index!, store: store, need: need))
+                result = .success(try make(index!, store: store))
             } catch {
                 result = .failure(error)
             }
@@ -182,45 +169,15 @@ nonisolated final class Engine: @unchecked Sendable {
         }
     }
 
-    /// The enlarged original for the frame on screen. Runs on the engine queue.
-    func original(index: Int, width: Int, height: Int, done: @escaping (CGImage?) -> Void) {
-        queue.async {
-            guard let film = self.film, width > 0, height > 0 else {
-                done(nil)
-                return
-            }
-            done(try? self.sourcePicture(film: film, index: index, width: width, height: height).image)
-        }
-    }
-
-    private func make(_ index: Int, store: FrameStore?, need: FrameNeed) throws -> Shown {
-        guard let film else { throw CLIError("kein Film") }
+    /// Runs the model for a frame the archive does not have yet and stores the result.
+    private func make(_ index: Int, store: FrameStore?) throws -> Shown {
+        guard film != nil else { throw CLIError("kein Film") }
         let started = CFAbsoluteTimeGetCurrent()
-        let withSource = need == .display
-        if store?.contains(index) == true {
-            if need == .fill {
-                return Shown(index: index, recon: nil, source: nil, milliseconds: 0, width: 0, height: 0, fromCache: true, stored: true)
-            }
-            let image = try store!.image(at: index)
-            let recon = try Pixels.picture(image)
-            let source = withSource
-                ? try sourcePicture(film: film, index: index, width: recon.width, height: recon.height)
-                : nil
-            return Shown(
-                index: index,
-                recon: recon,
-                source: source,
-                milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000,
-                width: recon.width,
-                height: recon.height,
-                fromCache: true,
-                stored: true
-            )
+        if let store, store.contains(index) {
+            let size = store.dimensions()
+            return Shown(index: index, milliseconds: 0, width: size?.width ?? 0, height: size?.height ?? 0, fromCache: true, stored: true)
         }
-        if need == .cached {
-            return Shown(index: index, recon: nil, source: nil, milliseconds: 0, width: 0, height: 0, fromCache: false, stored: false)
-        }
-        guard let predictor else { throw CLIError("kein Modell") }
+        guard let film, let predictor else { throw CLIError("kein Modell") }
         let window = try Self.wait { try await film.window(at: index, frames: predictor.info.inFrames) }
         let predicted = try predictor.predict(
             stack: window.stack,
@@ -232,42 +189,14 @@ nonisolated final class Engine: @unchecked Sendable {
             try store.put(rgb: predicted.image, width: predicted.width, height: predicted.height, index: index)
             stored = true
         }
-        if need == .fill {
-            return Shown(
-                index: index,
-                recon: nil,
-                source: nil,
-                milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000,
-                width: predicted.width,
-                height: predicted.height,
-                fromCache: false,
-                stored: stored
-            )
-        }
-        let source = withSource
-            ? try sourcePicture(film: film, index: index, width: predicted.width, height: predicted.height)
-            : nil
-        let recon = try Pixels.picture(planar: predicted.image, width: predicted.width, height: predicted.height)
         return Shown(
             index: index,
-            recon: recon,
-            source: source,
             milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000,
             width: predicted.width,
             height: predicted.height,
             fromCache: false,
             stored: stored
         )
-    }
-
-    private func sourcePicture(film: Film, index: Int, width: Int, height: Int) throws -> Picture {
-        let current = try Self.wait { try await film.frame(at: index) }
-        let scale = max(width / max(current.width, 1), 1)
-        let enlarged = Pixels.nearest(current.rgb, width: current.width, height: current.height, scale: scale)
-        let sized = enlarged.count == width * height * 3
-            ? enlarged
-            : Pixels.nearest(current.rgb, width: current.width, height: current.height, scale: predictor?.info.scale ?? scale)
-        return try Pixels.picture(planar: sized, width: width, height: height)
     }
 
     private static func wait<T>(_ body: @escaping () async throws -> T) throws -> T {

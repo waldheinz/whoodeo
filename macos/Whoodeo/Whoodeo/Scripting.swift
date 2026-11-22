@@ -35,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc var scriptShowingOriginal: Bool {
+        get { MainActor.assumeIsolated { Session.current?.showingOriginal ?? false } }
+        set { MainActor.assumeIsolated { Session.current?.showOriginal(newValue) } }
+    }
+
     @objc var scriptFillEnabled: Bool {
         get { MainActor.assumeIsolated { Session.current?.fillCache ?? false } }
         set { MainActor.assumeIsolated { Session.current?.fillCache = newValue } }
@@ -151,7 +156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static var pendingFilms: [URL] = []
 
     private static let keys: Set<String> = [
-        "scriptFrame", "scriptFrameCount", "scriptPlaying", "scriptFillEnabled",
+        "scriptFrame", "scriptFrameCount", "scriptPlaying", "scriptShowingOriginal", "scriptFillEnabled",
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
         "scriptCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",

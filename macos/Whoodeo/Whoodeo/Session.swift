@@ -50,8 +50,8 @@ final class Session: ObservableObject {
     @Published var playing = false
     @Published var busy = false
     @Published var exporting = false
-    @Published var recon: CGImage?
-    @Published var source: CGImage?
+    /// A frame of this film and model is on screen.
+    @Published private(set) var hasPicture = false
     @Published var pixelWidth = 0
     @Published var pixelHeight = 0
     @Published var milliseconds: Double?
@@ -92,8 +92,8 @@ final class Session: ObservableObject {
     private var librarySource: DispatchSourceFileSystemObject?
     private var facts: FilmFacts?
     private var store: FrameStore?
-    private var cache: [Int: Shown] = [:]
-    private var cacheOrder: [Int] = []
+    /// The open film's originals for the screen. Nil without a film.
+    private var originals: Originals?
     private var playGeneration = 0
     private var epoch = 0
     private var scrubbing = false
@@ -117,9 +117,8 @@ final class Session: ObservableObject {
     private var filmList = FilmList.empty
     /// Digest of the film on screen. Nil when the viewer has no film.
     private var shownFilmID: String?
-    /// The picture view. Playback attaches its video layer here.
+    /// The picture view. Its screen shows every frame.
     private weak var stage: PictureStage?
-    private var loggedVideo = false
     private var removeTarget: String?
     private var loadingFilmID: String?
     private static let fillCacheKey = "fillCache"
@@ -471,8 +470,11 @@ final class Session: ObservableObject {
         return ""
     }
 
+    /// The picture view appears with the first frame, so the still goes up once it is here.
     func attachStage(_ stage: PictureStage) {
+        guard self.stage !== stage else { return }
         self.stage = stage
+        if !playing { showStill() }
     }
 
     func installKeys() {
@@ -702,19 +704,9 @@ final class Session: ObservableObject {
         scrubbing = true
         filling = nil
         index = min(max(next, 0), frameCount - 1)
-        if let shown = cache[index], shown.recon != nil {
-            apply(shown)
-        } else {
-            let token = epoch
-            let wanted = index
-            engine.request(wanted, store: store, need: .cached) { [weak self] result in
-                Task { @MainActor in
-                    guard let self, token == self.epoch, self.scrubbing, self.index == wanted else { return }
-                    guard case .success(let shown) = result, shown.recon != nil else { return }
-                    self.remember(shown)
-                    self.apply(shown)
-                }
-            }
+        adoptStore()
+        if store?.contains(index) == true {
+            display()
         }
         scrubTask?.cancel()
         scrubTask = Task { @MainActor in
@@ -749,23 +741,16 @@ final class Session: ObservableObject {
         scrubTask?.cancel()
         playing = true
         playGeneration += 1
-        source = nil
-        loggedVideo = false
         Log.play.info("Wiedergabe ab Bild \(self.index + 1, privacy: .public)")
         beginPlayback()
     }
 
-    /// The original for the frame on screen, built when the mouse button goes down.
-    func originalNow() -> CGImage? {
-        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
-        var image: CGImage?
-        let gate = DispatchSemaphore(value: 0)
-        engine.original(index: index, width: pixelWidth, height: pixelHeight) {
-            image = $0
-            gate.signal()
-        }
-        gate.wait()
-        return image
+    var showingOriginal: Bool { stage?.screenIfCreated()?.original == true }
+
+    /// The original instead of the upscale while the mouse button is down, also during playback.
+    func showOriginal(_ show: Bool) {
+        guard hasPicture, let stage else { return }
+        stage.screen().setOriginal(show)
     }
 
     func markIn() {
@@ -824,6 +809,7 @@ final class Session: ObservableObject {
         loadingFilmID = id
         busy = true
         failure = nil
+        originals = nil
         releaseArchive()
         status = "öffnet \(url.lastPathComponent)"
         engine.openFilm(url, filmID: id) { [weak self] result in
@@ -833,6 +819,7 @@ final class Session: ObservableObject {
                 case .success(let facts):
                     self.loadingFilmID = nil
                     self.facts = facts
+                    self.originals = Originals(url: facts.url)
                     self.frameCount = facts.count
                     self.index = 0
                     self.inPoint = 0
@@ -879,6 +866,7 @@ final class Session: ObservableObject {
         filmCodec = nil
         loadingFilmID = nil
         facts = nil
+        originals = nil
         frameCount = 0
         index = 0
         inPoint = 0
@@ -958,16 +946,13 @@ final class Session: ObservableObject {
     /// Drop the pictures on screen. The archive on disk stays with its model.
     private func releaseArchive() {
         epoch += 1
-        stopPlay(.clear)
+        stopPlay(clear: true)
         scrubTask?.cancel()
         scrubbing = false
         filling = nil
         resetFillHolds()
         store = nil
-        cache.removeAll()
-        cacheOrder.removeAll()
-        recon = nil
-        source = nil
+        hasPicture = false
         milliseconds = nil
         coverage = Coverage(count: frameCount)
         resetScale()
@@ -989,17 +974,17 @@ final class Session: ObservableObject {
         guard modelURL != nil, facts != nil else { return }
         resetFillHolds()
         adoptStore()
-        if let shown = cache[index], shown.recon != nil {
-            apply(shown)
+        if store?.contains(index) == true {
+            display()
             scheduleFill()
             return
         }
         busy = true
-        if recon == nil { status = "rechnet…" }
+        if !hasPicture { status = "rechnet…" }
         let wanted = index
         let token = epoch
         filling = nil
-        engine.request(wanted, store: store, need: .display) { [weak self] result in
+        engine.request(wanted, store: store) { [weak self] result in
             Task { @MainActor in
                 guard let self, token == self.epoch else { return }
                 self.deliver(result)
@@ -1013,68 +998,47 @@ final class Session: ObservableObject {
         showCurrent()
     }
 
-    private enum PlayEnd {
-        /// Leave the video clock where it is, so play continues from this frame.
-        case pause
-        /// Stop the clock and keep its last frame until the next still is drawn.
-        case yield
-        /// Stop the clock and remove the video frame.
-        case clear
-    }
-
-    private func stopPlay(_ end: PlayEnd = .yield) {
+    /// Stop playback. The picture stays until the next still replaces it, unless `clear` drops it.
+    private func stopPlay(clear: Bool = false) {
         playing = false
         playGeneration += 1
         playFetching = false
-        switch end {
-        case .pause:
-            stage?.existingScreen()?.pause()
-        case .yield:
-            stage?.existingScreen()?.yield()
-        case .clear:
-            stage?.existingScreen()?.stop()
+        if clear {
+            stage?.screenIfCreated()?.stop()
+        } else {
+            stage?.screenIfCreated()?.yield()
         }
     }
 
+    /// Pause on the frame the screen shows, then treat it like any other still.
     private func finishPlay() {
-        let video = stage?.screenIsRunning() == true
-        stopPlay(video ? .pause : .yield)
+        if let frame = stage?.screenIfCreated()?.pause() {
+            index = frame
+        }
+        stopPlay()
         Log.play.info("Pause bei Bild \(self.index + 1, privacy: .public)")
-        if video {
-            if coverage.contains(index) {
-                status = "Bild \(index + 1) von \(frameCount) · Cache\(codecNote)"
-            }
-            attachSource()
-            scheduleFill()
-            return
-        }
-        if let shown = cache[index], shown.recon != nil {
-            apply(shown)
-        }
-        attachSource()
-        scheduleFill()
+        showCurrent()
     }
 
-    /// Cached playback hands ProRes samples to the system video display.
+    /// Playback hands ProRes samples, or the originals while the mouse is down, to the system video display.
     private func beginPlayback() {
         adoptStore()
-        guard pixelWidth > 0, let stage, let store else {
+        guard pixelWidth > 0, let stage, let reel = reel() else {
             playing = false
             return
         }
-        let fps = max(facts?.fps ?? 25, 1)
         if coverage.contains(index) {
             if status != "Wiedergabe · Cache" { status = "Wiedergabe · Cache" }
         } else if status != "rechnet…" {
             status = "rechnet…"
         }
-        stage.cacheScreen().play(from: index, fps: fps, store: store, count: frameCount) { [weak self] event in
+        stage.screen().play(from: index, reel: reel) { [weak self] event in
             self?.handlePlayback(event)
         }
         scheduleFill(allowWhilePlaying: true)
     }
 
-    private func handlePlayback(_ event: CacheScreen.Event) {
+    private func handlePlayback(_ event: FrameScreen.Event) {
         switch event {
         case .show(let frame):
             guard playing, frame >= 0, frame < frameCount else { return }
@@ -1086,10 +1050,6 @@ final class Session: ObservableObject {
                 status = "rechnet…"
             }
             ensureFrame(frame)
-        case .visible:
-            guard !loggedVideo else { return }
-            loggedVideo = true
-            Log.play.info("Video-Anzeige aktiv")
         case .ended:
             guard playing else { return }
             finishPlay()
@@ -1109,7 +1069,7 @@ final class Session: ObservableObject {
         playFetching = true
         let generation = playGeneration
         let token = epoch
-        engine.request(frame, store: store, need: .fill) { [weak self] result in
+        engine.request(frame, store: store) { [weak self] result in
             Task { @MainActor in
                 guard let self, generation == self.playGeneration else { return }
                 self.playFetching = false
@@ -1143,37 +1103,16 @@ final class Session: ObservableObject {
         return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
     }
 
-    private func attachSource() {
-        let wanted = index
-        let token = epoch
-        let width = pixelWidth
-        let height = pixelHeight
-        guard width > 0, height > 0 else { return }
-        engine.original(index: wanted, width: width, height: height) { [weak self] image in
-            Task { @MainActor in
-                guard let self, token == self.epoch, self.index == wanted, !self.playing else { return }
-                self.source = image
-            }
-        }
-    }
-
     private func deliver(_ result: Result<Shown, Error>) {
         busy = false
         switch result {
         case .success(let shown):
             if shown.stored { coverage.insert(shown.index) }
             if !shown.fromCache { noteScaled(1) }
-            guard shown.recon != nil else {
-                scheduleFill()
-                return
+            if shown.index == index, shown.stored, !playing {
+                display(milliseconds: shown.fromCache ? nil : shown.milliseconds)
             }
-            remember(shown)
-            if shown.index == index {
-                if !(playing && stage?.screenIsRunning() == true) {
-                    apply(shown)
-                }
-                if !playing { scheduleFill() }
-            }
+            if !playing { scheduleFill() }
         case .failure(let error):
             playing = false
             failure = error.localizedDescription
@@ -1181,20 +1120,32 @@ final class Session: ObservableObject {
         }
     }
 
-    private func apply(_ shown: Shown) {
-        stage?.existingScreen()?.stepAside()
-        recon = shown.recon?.image
-        source = shown.source?.image
-        pixelWidth = shown.width
-        pixelHeight = shown.height
-        milliseconds = shown.milliseconds
+    /// Show the stored frame under the playhead as a still.
+    private func display(milliseconds computed: Double? = nil) {
+        guard let size = store?.dimensions() else { return }
+        pixelWidth = size.width
+        pixelHeight = size.height
+        hasPicture = true
+        milliseconds = computed
         failure = nil
-        if shown.fromCache {
-            status = "Bild \(shown.index + 1) von \(frameCount) · Cache\(codecNote)"
+        if let computed {
+            let timing = String(format: "%.0f ms", computed)
+            status = "Bild \(index + 1) von \(frameCount) · \(timing)\(codecNote)"
         } else {
-            let timing = String(format: "%.0f ms", shown.milliseconds)
-            status = "Bild \(shown.index + 1) von \(frameCount) · \(timing)\(codecNote)"
+            status = "Bild \(index + 1) von \(frameCount) · Cache\(codecNote)"
         }
+        showStill()
+    }
+
+    private func showStill() {
+        guard hasPicture, let stage, let reel = reel() else { return }
+        stage.screen().show(index, reel: reel)
+    }
+
+    /// What the screen may show for the open film and model.
+    private func reel() -> Reel? {
+        guard let store, let facts else { return nil }
+        return Reel(store: store, originals: originals, fps: max(facts.fps, 1), count: frameCount)
     }
 
     private func resetFillHolds() {
@@ -1245,7 +1196,7 @@ final class Session: ObservableObject {
             fillAnnounced = true
             Log.fill.info("fill startet Bild \(next + 1, privacy: .public)")
         }
-        engine.request(next, store: store, need: .fill) { [weak self] result in
+        engine.request(next, store: store) { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }
                 if self.filling == next { self.filling = nil }
@@ -1283,28 +1234,6 @@ final class Session: ObservableObject {
                     self.continuePlaybackWork()
                 }
             }
-        }
-    }
-
-    private func remember(_ shown: Shown) {
-        guard shown.recon != nil else { return }
-        if cache[shown.index] == nil {
-            cacheOrder.append(shown.index)
-        }
-        cache[shown.index] = shown
-        while cacheOrder.count > 16 {
-            var farthest = 0
-            var distance = -1
-            for (offset, cached) in cacheOrder.enumerated() where cached != index {
-                // Keep the cushion in front of the playhead. Frames behind go first.
-                let gap = cached < index ? abs(cached - index) + frameCount : cached - index
-                if gap > distance {
-                    distance = gap
-                    farthest = offset
-                }
-            }
-            let dropped = cacheOrder.remove(at: farthest)
-            cache.removeValue(forKey: dropped)
         }
     }
 

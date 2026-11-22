@@ -362,6 +362,14 @@ static int decode_one(SourceFile *file, AVFrame *frame) {
     }
 }
 
+// True once a packet is at or past the index time of the wanted keyframe.
+// MP4 with B-frames indexes decode times, so either stamp may be the one that matches.
+static int reaches(const AVPacket *packet, int64_t target) {
+    if (packet->dts == AV_NOPTS_VALUE && packet->pts == AV_NOPTS_VALUE) return 1;
+    return (packet->dts != AV_NOPTS_VALUE && packet->dts >= target)
+        || (packet->pts != AV_NOPTS_VALUE && packet->pts >= target);
+}
+
 static int position(SourceFile *file, int index) {
     int key = index;
     while (key > 0 && file->key[key] == 0) key--;
@@ -369,6 +377,19 @@ static int position(SourceFile *file, int index) {
     if (status < 0) return status;
     avcodec_flush_buffers(file->dec);
     file->inputEOF = 0;
+    // A backward seek can land on the keyframe before the wanted one, a whole GOP early.
+    // Skip packets until the wanted keyframe, or every frame after it is off by that GOP.
+    for (;;) {
+        status = av_read_frame(file->fmt, file->packet);
+        if (status < 0) return status;
+        if (file->packet->stream_index == file->video
+            && (file->packet->flags & AV_PKT_FLAG_KEY)
+            && reaches(file->packet, file->pts[key])) break;
+        av_packet_unref(file->packet);
+    }
+    status = avcodec_send_packet(file->dec, file->packet);
+    av_packet_unref(file->packet);
+    if (status < 0) return status;
     for (int i = 0; i < index - key; i++) {
         status = decode_one(file, file->frame);
         if (status < 0) return status;

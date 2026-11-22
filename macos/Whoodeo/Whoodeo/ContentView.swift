@@ -158,8 +158,6 @@ struct ContentView: View {
             ZStack {
                 if showsPicture {
                     Viewer(
-                        recon: session.recon,
-                        source: session.source,
                         zoomToFit: session.zoomToFit,
                         magnification: session.magnification,
                         placement: session.zoomPlacement,
@@ -174,10 +172,10 @@ struct ContentView: View {
                         onZoom: { fits, factor in
                             session.noteZoom(fits: fits, magnification: factor)
                         },
-                        onOriginal: { session.originalNow() },
+                        onOriginal: { session.showOriginal($0) },
                         onStage: { session.attachStage($0) }
                     )
-                } else if session.loadingModel || (session.busy && session.recon == nil) {
+                } else if session.loadingModel || (session.busy && !session.hasPicture) {
                     ProgressView(session.loadingModel ? "Modell wird geladen…" : "rechnet…")
                         .controlSize(.large)
                 } else {
@@ -263,7 +261,7 @@ struct ContentView: View {
     }
 
     private var showsPicture: Bool {
-        session.recon != nil
+        session.hasPicture
     }
 
     private var dropHint: some View {

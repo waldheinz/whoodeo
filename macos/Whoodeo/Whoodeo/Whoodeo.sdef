@@ -36,6 +36,9 @@
             <property name="playing" code="Wply" type="boolean" access="rw" description="Die Wiedergabe läuft.">
                 <cocoa key="scriptPlaying"/>
             </property>
+            <property name="showing original" code="Word" type="boolean" access="rw" description="Das Original statt der Hochskalierung zeigen, wie bei gedrückter Maustaste.">
+                <cocoa key="scriptShowingOriginal"/>
+            </property>
             <property name="fill enabled" code="Wfil" type="boolean" access="rw" description="Fehlende Bilder im Hintergrund rechnen und speichern.">
                 <cocoa key="scriptFillEnabled"/>
             </property>

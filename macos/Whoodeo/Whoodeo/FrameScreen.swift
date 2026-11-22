@@ -3,17 +3,91 @@ import AVFoundation
 import CoreMedia
 import os
 
-/// Plays cached ProRes 4444 by handing the access units to the system video display.
-/// The layer decodes and the window compositor scans the picture out. Playback does not
-/// build a 16-bit bitmap for each frame.
+/// What the screen can show for one film: the stored upscale or the decoded original, timed on the film clock.
+nonisolated struct Reel: Sendable {
+    let store: FrameStore
+    let originals: Originals?
+    let fps: Double
+    let count: Int
+
+    func has(_ frame: Int, original: Bool) -> Bool {
+        guard frame >= 0, frame < count else { return false }
+        return original ? originals != nil : store.contains(frame)
+    }
+
+    func sample(_ frame: Int, original: Bool) throws -> CMSampleBuffer {
+        let time = Self.time(frame, fps: fps)
+        let duration = Self.time(1, fps: fps)
+        if original {
+            guard let originals else { throw CLIError("Original fehlt") }
+            return try originals.sample(at: frame, time: time, duration: duration)
+        }
+        return try store.sample(at: frame, time: time, duration: duration)
+    }
+
+    static func time(_ frame: Int, fps: Double) -> CMTime {
+        let ticks = (Double(frame) * 600 / max(fps, 1)).rounded()
+        return CMTime(value: CMTimeValue(ticks), timescale: 600)
+    }
+}
+
+/// The low-res film at its own size. It has its own reader, so it never waits for the model queue.
+nonisolated final class Originals: @unchecked Sendable {
+    private let url: URL
+    private let lock = NSLock()
+    private var film: Film?
+    private var transfer: ColorTransfer?
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    /// One original frame, through the same color conversion as the cache. The layer scales it.
+    func sample(at index: Int, time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
+        lock.lock()
+        defer { lock.unlock() }
+        if film == nil { film = try Film.open(url) }
+        if transfer == nil { transfer = try ColorTransfer() }
+        let decoded = try film!.decode(at: index)
+        let buffer = try transfer!.convert(
+            decoded.rgb,
+            width: decoded.width,
+            height: decoded.height,
+            format: kCVPixelFormatType_4444AYpCbCr16,
+            pool: nil
+        )
+        var format: CMVideoFormatDescription?
+        var status = CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescriptionOut: &format
+        )
+        guard status == noErr, let format else { throw CLIError("Original \(index + 1) ohne Bildformat (\(status))") }
+        var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: time, decodeTimeStamp: .invalid)
+        var sample: CMSampleBuffer?
+        status = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: buffer,
+            formatDescription: format,
+            sampleTiming: &timing,
+            sampleBufferOut: &sample
+        )
+        guard status == noErr, let sample else { throw CLIError("Original \(index + 1) (\(status))") }
+        return sample
+    }
+}
+
+/// The only way the picture reaches the screen. Stills and playback both go through the system
+/// video display: a still is one sample, playback a stream on a clock. The layer decodes ProRes
+/// and scales the picture. It shows one source at a time, the upscale or the original; switching
+/// flushes and feeds the other source from the frame on screen.
 /// The clock waits until the renderer has decoded a cushion. A realtime clock that starts
 /// earlier drops frames that are already late and still advances at the film's speed.
 @MainActor
-final class CacheScreen {
+final class FrameScreen {
     enum Event {
         case show(Int)
         case needs(Int)
-        case visible
         case ended
         case failed(String)
     }
@@ -23,40 +97,30 @@ final class CacheScreen {
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private var receiver: AVSampleBufferVideoRenderer.Receiver?
     private var observer: Any?
-    private var readyObserver: NSObjectProtocol?
     private var feed: Task<Void, Never>?
     nonisolated private let tokenLock = OSAllocatedUnfairLock(initialState: 0)
     nonisolated private let cursorLock = OSAllocatedUnfairLock(initialState: FeedCursor())
     nonisolated private let failures = OSAllocatedUnfairLock(initialState: 0)
-    private weak var view: PixelView?
+    private weak var view: PictureView?
     private var onEvent: ((Event) -> Void)?
-    private var mode = Mode.stopped
-    private var coveredByOriginal = false
-    /// The last decoded video frame stays up until the still picture replaces it.
-    private var holdingLastFrame = false
+    private var playing = false
+    private var reel: Reel?
+    /// The original instead of the upscale, while the mouse button is down.
+    private(set) var original = false
+    /// The still on screen, or where playback started.
+    private var frame = 0
     private var clockStarted = false
     /// Ignore timebase callbacks until they land on this play. A seek leaves the old time in place
     /// until setRate applies, and that stale time would pause the new clock.
     private var awaitingAnchor = false
     private var holding = false
-    private var announced = false
     private var fps = 25.0
     private var count = 0
     private var startIndex = 0
     private var enqueued = 0
     private var lastShown = 0
-    private var store: FrameStore?
 
-    private enum Mode {
-        case stopped, playing, paused
-    }
-
-    var isRunning: Bool { mode == .playing || mode == .paused }
-
-    /// True while the video layer, not the still bitmap, is what the user sees.
-    var isCoveringStill: Bool { !host.isHidden }
-
-    func attach(to view: PixelView) {
+    func attach(to view: PictureView) {
         self.view = view
         if host.superview !== view {
             view.addSubview(host)
@@ -75,15 +139,6 @@ final class CacheScreen {
                 "opacity": NSNull(),
             ]
             host.layer?.addSublayer(display)
-            readyObserver = NotificationCenter.default.addObserver(
-                forName: .AVSampleBufferDisplayLayerReadyForDisplayDidChange,
-                object: display,
-                queue: .main
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    self?.updateVisibility()
-                }
-            }
         }
         if receiver == nil {
             receiver = synchronizer.sampleBufferReceiver(adding: display.sampleBufferRenderer)
@@ -92,7 +147,6 @@ final class CacheScreen {
         layout(in: view.bounds)
         updateScale()
         setSharp(view.sharp)
-        host.isHidden = true
     }
 
     func layout(in bounds: CGRect) {
@@ -118,41 +172,99 @@ final class CacheScreen {
         display.minificationFilter = filter
     }
 
-    func setCoveredByOriginal(_ covered: Bool) {
-        coveredByOriginal = covered
-        updateVisibility()
+    /// Switch between upscale and original at the frame on screen. Playback keeps running.
+    func setOriginal(_ on: Bool) {
+        guard on != original else { return }
+        original = on
+        guard let reel else { return }
+        if playing {
+            start(at: currentFrame(), keepPicture: true)
+        } else {
+            show(frame, reel: reel)
+        }
     }
 
-    /// Continue a pause, or start at `index`. Samples use film time, not the order they were stored.
-    func play(from index: Int, fps: Double, store: FrameStore, count: Int, on event: @escaping (Event) -> Void) {
+    /// One frame as a still. A frame the source does not have leaves the picture as it is.
+    func show(_ index: Int, reel: Reel) {
+        shutdownFeed()
+        self.reel = reel
+        fps = max(reel.fps, 1)
+        count = reel.count
+        frame = index
+        guard reel.has(index, original: original), let receiver else { return }
+        let token = invalidate()
+        let original = original
+        synchronizer.setRate(0, time: Reel.time(index, fps: fps))
+        let previous = feed
+        feed = Task.detached {
+            await previous?.value
+            guard let sample = try? reel.sample(index, original: original) else { return }
+            Self.displayImmediately(sample)
+            await receiver.flush(removingDisplayedImage: false)
+            guard self.tokenMatches(token) else { return }
+            _ = try? await receiver.enqueue(CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample))
+        }
+    }
+
+    /// Start playback at `index`. Samples use film time, not the order they were stored.
+    func play(from index: Int, reel: Reel, on event: @escaping (Event) -> Void) {
         onEvent = event
-        if mode == .paused, feed != nil {
-            mode = .playing
-            display.preventsDisplaySleepDuringVideoPlayback = true
-            if clockStarted {
-                resumeTiming()
-            } else {
-                startClock()
-            }
-            updateVisibility()
+        self.reel = reel
+        start(at: index, keepPicture: false)
+    }
+
+    /// Stop the clock and return the frame on screen. The picture stays.
+    func pause() -> Int {
+        guard playing else { return frame }
+        let shown = currentFrame()
+        shutdownFeed()
+        frame = shown
+        return shown
+    }
+
+    /// Seek and step. The picture stays until the next still replaces it.
+    func yield() {
+        guard playing else { return }
+        frame = currentFrame()
+        shutdownFeed()
+    }
+
+    /// Drop the picture. Used when the film or the model goes away.
+    func stop() {
+        shutdownFeed()
+        reel = nil
+        let receiver = receiver
+        let previous = feed
+        feed = Task { @MainActor in
+            await previous?.value
+            await receiver?.flush(removingDisplayedImage: true)
+        }
+    }
+
+    /// The frame the clock is on. Before the clock runs, the first frame of this play.
+    private func currentFrame() -> Int {
+        guard playing, clockStarted else { return startIndex }
+        let raw = frameIndex(synchronizer.currentTime())
+        return min(max(raw, startIndex), max(enqueued - 1, startIndex))
+    }
+
+    private func start(at index: Int, keepPicture: Bool) {
+        shutdownFeed()
+        guard let reel, let receiver else {
+            onEvent?(.failed("Die Video-Anzeige fehlt."))
             return
         }
-        self.fps = max(fps, 1)
-        self.count = count
-        self.store = store
+        fps = max(reel.fps, 1)
+        count = reel.count
+        frame = index
         startIndex = index
         lastShown = index
         enqueued = index
-        clockStarted = false
-        awaitingAnchor = false
-        holding = false
-        holdingLastFrame = false
-        announced = false
         failures.withLock { $0 = 0 }
-        mode = .playing
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
-        host.isHidden = true
+        playing = true
         display.preventsDisplaySleepDuringVideoPlayback = true
+        // The first sample shows as soon as it is decoded; the clock starts after the cushion.
+        synchronizer.setRate(0, time: mediaTime(index))
         let token = invalidate()
         cursorLock.withLock { state in
             state.token = token
@@ -160,92 +272,33 @@ final class CacheScreen {
             state.wake = true
             state.signaled = false
         }
-        feed?.cancel()
-        feed = nil
-        if let observer {
-            synchronizer.removeTimeObserver(observer)
-            self.observer = nil
-        }
-        let rate = self.fps
-        let total = count
-        let cursor = index
-        guard let receiver else {
-            mode = .stopped
-            onEvent?(.failed("Die Video-Anzeige fehlt."))
-            return
-        }
-        // Drop the previous picture before new samples arrive, or a seek flashes the old frame.
+        let original = original
+        let previous = feed
         feed = Task { @MainActor in
-            await receiver.flush(removingDisplayedImage: true)
-            guard self.tokenMatches(token) else { return }
-            guard self.mode == .playing || self.mode == .paused else { return }
+            await previous?.value
+            // Drop the queued samples. A seek also drops the picture, or it flashes the old frame.
+            await receiver.flush(removingDisplayedImage: !keepPicture)
+            guard self.tokenMatches(token), self.playing else { return }
             self.installObserver()
             let screen = self
             self.feed = Task.detached {
-                await screen.read(
-                    token: token,
-                    receiver: receiver,
-                    store: store,
-                    fps: rate,
-                    count: total,
-                    from: cursor
-                )
+                await screen.read(token: token, receiver: receiver, reel: reel, original: original, from: index)
             }
         }
     }
 
-    func pause() {
-        guard mode == .playing else { return }
-        mode = .paused
-        synchronizer.rate = 0
-        display.preventsDisplaySleepDuringVideoPlayback = false
-        updateVisibility()
-    }
-
-    /// Seek and step. The last video frame stays until the still is ready.
-    func yield() {
-        guard mode != .stopped || holdingLastFrame else { return }
-        shutdownFeed(removePicture: false)
-        holdingLastFrame = display.isReadyForDisplay
-        updateVisibility()
-    }
-
-    /// Drop the video frame. Used when the film or the picture goes away.
-    func stop() {
-        shutdownFeed(removePicture: true)
-        holdingLastFrame = false
-        host.isHidden = true
-        view?.needsDisplay = true
-    }
-
-    /// The still picture is on screen, so the video layer gets out of its way.
-    func stepAside() {
-        holdingLastFrame = false
-        guard mode == .stopped else { return }
-        host.isHidden = true
-        view?.needsDisplay = true
-    }
-
-    private func shutdownFeed(removePicture: Bool) {
-        mode = .stopped
+    private func shutdownFeed() {
+        playing = false
         clockStarted = false
+        awaitingAnchor = false
         holding = false
         synchronizer.rate = 0
         display.preventsDisplaySleepDuringVideoPlayback = false
         _ = invalidate()
         feed?.cancel()
-        feed = nil
         if let observer {
             synchronizer.removeTimeObserver(observer)
             self.observer = nil
-        }
-        let receiver = receiver
-        if removePicture {
-            Task { @MainActor in
-                await receiver?.flush(removingDisplayedImage: true)
-            }
-        } else {
-            receiver?.flush()
         }
     }
 
@@ -273,31 +326,37 @@ final class CacheScreen {
         }
     }
 
+    private func thin(_ next: Int) -> Bool {
+        next >= count || reel?.has(next, original: original) != true
+    }
+
+    /// Wait for decoded ProRes before the clock runs. Originals arrive decoded already.
+    private func preroll(_ next: Int) -> Bool {
+        !original && !thin(next)
+    }
+
     private func startClock() {
-        guard mode == .playing, !clockStarted else { return }
+        guard playing, !clockStarted else { return }
         enqueued = cursorLock.withLock { $0.next }
         clockStarted = true
         awaitingAnchor = true
-        let thin = enqueued >= count || store?.contains(enqueued) != true
         // A gap has nothing more to preroll. A cached span waits until the renderer has decoded enough.
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = !thin
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = preroll(enqueued)
         synchronizer.setRate(1, time: mediaTime(startIndex))
         cursorLock.withLock { $0.wake = false }
-        updateVisibility()
     }
 
-    /// Continues from the paused time. A cached span waits for decoded media; a gap starts on the frame in hand.
+    /// Continues after a gap. A cached span waits for decoded media; a gap starts on the frame in hand.
     private func resumeTiming() {
         enqueued = cursorLock.withLock { $0.next }
         holding = false
-        let thin = enqueued >= count || store?.contains(enqueued) != true
-        synchronizer.delaysRateChangeUntilHasSufficientMediaData = !thin
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = preroll(enqueued)
         synchronizer.rate = 1
         cursorLock.withLock { $0.wake = false }
     }
 
     private func consider(_ time: CMTime) {
-        guard mode == .playing, clockStarted else { return }
+        guard playing, clockStarted else { return }
         let end = mediaTime(count)
         if CMTimeCompare(time, end) >= 0 {
             onEvent?(.ended)
@@ -325,7 +384,7 @@ final class CacheScreen {
 
     /// The feed calls this when the clock still needs a nudge. The enqueue loop itself does not wait for the main actor.
     private func applyCursor(_ token: Int) {
-        guard tokenMatches(token), mode == .playing || mode == .paused else { return }
+        guard tokenMatches(token), playing else { return }
         let next = cursorLock.withLock { state -> Int in
             state.signaled = false
             return state.next
@@ -333,30 +392,18 @@ final class CacheScreen {
         guard next >= enqueued else { return }
         enqueued = next
         let cushion = next - startIndex
-        let blocked = next >= count || store?.contains(next) != true
-        if !clockStarted, mode == .playing, cushion >= 8 || (blocked && cushion >= 1) {
+        let blocked = thin(next)
+        // The renderer queues only a few decoded originals, fewer than the ProRes cushion.
+        let wanted = original ? 2 : 8
+        if !clockStarted, cushion >= wanted || (blocked && cushion >= 1) {
             startClock()
-        } else if holding, next > lastShown, mode == .playing {
+        } else if holding, next > lastShown {
             resumeTiming()
         }
     }
 
-    private func updateVisibility() {
-        let show = !coveredByOriginal
-            && display.isReadyForDisplay
-            && (holdingLastFrame || (clockStarted && (mode == .playing || mode == .paused)))
-        if host.isHidden == !show { return }
-        host.isHidden = !show
-        view?.needsDisplay = true
-        if show, !announced, mode == .playing || mode == .paused {
-            announced = true
-            onEvent?(.visible)
-        }
-    }
-
     private func mediaTime(_ frame: Int) -> CMTime {
-        let ticks = (Double(frame) * 600 / fps).rounded()
-        return CMTime(value: CMTimeValue(ticks), timescale: 600)
+        Reel.time(frame, fps: fps)
     }
 
     private func frameIndex(_ time: CMTime) -> Int {
@@ -366,7 +413,7 @@ final class CacheScreen {
     }
 
     private func fail(_ message: String, token: Int) {
-        guard tokenMatches(token), mode == .playing else { return }
+        guard tokenMatches(token), playing else { return }
         onEvent?(.failed(message))
     }
 
@@ -374,17 +421,16 @@ final class CacheScreen {
     private nonisolated func read(
         token: Int,
         receiver: AVSampleBufferVideoRenderer.Receiver,
-        store: FrameStore,
-        fps: Double,
-        count: Int,
+        reel: Reel,
+        original: Bool,
         from start: Int
     ) async {
         var cursor = start
         var strikes = 0
         while !Task.isCancelled {
             if !tokenMatches(token) { return }
-            if cursor >= count { return }
-            if !store.contains(cursor) {
+            if cursor >= reel.count { return }
+            if !reel.has(cursor, original: original) {
                 let missing = cursor
                 await MainActor.run {
                     guard tokenMatches(token) else { return }
@@ -394,7 +440,7 @@ final class CacheScreen {
                 continue
             }
             do {
-                let sample = try store.sample(at: cursor, time: Self.time(cursor, fps: fps), duration: Self.time(1, fps: fps))
+                let sample = try reel.sample(cursor, original: original)
                 let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample)
                 let result = try await receiver.enqueue(ready)
                 switch result {
@@ -454,9 +500,16 @@ final class CacheScreen {
         }
     }
 
-    private nonisolated static func time(_ frame: Int, fps: Double) -> CMTime {
-        let ticks = (Double(frame) * 600 / max(fps, 1)).rounded()
-        return CMTime(value: CMTimeValue(ticks), timescale: 600)
+    /// A still ignores the clock.
+    private nonisolated static func displayImmediately(_ sample: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
+              CFArrayGetCount(attachments) > 0 else { return }
+        let first = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            first,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
     }
 }
 
