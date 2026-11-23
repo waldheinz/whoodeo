@@ -337,7 +337,6 @@ def convert_encoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
     """Write the vae2 encoder: frames 8x the latent sizes in, μ out, enumerated or one fixed size."""
     model, label, _in_frames, step, _path = build_generator(spec, torch.device("cpu"))
     _prepare(model)
-    latent = spec.architecture["latent"]
     factor = int(spec.architecture.get("factor") or model.factor)
     sizes = [tuple(size) for size in latent_sizes]
     frames = [(height * factor, width * factor) for height, width in sizes]
@@ -701,6 +700,12 @@ def _latent_size(text):
     if height < 1 or width < 1:
         raise argparse.ArgumentTypeError(f"expected positive sides, got {text!r}")
     return height, width
+
+
+def _assign_metadata(model, mapping):
+    defined = model.user_defined_metadata
+    for key, value in mapping.items():
+        defined[key] = value
 
 
 def main(argv=None):
