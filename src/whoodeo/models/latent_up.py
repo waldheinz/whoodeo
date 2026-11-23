@@ -26,8 +26,8 @@ residual block, and the block's output becomes x * (1 + γ) + β. The last
 layer of the MLP starts at zero, so a fresh FiLM gives γ = β = 0 and the
 network is exactly the one without it: a latent_up checkpoint without
 condition loads into it with the FiLM weights left at their start. The
-encoder keeps its parameter names. For an export the vector is fixed, and
-γ and β are computed once (`modulation`), a multiply and an add per block.
+encoder keeps its parameter names. For an export the vector is a second input, and
+the FiLM MLP stays in the graph, a multiply and an add per block.
 
 `in_frames: 3` reads the previous, middle, and next low frame, stacked on
 the channels as the other multi-frame archs take them (9 channels). The
@@ -363,16 +363,16 @@ class LatentUpExport(nn.Module):
     the caller pads the bottom and the right as `pad_to` does and crops the
     frame back to 2h x 2w.
 
-    With FiLM the condition is fixed at `codec` (a name of CODECS, or None
-    for unknown): γ and β are computed here once and stay in the graph as
-    constants per block (Core ML folds 1 + γ), so the program has the frame
-    as its only input and the MLP is not part of it.
+    With FiLM the condition vector is a second input of shape (B, condition_size):
+    one-hot of CODECS, unknown is all zero, then RESERVE zeros. The FiLM MLP
+    stays in the graph, so one package serves every codec, and later reserve
+    slots can be filled without a new export.
 
     With in_frames 3 the input is the previous, middle, and next frame on 9
     channels, as training reads them; the front runs once per frame.
     """
 
-    def __init__(self, model, vae, codec=None):
+    def __init__(self, model, vae):
         super().__init__()
         import copy
 
@@ -380,30 +380,23 @@ class LatentUpExport(nn.Module):
         self.decoder = copy.deepcopy(vae.decoder)
         self.in_frames = model.in_frames
         self.mix = None if model.mix is None else copy.deepcopy(model.mix)
+        self.film = None if model.film is None else copy.deepcopy(model.film)
+        self.condition_size = 0 if model.film is None else model.condition_size
         head = self.encoder.to_stats
         inverse = vae.latent_scale.reciprocal().to(head.weight)
         shift = vae.latent_shift.to(head.weight)
         with torch.no_grad():
             head.weight.copy_(head.weight * inverse.view(-1, 1, 1, 1))
             head.bias.copy_(head.bias * inverse + shift)
-        self.modulated = False
-        condition = fixed_condition(model, codec)
-        if condition is not None:
-            with torch.no_grad():
-                pairs = model.film(condition.to(head.weight))
-            for index, (gamma, beta) in enumerate(pairs):
-                self.register_buffer(f"film_gamma_{index}", gamma.detach().clone())
-                self.register_buffer(f"film_beta_{index}", beta.detach().clone())
-            self.film_count = len(pairs)
-            self.modulated = True
 
-    def forward(self, frames):
+    def forward(self, frames, condition=None):
         pairs = None
-        if self.modulated:
-            pairs = [
-                (getattr(self, f"film_gamma_{index}"), getattr(self, f"film_beta_{index}"))
-                for index in range(self.film_count)
-            ]
+        if self.film is not None:
+            if condition is None:
+                condition = torch.zeros(
+                    frames.shape[0], self.condition_size, device=frames.device, dtype=frames.dtype,
+                )
+            pairs = self.film(condition)
         if self.mix is None:
             return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
         # One front per frame on its 3 channels, no batch reshape in the graph.
@@ -422,7 +415,7 @@ class LatentUpExport(nn.Module):
 class LatentUpReference(nn.Module):
     """The unfolded path training takes: code, z / scale + shift, decode, crop to 2h x 2w.
 
-    With FiLM, `codec` fixes the condition as in LatentUpExport.
+    With FiLM, `codec` fixes the condition vector (a name of CODECS, or unknown).
     """
 
     def __init__(self, model, vae, codec=None):

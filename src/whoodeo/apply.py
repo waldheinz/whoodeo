@@ -21,8 +21,9 @@ then CUDA, then the CPU. A latent_up with condition takes --codec (h264,
 mpeg4, mpeg2, or unknown, the default).
 
 --coreml runs a package from whoodeo-coreml instead of PyTorch, on the unit
---unit names: gpu (CPU_AND_GPU, the default), ane (CPU_AND_NE), cpu, or all.
-A .mlpackage as the model does the same. The frame is padded on the bottom
+--unit names: gpu (CPU_AND_GPU, the default), cpu, or all.
+A .mlpackage as the model does the same. A FiLM package takes --codec the
+same way a checkpoint does and feeds the condition vector. The frame is padded on the bottom
 and the right to the package's whoodeo.pad (reflect) and must fit its size
 range; the result is cropped to 2h x 2w, as in the macOS app. Without --out a
 package writes <stem>-recon-<package>-<unit>.mkv into the current directory.
@@ -60,7 +61,7 @@ def load_checkpoint(path, device, vae=None, codec=None):
             "whoodeo-apply upscales video"
         )
     if spec.architecture.get("arch") == "latent_up":
-        # coreml imports coremltools only when it converts or benches.
+        # coreml imports coremltools only when it converts.
         from whoodeo.coreml import load_latent_up
         from whoodeo.models.latent_up import LatentUpReference
 
@@ -77,7 +78,7 @@ def load_checkpoint(path, device, vae=None, codec=None):
     return build_generator(spec, device)
 
 
-COREML_UNITS = ("gpu", "ane", "cpu", "all")
+COREML_UNITS = ("gpu", "cpu", "all")
 
 
 class CoreMLModel:
@@ -88,7 +89,7 @@ class CoreMLModel:
     declares, and crops the result to 2h x 2w.
     """
 
-    def __init__(self, package, unit="gpu"):
+    def __init__(self, package, unit="gpu", codec=None):
         try:
             import coremltools as ct
         except ImportError as exc:
@@ -103,7 +104,6 @@ class CoreMLModel:
             raise SystemExit(f"no package: {package}")
         units = {
             "gpu": ct.ComputeUnit.CPU_AND_GPU,
-            "ane": ct.ComputeUnit.CPU_AND_NE,
             "cpu": ct.ComputeUnit.CPU_ONLY,
             "all": ct.ComputeUnit.ALL,
         }
@@ -137,6 +137,17 @@ class CoreMLModel:
             f"{package.name}  {self.arch or 'model'}  step {self.step}  unit {unit}  "
             f"conv scale {meta.get('whoodeo.conv_scale', '?')}"
         )
+        self.condition = None
+        if "condition" in inputs:
+            from whoodeo.models.latent_up import CONDITIONS, condition_vector
+
+            kind = meta.get("whoodeo.condition") or "codec"
+            size = int(meta["whoodeo.condition_size"]) if meta.get("whoodeo.condition_size", "").isdigit() else CONDITIONS[kind]
+            name = None if codec in (None, "unknown") else codec
+            self.condition = condition_vector(name, size).unsqueeze(0)
+            print(f"codec {codec or 'unknown'}", flush=True)
+        elif codec is not None:
+            raise SystemExit("--codec is for a package that takes a condition vector")
         self.model = ct.models.MLModel(
             str(package),
             compute_units=units[unit],
@@ -169,7 +180,10 @@ class CoreMLModel:
         self.check_size(height, width)
         padded, _h, _w = pad_to(frames.float().cpu(), self.pad) if self.pad > 1 else (frames, height, width)
         batch = padded.numpy().astype(self.dtype, copy=False)
-        result = self.model.predict({"frames": batch})
+        feed = {"frames": batch}
+        if self.condition is not None:
+            feed["condition"] = self.condition.numpy().astype(self.dtype, copy=False)
+        result = self.model.predict(feed)
         image = result.get("image")
         if image is None:
             raise SystemExit(f"{self.package.name}: output names {', '.join(result)}")
@@ -333,10 +347,8 @@ def apply(args):
     if package is not None:
         if args.vae is not None:
             raise SystemExit("--vae is for a PyTorch latent_up checkpoint; a package has its decoder built in")
-        if args.codec is not None:
-            raise SystemExit("--codec is for a PyTorch latent_up checkpoint; a package has its codec built in")
         device = torch.device("cpu")
-        model = CoreMLModel(package, args.unit or "gpu")
+        model = CoreMLModel(package, args.unit or "gpu", args.codec)
         label, in_frames, step = model.label, model.in_frames, model.step
         checkpoint_path = None
     else:
@@ -491,7 +503,7 @@ def parse_args(argv=None):
         "--unit",
         choices=COREML_UNITS,
         default=None,
-        help="Core ML compute unit: gpu (default), ane (Neural Engine), cpu, or all",
+        help="Core ML compute unit: gpu (default), cpu, or all",
     )
     add_live_args(parser)
     args = parser.parse_args(argv)

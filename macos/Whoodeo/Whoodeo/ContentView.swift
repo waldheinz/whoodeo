@@ -293,7 +293,7 @@ struct ContentView: View {
             return "Dieses Modell hat keine Codec-Bedingung."
         }
         let film = session.filmCodec.map { "Film: \($0.title)" } ?? "kein Film"
-        let active = session.activeCodec.map { "Paket: \($0.title)" } ?? "kein Paket"
+        let active = session.activeCodec.map { "aktiv: \($0.title)" } ?? "kein Codec"
         return "Codec, auf den der Upscaler eingestellt ist. \(film) · \(active)"
     }
 

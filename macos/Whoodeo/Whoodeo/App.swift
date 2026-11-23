@@ -82,8 +82,9 @@ nonisolated enum CLI {
     Whoodeo --upscale model.mlpackage video index [out.f32] [--source-codec auto|h264|mpeg4|mpeg2|unknown]
 
     --upscale scales one frame through the frame cache, as the window does: a latent_up with
-    FiLM picks the package of the codec beside the given one (auto: the film's codec), and the
-    frame comes from that package's cache when it is there. --export takes --source-codec too.
+    FiLM uses the condition of the given codec (auto: the film's codec; MPEG-2 automatic
+    falls back to unknown). The frame comes from that cache when it is there. --export takes
+    --source-codec too.
 
     The f32 file is little-endian int32 n,c,h,w followed by float32 NCHW.
     """
@@ -204,19 +205,24 @@ nonisolated enum CLI {
         return (rest, choice)
     }
 
-    /// The package the window would load for this film: the codec package of a FiLM line.
+    /// The codec the window would feed: automatic MPEG-2 uses unknown until that slot is trained.
+    private static func wantedCodec(_ choice: CodecChoice, film: SourceCodec) -> SourceCodec {
+        let wanted = choice.resolve(film: film)
+        if choice == .auto, wanted == .mpeg2 { return .unknown }
+        return wanted
+    }
+
+    /// Cache suffix of a `-cond` package, nil without FiLM.
+    private static func conditionTag(package: URL, codec: SourceCodec?) -> String? {
+        package.deletingPathExtension().lastPathComponent.hasSuffix("-cond") ? codec?.cacheTag : nil
+    }
+
+    /// The named package, and the codec a `-cond` package would be fed.
     private static func resolvePackage(_ path: String, choice: CodecChoice?, film: FilmFacts) -> (URL, SourceCodec?) {
         let given = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-        let family = ModelLibrary.family(of: given)
-        guard family.hasCodecs else { return (given, nil) }
-        guard let choice else {
-            // A package named outright keeps its own codec.
-            if let (_, codec) = LibraryModel.splitCodec(given.deletingPathExtension().lastPathComponent) {
-                return (given, codec)
-            }
-            return family.package(for: .unknown)
-        }
-        return family.package(for: choice.resolve(film: film.codec))
+        let model = LibraryModel.read(given)
+        guard model.conditionInput else { return (given, nil) }
+        return (given, wantedCodec(choice ?? .auto, film: film.codec))
     }
 
     /// One frame through the cache of the package the window would pick. Prints package, codec, and cache hit.
@@ -228,11 +234,12 @@ nonisolated enum CLI {
         let film = try wait { try await Film.load(video) }
         guard index < film.facts.count else { throw CLIError("der Film hat \(film.facts.count) Bilder") }
         let (package, codec) = resolvePackage(paths[0], choice: choice ?? .auto, film: film.facts)
-        let store = try FrameStore.open(filmID: id, model: package, count: film.facts.count)
+        let tag = conditionTag(package: package, codec: codec)
+        let store = try FrameStore.open(filmID: id, model: package, count: film.facts.count, condition: tag)
         defer { store.flush() }
         fputs("Film-Codec \(film.facts.codecName) → \(film.facts.codec.rawValue)\n", stdout)
         fputs("Paket \(package.lastPathComponent) · Codec \(codec?.rawValue ?? "-")\n", stdout)
-        fputs("Cache \(id.prefix(12))…/\(FrameStore.modelKey(of: package).prefix(12))…-\(FrameStore.unitSuffix)\n", stdout)
+        fputs("Cache \(id.prefix(12))…/\(FrameStore.folderName(model: package, condition: tag).prefix(12))…\n", stdout)
         var image: [Float]
         var width: Int
         var height: Int
@@ -244,8 +251,8 @@ nonisolated enum CLI {
             fputs("Bild \(index + 1): aus dem Cache\n", stdout)
         } else {
             let predictor = try Predictor(url: package)
-            if predictor.info.codec != codec {
-                throw CLIError("Paket meldet Codec \(predictor.info.codec?.rawValue ?? "-"), erwartet \(codec?.rawValue ?? "-")")
+            if predictor.info.takesCondition {
+                predictor.setCondition(codec ?? .unknown)
             }
             let window = try wait { try await film.window(at: index, frames: predictor.info.inFrames) }
             let predicted = try predictor.predict(stack: window.stack, width: window.current.width, height: window.current.height)
@@ -272,6 +279,9 @@ nonisolated enum CLI {
             fputs("Paket \(modelURL.lastPathComponent) · Codec \(sourceCodec.rawValue)\n", stdout)
         }
         let predictor = try Predictor(url: modelURL)
+        if predictor.info.takesCondition {
+            predictor.setCondition(sourceCodec ?? .unknown)
+        }
         let id = try FilmLibrary.mutate { list in
             let id = try FilmLibrary.insert(video, into: &list)
             if list.current.isEmpty { list.current = id }
@@ -281,7 +291,7 @@ nonisolated enum CLI {
         try FilmLibrary.mutate { list in
             FilmLibrary.remember(id, width: film.facts.width, height: film.facts.height, frames: film.facts.count, in: &list)
         }
-        let store = try FrameStore.open(filmID: id, model: modelURL, count: film.facts.count)
+        let store = try FrameStore.open(filmID: id, model: modelURL, count: film.facts.count, condition: conditionTag(package: modelURL, codec: sourceCodec))
         let count = frames > 0 ? min(frames, film.facts.count) : film.facts.count
         try Export.write(
             film: film,

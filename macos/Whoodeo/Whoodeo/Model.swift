@@ -27,15 +27,18 @@ nonisolated struct PackageInfo {
     /// Both sides are padded (reflect, bottom and right) to a multiple of this, 1 for none.
     var pad: Int = 1
     var inputType: MLMultiArrayDataType = .float32
-    /// The codec fixed into a latent_up with FiLM (`whoodeo.codec`), nil without condition.
-    var codec: SourceCodec? = nil
+    /// Length of the `condition` input, 0 when the package has none.
+    var conditionSize: Int = 0
+    /// Name of the condition input, nil when the package has none.
+    var conditionName: String? = nil
+
+    var takesCondition: Bool { conditionSize > 0 && conditionName != nil }
 
     var label: String {
         var parts = ["\(arch) \(blocks)×\(channels)"]
         if let stem { parts.append("stem \(stem)") }
         if let vote { parts.append("vote \(vote)") }
         if let step { parts.append("Schritt \(step)") }
-        if let codec { parts.append("· Codec \(codec.title)") }
         return parts.joined(separator: " ")
     }
 
@@ -79,6 +82,13 @@ nonisolated struct PackageInfo {
             return FrameSize(width: width, height: height)
         }
         let inputType = inputs[inputName]?.multiArrayConstraint?.dataType ?? .float32
+        let conditionName = inputs["condition"] != nil ? "condition" : nil
+        let conditionSize: Int
+        if let name = conditionName, let shape = inputs[name]?.multiArrayConstraint?.shape, let last = shape.last {
+            conditionSize = last.intValue
+        } else {
+            conditionSize = Int(meta["whoodeo.condition_size"] ?? "") ?? 0
+        }
         return PackageInfo(
             arch: arch,
             blocks: Int(meta["whoodeo.blocks"] ?? "") ?? 0,
@@ -98,7 +108,8 @@ nonisolated struct PackageInfo {
             sizes: sizes,
             pad: max(Int(meta["whoodeo.pad"] ?? "") ?? 1, 1),
             inputType: inputType == .float16 ? .float16 : .float32,
-            codec: meta["whoodeo.condition"] == nil ? nil : SourceCodec(rawValue: meta["whoodeo.codec"] ?? "unknown")
+            conditionSize: conditionSize,
+            conditionName: conditionName
         )
     }
 }
@@ -114,6 +125,9 @@ nonisolated final class Predictor {
     let info: PackageInfo
     let model: MLModel
     private var inputArray: MLMultiArray?
+    private var conditionArray: MLMultiArray?
+    /// Condition vector fed to a `-cond` package, nil when the package has no such input.
+    private(set) var condition: [Float]?
 
     /// The app runs every package on the GPU.
     init(url: URL) throws {
@@ -128,6 +142,17 @@ nonisolated final class Predictor {
         let compiled = url.pathExtension == "mlmodelc" ? url : try MLModel.compileModel(at: url)
         model = try MLModel(contentsOf: compiled, configuration: config)
         info = try PackageInfo.read(model)
+        if info.takesCondition {
+            setCondition(.unknown)
+        }
+    }
+
+    func setCondition(_ codec: SourceCodec) {
+        guard info.takesCondition else {
+            condition = nil
+            return
+        }
+        condition = codec.vector(size: info.conditionSize)
     }
 
     func predict(stack: [Float], width: Int, height: Int) throws -> Prediction {
@@ -149,11 +174,19 @@ nonisolated final class Predictor {
         } else {
             Self.write(input, into: array)
         }
-        let features = try MLDictionaryFeatureProvider(dictionary: [
+        var features: [String: Any] = [
             info.inputName: MLFeatureValue(multiArray: array),
-        ])
+        ]
+        if let name = info.conditionName, info.conditionSize > 0 {
+            let values = condition ?? [Float](repeating: 0, count: info.conditionSize)
+            guard values.count == info.conditionSize else {
+                throw CLIError("Bedingung hat \(values.count) Werte, erwartet \(info.conditionSize)")
+            }
+            features[name] = MLFeatureValue(multiArray: try conditionBuffer(values))
+        }
+        let provider = try MLDictionaryFeatureProvider(dictionary: features)
         let started = CFAbsoluteTimeGetCurrent()
-        let result = try model.prediction(from: features)
+        let result = try model.prediction(from: provider)
         let milliseconds = (CFAbsoluteTimeGetCurrent() - started) * 1000
         guard let output = result.featureValue(for: info.outputName)?.multiArrayValue else {
             throw CLIError("keine Ausgabe \(info.outputName)")
@@ -226,6 +259,35 @@ nonisolated final class Predictor {
             }
         }
         return out
+    }
+
+    private func conditionBuffer(_ values: [Float]) throws -> MLMultiArray {
+        let shape: [NSNumber] = [1, values.count as NSNumber]
+        if let conditionArray, conditionArray.shape == shape, conditionArray.dataType == info.inputType {
+            Self.writeVector(values, into: conditionArray)
+            return conditionArray
+        }
+        let array = try MLMultiArray(shape: shape, dataType: info.inputType)
+        Self.writeVector(values, into: array)
+        conditionArray = array
+        return array
+    }
+
+    /// A short vector such as the condition input (1 × size), fp16 or fp32.
+    private static func writeVector(_ values: [Float], into array: MLMultiArray) {
+        let strides = array.strides.map(\.intValue)
+        let step = strides.count > 1 ? strides[1] : 1
+        if array.dataType == .float16 {
+            let pointer = array.dataPointer.bindMemory(to: Float16.self, capacity: array.count)
+            for index in values.indices {
+                pointer[index * step] = Float16(values[index])
+            }
+        } else {
+            let pointer = array.dataPointer.bindMemory(to: Float.self, capacity: array.count)
+            for index in values.indices {
+                pointer[index * step] = values[index]
+            }
+        }
     }
 
     private func inputBuffer(channels: Int, height: Int, width: Int) throws -> MLMultiArray {

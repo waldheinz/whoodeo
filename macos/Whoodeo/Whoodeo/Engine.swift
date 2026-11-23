@@ -36,15 +36,23 @@ nonisolated final class Engine: @unchecked Sendable {
         }
     }
 
-    func openModel(_ url: URL, done: @escaping (Result<PackageInfo, Error>) -> Void) {
+    func openModel(_ url: URL, condition: SourceCodec? = nil, done: @escaping (Result<PackageInfo, Error>) -> Void) {
         queue.async {
             do {
                 let predictor = try Predictor(url: url)
+                if let condition { predictor.setCondition(condition) }
                 self.predictor = predictor
                 done(.success(predictor.info))
             } catch {
                 done(.failure(error))
             }
+        }
+    }
+
+    /// Set the condition vector of a `-cond` package. Runs on the model queue, before later requests.
+    func setCondition(_ codec: SourceCodec) {
+        queue.async {
+            self.predictor?.setCondition(codec)
         }
     }
 

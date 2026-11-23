@@ -1,11 +1,14 @@
 import Foundation
 
-/// The codec a latent_up with FiLM was told about: the condition of `whoodeo-coreml --codec`.
-/// Each codec is its own package, so a package name ends in one of these raw values.
+/// The codec a latent_up with FiLM is told about, in the order of the condition vector's one-hot slots.
+/// Unknown is all slots zero, not a slot of its own.
 nonisolated enum SourceCodec: String, CaseIterable, Identifiable, Sendable {
     case h264, mpeg4, mpeg2, unknown
 
     var id: String { rawValue }
+
+    /// One-hot slots of the condition vector, same order as Python `CODECS`.
+    static let slots: [SourceCodec] = [.h264, .mpeg4, .mpeg2]
 
     var title: String {
         switch self {
@@ -15,6 +18,18 @@ nonisolated enum SourceCodec: String, CaseIterable, Identifiable, Sendable {
         case .unknown: "unbekannt"
         }
     }
+
+    /// Condition vector of `size` (codec slots, then reserve zeros).
+    func vector(size: Int) -> [Float] {
+        var values = [Float](repeating: 0, count: max(size, 0))
+        if self != .unknown, let index = Self.slots.firstIndex(of: self), index < values.count {
+            values[index] = 1
+        }
+        return values
+    }
+
+    /// Suffix of a `-cond` package's frame cache for this codec vector.
+    var cacheTag: String { rawValue }
 
     /// FFmpeg's codec name of the picture stream. MPEG-4 Part 2 (DivX, XviD) and the
     /// older Microsoft MPEG-4 (DivX 3) are mpeg4, MPEG-1 and MPEG-2 are mpeg2.

@@ -148,11 +148,20 @@ nonisolated final class FrameStore: @unchecked Sendable {
     /// everything runs on the GPU now, and the suffix stays so the caches stay valid.
     static let unitSuffix = "gpu"
 
-    static func open(filmID: String, model: URL, count: Int) throws -> FrameStore {
+    /// Folder name of a model's archive, optionally plus the condition of a `-cond` package.
+    static func folderName(model: URL, condition: String? = nil) -> String {
+        var name = "\(digest(identity(model)))-\(unitSuffix)"
+        if let condition, !condition.isEmpty {
+            name += "-\(condition)"
+        }
+        return name
+    }
+
+    static func open(filmID: String, model: URL, count: Int, condition: String? = nil) throws -> FrameStore {
         guard count > 0 else { throw CLIError("der Film hat keine Bilder") }
         let root = cacheRoot
             .appendingPathComponent(filmID, isDirectory: true)
-            .appendingPathComponent("\(digest(identity(model)))-\(unitSuffix)", isDirectory: true)
+            .appendingPathComponent(folderName(model: model, condition: condition), isDirectory: true)
         gate.lock()
         defer { gate.unlock() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -232,9 +241,9 @@ nonisolated final class FrameStore: @unchecked Sendable {
                     try? FileManager.default.removeItem(at: archive)
                     continue
                 }
-                guard (try? archive.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
-                      let dash = name.lastIndex(of: "-") else { continue }
-                if keep.contains(String(name[..<dash])) { continue }
+                guard (try? archive.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+                // `{digest}-gpu` or `{digest}-gpu-{codec}`: keep every archive of a library package.
+                if keep.contains(where: { name.hasPrefix($0 + "-") }) { continue }
                 gate.lock()
                 let dest = film.appendingPathComponent(name + ".deleting")
                 try? FileManager.default.removeItem(at: dest)

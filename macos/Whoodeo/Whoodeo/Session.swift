@@ -99,6 +99,8 @@ final class Session: ObservableObject {
 
     private let engine = Engine()
     private var modelURL: URL?
+    /// Length of the loaded package's condition input, 0 without one.
+    private var conditionSize = 0
     private var deleteTarget: URL?
     private var librarySource: DispatchSourceFileSystemObject?
     private var facts: FilmFacts?
@@ -620,19 +622,34 @@ final class Session: ObservableObject {
     /// The codec automatic would pick now: that of the open film, unknown without one.
     var automaticCodec: SourceCodec { filmCodec ?? .unknown }
 
-    /// The package of the selected line for the codec in force. The codec is nil without FiLM.
+    /// The codec actually fed: automatic MPEG-2 uses unknown until that slot has been trained.
+    private func wantedCodec() -> SourceCodec {
+        let wanted = codecChoice.resolve(film: filmCodec)
+        if codecChoice == .auto, wanted == .mpeg2 {
+            return .unknown
+        }
+        return wanted
+    }
+
+    /// The selected package, and the codec to feed a `-cond` package. The codec is nil without FiLM.
     private func resolvedPackage() -> (url: URL, codec: SourceCodec?)? {
         guard let selection else { return nil }
         guard let model = selectedModel else { return (selection, nil) }
-        let wanted = codecChoice.resolve(film: filmCodec)
-        let picked = model.package(for: wanted)
-        if let got = picked.codec, got != wanted {
-            Log.model.info("kein Paket für Codec \(wanted.rawValue, privacy: .public), nehme \(got.rawValue, privacy: .public)")
+        guard model.conditionInput else { return (model.url, nil) }
+        let wanted = wantedCodec()
+        if codecChoice == .auto, filmCodec == .mpeg2, wanted == .unknown {
+            Log.model.info("MPEG-2 noch ohne Training, nehme unknown")
         }
-        return picked
+        return (model.url, wanted)
     }
 
-    /// Menu: automatic or a fixed codec. Swaps the package when it differs; the frame cache follows the package.
+    /// Suffix of the frame cache of a `-cond` package, nil without a condition input.
+    private func conditionTag() -> String? {
+        guard conditionSize > 0 else { return nil }
+        return (activeCodec ?? wantedCodec()).cacheTag
+    }
+
+    /// Menu: automatic or a fixed codec. Swaps the package or the vector; the frame cache follows.
     func changeCodec(_ next: CodecChoice) {
         guard !exporting else {
             failure = "Während des Exports bleibt der Codec."
@@ -655,14 +672,47 @@ final class Session: ObservableObject {
         return nil
     }
 
-    /// Load the package of the codec in force if it is not the one loaded. True when a load started.
+    /// Load the package of the codec in force if it is not the one loaded, or switch the
+    /// condition vector of a `-cond` package. True when a load started.
     @discardableResult
     private func syncCodecPackage() -> Bool {
         guard !exporting, let (url, codec) = resolvedPackage() else { return false }
-        guard url != modelURL else { return false }
+        if url == modelURL {
+            if conditionSize > 0, let codec, codec != activeCodec {
+                Log.model.info("Codec \(codec.rawValue, privacy: .public) am selben Paket")
+                activeCodec = codec
+                engine.setCondition(codec)
+                reopenConditionArchives()
+            }
+            return false
+        }
         Log.model.info("Codec \(codec?.rawValue ?? "-", privacy: .public): \(url.lastPathComponent, privacy: .public)")
         loadModel(url, codec: codec)
         return true
+    }
+
+    /// Drop and reopen the frame caches after the condition of a loaded `-cond` package changes.
+    /// The model stays; fill and a comparison cache start over, the comparison engine is kept.
+    private func reopenConditionArchives() {
+        epoch += 1
+        stopPlay(clear: true)
+        scrubTask?.cancel()
+        scrubbing = false
+        filling = nil
+        resetFillHolds()
+        store?.flush()
+        store = nil
+        comparisonStore?.flush()
+        comparisonStore = nil
+        comparisonOpened = false
+        comparisonComputing = nil
+        hasPicture = false
+        milliseconds = nil
+        coverage = Coverage(count: frameCount)
+        resetScale()
+        if let codec = activeCodec {
+            comparisonEngine?.setCondition(codec)
+        }
     }
 
     /// End of the line under the picture: the codec for a package with FiLM, empty otherwise.
@@ -675,7 +725,6 @@ final class Session: ObservableObject {
         deleteTarget = url
         if let model = library.first(where: { $0.url == url }) {
             deleteName = "\(model.title), \(model.detail)"
-            if model.urls.count > 1 { deleteName += " (\(model.urls.count) Codec-Pakete)" }
         } else {
             deleteName = url.deletingPathExtension().lastPathComponent
         }
@@ -684,11 +733,9 @@ final class Session: ObservableObject {
 
     func deleteSelected() {
         guard let target = deleteTarget else { return }
-        // A FiLM line is one package per codec. They go together.
-        let targets = library.first(where: { $0.url == target })?.urls ?? [target]
-        let removingCurrent = modelURL.map(targets.contains) ?? false
+        let removingCurrent = modelURL == target
         let removingSelection = target == selection
-        NSWorkspace.shared.recycle(targets) { [weak self] _, error in
+        NSWorkspace.shared.recycle([target]) { [weak self] _, error in
             let message = error?.localizedDescription
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -882,10 +929,11 @@ final class Session: ObservableObject {
         guard !comparisonOpened, let comparison, let facts, let shownFilmID, facts.count > 0,
               let model = library.first(where: { $0.url == comparison }) else { return }
         comparisonOpened = true
-        let package = model.package(for: codecChoice.resolve(film: filmCodec)).url
+        let package = model.url
         guard package != modelURL else { return }
         do {
-            comparisonStore = try FrameStore.open(filmID: shownFilmID, model: package, count: facts.count)
+            let tag = model.conditionInput ? wantedCodec().cacheTag : nil
+            comparisonStore = try FrameStore.open(filmID: shownFilmID, model: package, count: facts.count, condition: tag)
             comparisonPackage = package
         } catch {
             comparisonError = error.localizedDescription
@@ -908,7 +956,8 @@ final class Session: ObservableObject {
             comparisonLoading = true
             Log.model.info("Vergleich lädt \(package.lastPathComponent, privacy: .public)")
             engine.openFilm(facts.url, filmID: shownFilmID) { _ in }
-            engine.openModel(package) { [weak self] result in
+            let codec = activeCodec ?? wantedCodec()
+            engine.openModel(package, condition: codec) { [weak self] result in
                 Task { @MainActor in
                     guard let self, token == self.comparisonEpoch else { return }
                     self.comparisonLoading = false
@@ -966,7 +1015,7 @@ final class Session: ObservableObject {
         releaseArchive()
         modelLoad += 1
         let token = modelLoad
-        engine.openModel(url) { [weak self] result in
+        engine.openModel(url, condition: codec) { [weak self] result in
             Task { @MainActor in
                 guard let self, token == self.modelLoad else { return }
                 self.applyModel(result)
@@ -978,9 +1027,14 @@ final class Session: ObservableObject {
         switch result {
         case .success(let info):
             modelLabel = info.label
-            activeCodec = info.codec
-            if let codec = info.codec {
+            conditionSize = info.takesCondition ? info.conditionSize : 0
+            if info.takesCondition {
+                let codec = activeCodec ?? wantedCodec()
+                activeCodec = codec
+                engine.setCondition(codec)
                 Log.model.info("Modell \(self.modelURL?.lastPathComponent ?? "", privacy: .public) · Codec \(codec.rawValue, privacy: .public) · Wahl \(self.codecChoice.rawValue, privacy: .public) · Film \(self.filmCodec?.rawValue ?? "-", privacy: .public)")
+            } else {
+                activeCodec = nil
             }
             loadingModel = false
             failure = nil
@@ -1091,30 +1145,23 @@ final class Session: ObservableObject {
 
     private func reloadLibrary() {
         library = ModelLibrary.models()
-        // Every codec package of a FiLM line keeps its caches.
-        let urls = library.flatMap(\.urls)
+        let urls = library.map(\.url)
         DispatchQueue.global(qos: .utility).async {
             FrameStore.pruneModelCaches(keep: Set(urls.map(FrameStore.modelKey(of:))))
         }
         if let selection, !library.contains(where: { $0.url == selection }) {
-            // A FiLM line names the package of another codec once more codecs arrive.
-            if let moved = library.first(where: { $0.urls.contains(selection) }) {
-                self.selection = moved.url
-            } else {
-                self.selection = nil
-            }
+            self.selection = nil
         }
         if let modelURL, !urls.contains(modelURL) { clearModel() }
         if let comparison, !library.contains(where: { $0.url == comparison }) { setComparison(nil) }
         if selection != nil, modelURL != nil, !loadingModel {
-            // A codec package that just arrived replaces the fallback.
             syncCodecPackage()
         }
         guard !didRestoreModel else { return }
         didRestoreModel = true
         guard selection == nil,
               let name = UserDefaults.standard.string(forKey: Self.lastModelKey),
-              let match = library.first(where: { $0.urls.contains { $0.lastPathComponent == name } })
+              let match = library.first(where: { $0.url.lastPathComponent == name })
         else { return }
         selection = match.url
         openSelection()
@@ -1124,6 +1171,7 @@ final class Session: ObservableObject {
         modelLoad += 1
         loadingModel = false
         modelURL = nil
+        conditionSize = 0
         activeCodec = nil
         modelLabel = ""
         pixelWidth = 0
@@ -1158,7 +1206,7 @@ final class Session: ObservableObject {
     private func adoptStore() {
         guard store == nil, let facts, let modelURL, let shownFilmID, facts.count > 0 else { return }
         do {
-            let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, count: facts.count)
+            let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, count: facts.count, condition: conditionTag())
             store = opened
             coverage = opened.coverage()
         } catch {

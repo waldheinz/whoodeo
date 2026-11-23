@@ -7,7 +7,7 @@ next, the same order as apply.
 A vae2 checkpoint gives its decoder alone: a latent in, the frame clamped
 to [0, 1] out, both fp16. The input takes the enumerated latent sizes of
 --latent, 60x107, 90x160, and 135x240 by default (480p, 720p, and 1080p at
-factor 8), so the Neural Engine can run it. One size gives a fixed shape.
+factor 8). One size gives a fixed shape.
 The metadata carries the latent shift and scale, one value per channel.
 --part encoder gives the vae2 encoder instead: the frame in (sides 8 times the
 latent sizes), μ out, both fp16, the same metadata. --part pair writes both
@@ -17,60 +17,48 @@ A latent_up checkpoint gives one program with its vae2 decoder behind it: the
 low frame in, the 2x frame clamped to [0, 1] out, both fp16. The latent shift
 and scale fold into the head of latent_up, so the graph hands the decoder μ
 directly. The input takes any size from 64x64 to --max-low, 1280x720 by
-default, so a 720p low frame fits. The app runs it on the GPU; the Neural
-Engine would abort on a whole 1280x720 low frame. --low gives enumerated sizes
+default, so a 720p low frame fits. The app runs it on the GPU. --low gives enumerated sizes
 instead. The app pads a frame on the bottom and the right
 (reflect) to the next multiple of 4 and crops the result to 2h x 2w. The vae2
 is the one the checkpoint names; a path under /mnt/home-storinator-trem is
 looked up under /Volumes/home, then ~/storinator/home, and --vae overrides it.
-A latent_up with condition (FiLM) is exported for one codec: --codec h264,
-mpeg4, mpeg2, or unknown (the default, all zero). γ and β of that codec are
-computed once and sit in the graph as constants, a multiply and an add behind
-each residual block; the frame stays the only input. The metadata names the
-codec, the package name ends in it, so one package per codec can live side by
-side. --bench compares with PyTorch under the same codec.
+A latent_up with condition (FiLM) is one package: the frames plus a
+condition vector (whoodeo.condition_size, 11 for codec: one-hot h264/mpeg4/mpeg2,
+unknown is all zero, then 8 reserve slots). The FiLM MLP stays in the graph, so
+the app sets the vector per film and later reserve slots need no new export.
+The package name ends in -cond.
 A latent_up with in_frames 3 takes the previous, middle, and next low frame
 on 9 channels, in that order (whoodeo.in_frames in the metadata); the clip's
 edges repeat the middle frame.
-The Neural Engine loses conv products below about 2^-14, which the residual
-convolutions that start at zero produce in numbers. --conv-scale k (16 by
-default for vae2 and latent_up, off for vote and edsr) multiplies each
-convolution's weight and bias by k and puts a separate multiply by 1/k behind
-it. The pass that would fold that multiply back into the weights is off, so
-the products stay large; the Neural Engine runs the multiply with the
-convolution at no measurable cost. In fp32 the picture does not change.
+--conv-scale k (16 by default for vae2 and latent_up, off for vote and edsr)
+multiplies each convolution's weight and bias by k and puts a separate
+multiply by 1/k behind it. The pass that would fold that multiply back into
+the weights is off, so the products stay large (residual convolutions that
+start at zero would otherwise go very small). In fp32 the picture does not
+change.
 coremltools stays out of the training dependencies. On the Mac:
 
     uv pip install --python .venv/bin/python 'coremltools==9.1.dev1'
 """
 
 import argparse
-import time
 from pathlib import Path
 
-import av
 import numpy as np
 import torch
 
 from whoodeo.checkpoint import build_generator, load_generator
-from whoodeo.video import frame_tensor
 
 # One 10-bit step. fp16 on the GPU stayed inside this against fp32.
 STEP = 1 / 1023
-# The bench accepts a compute unit when its worst PSNR against PyTorch fp32 is at
-# least this. One 8-bit step of uniform rounding noise is about 59 dB.
-PSNR_MIN = 50.0
 _FLEX_H = (64, 1080, 360)
 _FLEX_W = (64, 1920, 640)
 # Latent sides of 480p (856x480), 720p, and 1080p at factor 8.
 LATENT_SIZES = ((60, 107), (90, 160), (135, 240))
 LOW_PAD = 4
-# latent_up's flexible input: 64 up to this, height x width. The app runs it on the GPU;
-# a whole 1280x720 low frame aborts on the Neural Engine.
+# latent_up's flexible input: 64 up to this, height x width. The app runs it on the GPU.
 LOW_MIN = 64
 LOW_MAX = (720, 1280)
-# Sizes --plan and --bench use for a flexible latent_up package.
-LOW_PROBES = ((240, 428), (360, 640), (480, 852), (640, 1136), (720, 1280))
 # Convolution weights and bias times this, with a multiply by its inverse behind.
 CONV_SCALE = 16.0
 # Where the Spark's runs mount lives on the Mac, in the order they are tried.
@@ -101,7 +89,7 @@ def _prepare(model):
 
 class ScaledConv(torch.nn.Module):
     """A convolution with weight and bias times k, its output times 1/k: the same picture,
-    larger products on the Neural Engine."""
+    larger intermediate products."""
 
     def __init__(self, conv, k):
         super().__init__()
@@ -189,8 +177,8 @@ def _metadata(spec, arch, blocks, channels, in_frames, res_scale, stem, vote):
 
 
 def convert(
-    checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=None, vae=None, plan=False,
-    conv_scale=None, max_low=LOW_MAX, codec=None, part="decoder",
+    checkpoint, output, latent_sizes=LATENT_SIZES, low_sizes=None, vae=None,
+    conv_scale=None, max_low=LOW_MAX, part="decoder",
 ):
     """Write an mlprogram with a flexible input, a vae2 decoder, or latent_up with its decoder.
 
@@ -202,8 +190,6 @@ def convert(
     arch = spec.architecture.get("arch")
     if conv_scale is None:
         conv_scale = CONV_SCALE if arch in ("vae2", "latent_up") else 1.0
-    if codec is not None and arch != "latent_up":
-        raise SystemExit(f"--codec is for a latent_up with condition, not {arch}")
     if part != "decoder" and arch != "vae2":
         raise SystemExit(f"--part {part} is for a vae2, not {arch}")
     if arch == "vae2":
@@ -217,7 +203,7 @@ def convert(
                                    latent_sizes, conv_scale)
         return convert_decoder(ct, spec, output, latent_sizes, conv_scale)
     if arch == "latent_up":
-        return convert_latent_up(ct, spec, output, low_sizes, vae, plan, conv_scale, max_low, codec)
+        return convert_latent_up(ct, spec, output, low_sizes, vae, conv_scale, max_low)
     if arch not in ("vote", "edsr"):
         raise SystemExit(
             f"{checkpoint}: whoodeo-coreml converts vote, edsr, vae2, and latent_up, not {arch}"
@@ -302,7 +288,7 @@ def convert_decoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} decoder"
     _assign_metadata(mlmodel, _vae2_metadata(spec, model, "decoder", sizes, conv_scale))
-    return _save_vae2_part(ct, mlmodel, output, spec, f"{trace_h}x{trace_w}")
+    return _save_vae2_part(mlmodel, output, spec)
 
 
 def _vae2_metadata(spec, model, part, sizes, conv_scale):
@@ -324,7 +310,7 @@ def _vae2_metadata(spec, model, part, sizes, conv_scale):
     }
 
 
-def _save_vae2_part(ct, mlmodel, output, spec, probe):
+def _save_vae2_part(mlmodel, output, spec):
     output = Path(output)
     if output.exists():
         import shutil
@@ -332,11 +318,6 @@ def _save_vae2_part(ct, mlmodel, output, spec, probe):
     output.parent.mkdir(parents=True, exist_ok=True)
     mlmodel.save(str(output))
     print(f"wrote {output}", flush=True)
-    try:
-        counts = _plan_counts(mlmodel, ct.ComputeUnit.CPU_AND_NE)
-    except Exception as exc:
-        counts = {"plan": str(exc)}
-    print(f"plan ane {probe} {counts}", flush=True)
     return output, spec
 
 
@@ -388,7 +369,7 @@ def convert_encoder(ct, spec, output, latent_sizes, conv_scale=CONV_SCALE):
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} encoder"
     _assign_metadata(mlmodel, _vae2_metadata(spec, model, "encoder", sizes, conv_scale))
-    return _save_vae2_part(ct, mlmodel, output, spec, f"{trace_h}x{trace_w}")
+    return _save_vae2_part(mlmodel, output, spec)
 
 
 def resolve_vae(path, override=None):
@@ -441,13 +422,15 @@ def _smooth_frames(height, width, seed=0, frames=1):
 
 
 def convert_latent_up(
-    ct, spec, output, low_sizes, vae_override, plan, conv_scale=CONV_SCALE, max_low=LOW_MAX, codec=None,
+    ct, spec, output, low_sizes, vae_override, conv_scale=CONV_SCALE, max_low=LOW_MAX,
 ):
     """Write latent_up and its vae2 decoder as one program, flexible up to `max_low` or enumerated.
 
-    With condition, `codec` (None is unknown) is fixed into the graph.
+    With condition, the package takes a condition vector as a second input.
     """
-    from whoodeo.models.latent_up import FACTOR, LatentUpExport, LatentUpReference
+    from whoodeo.models.latent_up import (
+        CODECS, CONDITIONS, FACTOR, RESERVE, LatentUpExport, LatentUpReference, fixed_condition,
+    )
 
     model, label, step, vae, vae_label, vae_spec, vae_path = load_latent_up(
         spec, torch.device("cpu"), vae_override,
@@ -458,29 +441,54 @@ def convert_latent_up(
         if height % FACTOR or width % FACTOR:
             raise SystemExit(f"low size {width}x{height}: both sides must divide by {FACTOR}")
     condition = spec.architecture.get("condition")
+    condition_size = 0 if condition is None else CONDITIONS[condition]
     if condition is not None:
-        codec = codec or "unknown"
-        print(f"condition {condition}: codec {codec} fixed into the graph", flush=True)
-    folded = LatentUpExport(model, vae, codec).eval()
+        print(
+            f"condition {condition}: vector of {condition_size} as input "
+            f"(codecs {', '.join(CODECS)}, then {RESERVE} reserve)",
+            flush=True,
+        )
+    folded = LatentUpExport(model, vae).eval()
     export = scale_convs(folded, conv_scale)
-    reference = LatentUpReference(model, vae, codec).eval()
     # Neither the fold nor the conv scale may change the picture. fp32 on the CPU, padded and unpadded.
     with torch.no_grad():
         for height, width in ((96, 128), (90, 130)):
             frames = _smooth_frames(height, width, frames=model.in_frames)
-            want = reference(frames)
             padded, _h, _w = _pad(frames)
-            got = export(padded)[:, :, :2 * height, :2 * width]
-            fold = float((want - got).abs().max())
-            print(f"fold and conv scale {conv_scale:g} check {width}x{height}  max abs {fold:.3g}", flush=True)
-            if fold > 1e-4:
-                raise SystemExit(f"folding the latent shift and scale or the conv scale changed the frame by {fold}")
+            if condition is None:
+                want = LatentUpReference(model, vae).eval()(frames)
+                got = export(padded)[:, :, :2 * height, :2 * width]
+                fold = float((want - got).abs().max())
+                print(f"fold and conv scale {conv_scale:g} check {width}x{height}  max abs {fold:.3g}", flush=True)
+                if fold > 1e-4:
+                    raise SystemExit(
+                        f"folding the latent shift and scale or the conv scale changed the frame by {fold}"
+                    )
+            else:
+                for name in ("unknown", "h264", "mpeg4"):
+                    vector = fixed_condition(model, name)
+                    want = LatentUpReference(model, vae, name).eval()(frames)
+                    got = export(padded, vector)[:, :, :2 * height, :2 * width]
+                    fold = float((want - got).abs().max())
+                    print(
+                        f"fold and conv scale {conv_scale:g} check {width}x{height} {name}  max abs {fold:.3g}",
+                        flush=True,
+                    )
+                    if fold > 1e-4:
+                        raise SystemExit(
+                            f"folding the latent shift and scale or the conv scale changed the frame by {fold}"
+                        )
     trace_h, trace_w = 360, 640
     if sizes is not None and (trace_h, trace_w) not in sizes:
         trace_h, trace_w = sizes[len(sizes) // 2]
     example = torch.zeros(1, channels, trace_h, trace_w)
     with torch.no_grad():
-        traced = torch.jit.trace(export, example)
+        if condition is None:
+            traced = torch.jit.trace(export, example)
+        else:
+            example_cond = torch.zeros(1, condition_size)
+            example_cond[0, 0] = 1
+            traced = torch.jit.trace(export, (example, example_cond))
     if sizes is None:
         max_h, max_w = max_low
         shape = ct.Shape(shape=(
@@ -504,7 +512,8 @@ def convert_latent_up(
         widths = [width for _height, width in sizes]
         heights = [height for height, _width in sizes]
     print(f"convert {label}  step {step}  + {vae_label} decoder  {kind} -> {output}", flush=True)
-    mlmodel = _convert_latent_up_traced(ct, traced, shape, conv_scale)
+    cond_shape = (1, condition_size) if condition is not None else None
+    mlmodel = _convert_latent_up_traced(ct, traced, shape, conv_scale, cond_shape)
     mlmodel.author = "whoodeo"
     mlmodel.short_description = f"{label} + vae2 decoder"
     meta = {
@@ -535,7 +544,9 @@ def convert_latent_up(
         meta["whoodeo.sizes"] = ",".join(f"{width}x{height}" for height, width in sizes)
     if condition is not None:
         meta["whoodeo.condition"] = condition
-        meta["whoodeo.codec"] = codec
+        meta["whoodeo.condition_size"] = str(condition_size)
+        meta["whoodeo.codecs"] = ",".join(CODECS)
+        meta["whoodeo.reserve"] = str(RESERVE)
     _assign_metadata(mlmodel, meta)
     output = Path(output)
     if output.exists():
@@ -544,344 +555,27 @@ def convert_latent_up(
     output.parent.mkdir(parents=True, exist_ok=True)
     mlmodel.save(str(output))
     print(f"wrote {output}", flush=True)
-    if plan:
-        probes = sizes if sizes is not None else [
-            size for size in LOW_PROBES if size[0] <= max_low[0] and size[1] <= max_low[1]
-        ]
-        _plan_sizes(ct, traced, probes, conv_scale, channels)
     return output, spec
 
 
-def _convert_latent_up_traced(ct, traced, shape, conv_scale=CONV_SCALE):
+def _convert_latent_up_traced(ct, traced, shape, conv_scale=CONV_SCALE, condition_shape=None):
+    inputs = [ct.TensorType(name="frames", shape=shape, dtype=np.float16)]
+    if condition_shape is not None:
+        inputs.append(ct.TensorType(name="condition", shape=condition_shape, dtype=np.float16))
     return ct.convert(
         traced,
         convert_to="mlprogram",
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS18,
-        inputs=[ct.TensorType(name="frames", shape=shape, dtype=np.float16)],
+        inputs=inputs,
         outputs=[ct.TensorType(name="image", dtype=np.float16)],
         pass_pipeline=_pipeline(ct, conv_scale),
     )
 
 
-def _plan_sizes(ct, traced, sizes, conv_scale=CONV_SCALE, channels=3):
-    """The Neural Engine plan of each size, from a fixed-shape copy of the program."""
-    import tempfile
-
-    for height, width in sizes:
-        fixed = _convert_latent_up_traced(ct, traced, (1, channels, height, width), conv_scale)
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / "plan.mlpackage"
-            fixed.save(str(path))
-            fixed = ct.models.MLModel(str(path), compute_units=ct.ComputeUnit.CPU_AND_NE)
-            try:
-                counts = _plan_counts(fixed, ct.ComputeUnit.CPU_AND_NE)
-            except Exception as exc:
-                counts = {"plan": str(exc)}
-        print(f"plan ane {width}x{height} {_plan_text(counts)}", flush=True)
-
-
-def _plan_text(counts):
-    if "plan" in counts:
-        return counts["plan"]
-    ops = sum(value for key, value in counts.items() if not key.startswith("conv_"))
-    convs = sum(value for key, value in counts.items() if key.startswith("conv_"))
-    parts = [f"ops {counts.get('ane', 0)}/{ops} ane"]
-    parts.append(f"conv {counts.get('conv_ane', 0)}/{convs} ane")
-    others = {key: value for key, value in counts.items() if key not in ("ane", "conv_ane")}
-    if others:
-        parts.append(str(others))
-    return "  ".join(parts)
-
-
 def _pad(frames):
     from whoodeo.models.common import pad_to
     return pad_to(frames, LOW_PAD)
-
-
-def _read_window(path, index, radius):
-    """Low frames around `index`, display order. The clip's edges repeat."""
-    frames = []
-    with av.open(str(path)) as container:
-        stream = container.streams.video[0]
-        for number, frame in enumerate(container.decode(stream)):
-            frames.append(frame_tensor(frame))
-            if number >= index + radius:
-                break
-    if not frames:
-        raise SystemExit(f"no frames: {path}")
-    center = min(index, len(frames) - 1)
-    picked = []
-    for dt in range(-radius, radius + 1):
-        slot = min(max(center + dt, 0), len(frames) - 1)
-        picked.append(frames[slot])
-    stack = torch.cat(picked, dim=0)
-    return stack, center
-
-
-def _error(reference, got):
-    diff = np.abs(reference.astype(np.float64) - got.astype(np.float64))
-    max_abs = float(diff.max())
-    mse = float(np.mean(np.square(diff)))
-    psnr = float("inf") if mse == 0 else float(10 * np.log10(1.0 / mse))
-    return max_abs, psnr
-
-
-def _time_predict(predict, repeats=8):
-    predict()
-    predict()
-    samples = []
-    for _ in range(repeats):
-        started = time.perf_counter()
-        predict()
-        samples.append((time.perf_counter() - started) * 1000)
-    samples.sort()
-    return samples[len(samples) // 2]
-
-
-def _device_kind(device):
-    from coremltools.models.compute_device import (
-        MLCPUComputeDevice,
-        MLGPUComputeDevice,
-        MLNeuralEngineComputeDevice,
-    )
-    if isinstance(device, MLNeuralEngineComputeDevice):
-        return "ane"
-    if isinstance(device, MLGPUComputeDevice):
-        return "gpu"
-    if isinstance(device, MLCPUComputeDevice):
-        return "cpu"
-    return type(device).__name__
-
-
-def _assign_metadata(model, mapping):
-    defined = model.user_defined_metadata
-    for key, value in mapping.items():
-        defined[key] = value
-
-
-def _plan_counts(mlmodel, unit):
-    from coremltools.models.compute_plan import MLComputePlan
-    compiled = mlmodel.get_compiled_model_path()
-    plan = MLComputePlan.load_from_path(compiled, compute_units=unit)
-    program = plan.model_structure.program
-    if program is None:
-        return {}
-    counts = {}
-
-    def walk(block):
-        for operation in block.operations:
-            usage = plan.get_compute_device_usage_for_mlprogram_operation(operation)
-            if usage is not None:
-                name = _device_kind(usage.preferred_compute_device)
-                counts[name] = counts.get(name, 0) + 1
-                if operation.operator_name.split(".")[-1] == "conv":
-                    key = f"conv_{name}"
-                    counts[key] = counts.get(key, 0) + 1
-            for nested in operation.blocks:
-                walk(nested)
-
-    main = program["main"] if isinstance(program, dict) else program.functions["main"]
-    walk(main.block)
-    return counts
-
-
-def _predict_array(mlmodel, batch):
-    result = mlmodel.predict({"frames": batch})
-    image = result.get("image")
-    if image is None:
-        raise SystemExit(f"Core ML output names: {', '.join(result)}")
-    array = np.asarray(image, dtype=np.float32)
-    if array.ndim == 4:
-        array = array[0]
-    return array
-
-
-def _cases_upscaler(videos, radius):
-    """Frame 100 of each video at its own size, with its neighbors."""
-    for video in videos:
-        stack, center = _read_window(video, 100, radius)
-        height, width = stack.shape[-2], stack.shape[-1]
-        yield f"{Path(video).name} #{center}", stack.unsqueeze(0), width, height
-
-
-def _cases_latent_up(videos, sizes, radius=0):
-    """Frame 100 of each video with `radius` neighbors, resized to each enumerated low size."""
-    frames = []
-    for video in videos:
-        stack, center = _read_window(video, 100, radius)
-        frames.append((f"{Path(video).name} #{center}", stack.unsqueeze(0)))
-    for height, width in sizes:
-        for name, frame in frames:
-            if frame.shape[-2:] == (height, width):
-                sized = frame
-            else:
-                sized = torch.nn.functional.interpolate(
-                    frame, size=(height, width), mode="bilinear", antialias=True, align_corners=False,
-                ).clamp(0, 1)
-            yield name, sized, width, height
-
-
-def _package_sizes(package, ct):
-    from coremltools.models.utils import load_spec
-    spec = load_spec(str(package))
-    text = spec.description.metadata.userDefined.get("whoodeo.sizes", "")
-    sizes = []
-    for part in text.split(","):
-        if "x" in part:
-            width, height = (int(item) for item in part.split("x"))
-            sizes.append((height, width))
-    return sizes
-
-
-def _package_probes(package):
-    """LOW_PROBES that fit a flexible package's range."""
-    from coremltools.models.utils import load_spec
-    defined = load_spec(str(package)).description.metadata.userDefined
-    max_w = int(defined.get("whoodeo.width_max", LOW_MAX[1]))
-    max_h = int(defined.get("whoodeo.height_max", LOW_MAX[0]))
-    return [size for size in LOW_PROBES if size[0] <= max_h and size[1] <= max_w]
-
-
-def bench(package, checkpoint, videos, vae=None, codec=None):
-    """Compare the package with PyTorch fp32 on real frames. PSNR sets the default unit."""
-    ct = _coremltools()
-    spec = load_generator(checkpoint)
-    arch = spec.architecture.get("arch")
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    if arch == "latent_up":
-        from whoodeo.models.latent_up import LatentUpReference
-        model, label, _step, vae_model, _vae_label, _vae_spec, _vae_path = load_latent_up(spec, device, vae)
-        radius = model.in_frames // 2
-        model = LatentUpReference(model, vae_model, codec).eval()
-        sizes = _package_sizes(package, ct) or _package_probes(package)
-        cases = list(_cases_latent_up(videos, sizes, radius))
-        dtype = np.float16
-        repeats = 5
-    else:
-        model, label, in_frames, _step, _path = build_generator(spec, torch.device("cpu"))
-        _prepare(model)
-        model.to(device)
-        cases = list(_cases_upscaler(videos, in_frames // 2))
-        dtype = np.float32
-        repeats = 8
-    units = (
-        ("gpu", ct.ComputeUnit.CPU_AND_GPU),
-        ("ane", ct.ComputeUnit.CPU_AND_NE),
-    )
-    loaded = {}
-    for name, unit in units:
-        loaded[name] = ct.models.MLModel(
-            str(package),
-            compute_units=unit,
-            optimization_hints={"reshapeFrequency": ct.ReshapeFrequency.Infrequent},
-        )
-
-    rows = []
-    timed = {}
-    for case, batch_t, width, height in cases:
-        print(f"frame {case}  {width}x{height}", flush=True)
-        with torch.inference_mode():
-            reference = model(batch_t.to(device)).squeeze(0).detach().float().cpu().numpy()
-            if device.type == "mps":
-                torch.mps.synchronize()
-        batch = batch_t.numpy().astype(dtype, copy=False)
-        for name, _unit in units:
-            mlmodel = loaded[name]
-
-            def predict(mlmodel=mlmodel, batch=batch):
-                return _predict_array(mlmodel, batch)
-
-            # The first shape pays for the compiler. Keep it out of the median.
-            started = time.perf_counter()
-            got = predict()
-            compile_s = time.perf_counter() - started
-            max_abs, psnr = _error(reference, got)
-            shape_key = (name, width, height)
-            if shape_key not in timed:
-                timed[shape_key] = _time_predict(predict, repeats)
-                note = f"  compile {compile_s:.1f}s"
-            else:
-                note = ""
-            median = timed[shape_key]
-            print(
-                f"  {name}  max {max_abs:.6f}  psnr {psnr:.2f}  {median:.1f} ms{note}",
-                flush=True,
-            )
-            rows.append({
-                "name": name,
-                "width": width,
-                "height": height,
-                "max_abs": max_abs,
-                "psnr": psnr,
-                "ms": median,
-            })
-
-    summary = {}
-    for name, _unit in units:
-        mine = [row for row in rows if row["name"] == name]
-        if not mine:
-            continue
-        worst = min(mine, key=lambda row: row["psnr"])
-        sizes_ms = {}
-        for row in mine:
-            sizes_ms[(row["width"], row["height"])] = row["ms"]
-        summary[name] = {
-            "psnr": worst["psnr"],
-            "max_abs": max(row["max_abs"] for row in mine),
-            "width": worst["width"],
-            "height": worst["height"],
-            "ms": sum(sizes_ms.values()) / len(sizes_ms),
-            "sizes_ms": sizes_ms,
-        }
-    passing = [name for name, row in summary.items() if row["psnr"] >= PSNR_MIN]
-    if passing:
-        prefer = min(passing, key=lambda name: summary[name]["ms"])
-    else:
-        prefer = "gpu"
-    parts = []
-    for name, title in (("gpu", "GPU"), ("ane", "Neural Engine")):
-        row = summary.get(name)
-        if row is None:
-            continue
-        mark = "ok" if row["psnr"] >= PSNR_MIN else f"unter {PSNR_MIN:g} dB"
-        step = "innerhalb" if row["max_abs"] <= STEP else "über"
-        parts.append(
-            f"{title} PSNR min {row['psnr']:.1f} dB ({mark}), max {row['max_abs']:.6f} "
-            f"({step} einem 10-bit-Schritt), im Mittel {row['ms']:.0f} ms"
-        )
-    note = ". ".join(parts)
-    note += ". Voreinstellung GPU." if prefer == "gpu" else ". Voreinstellung Neural Engine."
-    print(note, flush=True)
-    for width, height in sorted({(row["width"], row["height"]) for row in rows}):
-        cells = "  ".join(
-            f"{name} {summary[name]['sizes_ms'][(width, height)]:.1f} ms"
-            for name in summary if (width, height) in summary[name]["sizes_ms"]
-        )
-        print(f"  {width}x{height}  {cells}", flush=True)
-    _write_bench(package, summary.get("gpu"), summary.get("ane"), prefer, note)
-    return prefer
-
-
-def _write_bench(package, gpu, ane, prefer, note):
-    """Patch the spec in place. Saving the whole package would delete its weights."""
-    from coremltools.models.utils import _get_model_spec_path, load_spec, save_spec
-    spec = load_spec(str(package))
-    defined = spec.description.metadata.userDefined
-    for name, row in (("gpu", gpu), ("ane", ane)):
-        if row is None:
-            continue
-        defined[f"whoodeo.bench.{name}_max_abs"] = f"{row['max_abs']:.6g}"
-        defined[f"whoodeo.bench.{name}_psnr"] = f"{row['psnr']:.2f}"
-        defined[f"whoodeo.bench.{name}_ms"] = f"{row['ms']:.1f}"
-        defined[f"whoodeo.bench.{name}_ok"] = "1" if row["psnr"] >= PSNR_MIN else "0"
-        defined[f"whoodeo.bench.{name}_sizes_ms"] = ",".join(
-            f"{width}x{height}:{ms:.1f}" for (width, height), ms in sorted(row["sizes_ms"].items())
-        )
-    defined["whoodeo.bench.prefer"] = prefer
-    defined["whoodeo.bench.note"] = note
-    save_spec(spec, _get_model_spec_path(str(package)))
-    print(f"bench metadata -> {package}", flush=True)
 
 
 def library_directory():
@@ -914,10 +608,10 @@ def _safe_name(text):
     return cleaned or "model"
 
 
-def package_filename(checkpoint, spec, codec=None, part=None):
-    """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in its codec.
+def package_filename(checkpoint, spec, part=None):
+    """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in -cond.
 
-    A model on more than one frame carries the count behind the step, "…-step003000-3f-hd-h264".
+    A model on more than one frame carries the count behind the step, "…-step003000-3f-hd-cond".
     """
     arch = spec.architecture.get("arch") or "model"
     blocks = spec.architecture.get("blocks")
@@ -934,14 +628,14 @@ def package_filename(checkpoint, spec, codec=None, part=None):
     if arch == "vae2" and part == "encoder":
         kind = "encoder"
     if spec.architecture.get("condition") is not None:
-        kind += f"-{codec or 'unknown'}"
+        kind += "-cond"
     return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"
 
 
-def _default_output(checkpoint, spec, codec=None, part="decoder"):
+def _default_output(checkpoint, spec, part="decoder"):
     if part == "pair":
         return playground_directory()
-    return library_directory() / package_filename(checkpoint, spec, codec, part)
+    return library_directory() / package_filename(checkpoint, spec, part)
 
 
 def parse_args(argv=None):
@@ -952,13 +646,6 @@ def parse_args(argv=None):
     parser.add_argument(
         "-o", "--out", type=Path, default=None,
         help="mlpackage to write. Default: ~/Library/Application Support/Whoodeo/Models",
-    )
-    parser.add_argument(
-        "--bench",
-        type=Path,
-        nargs="+",
-        default=None,
-        help="compare with PyTorch on frame 100 of each video",
     )
     parser.add_argument(
         "--latent",
@@ -986,7 +673,7 @@ def parse_args(argv=None):
         "--conv-scale",
         type=float,
         default=None,
-        help="multiply conv weights by k and the outputs by 1/k, for the Neural Engine. "
+        help="multiply conv weights by k and the outputs by 1/k. "
              "1 turns it off. Default: 16 for vae2 and latent_up, 1 for vote and edsr",
     )
     parser.add_argument(
@@ -997,22 +684,11 @@ def parse_args(argv=None):
              "/mnt/home-storinator-trem mapped to /Volumes/home",
     )
     parser.add_argument(
-        "--plan",
-        action="store_true",
-        help="latent_up: print the Neural Engine plan of each low size",
-    )
-    parser.add_argument(
         "--part",
         choices=("decoder", "encoder", "pair"),
         default="decoder",
         help="vae2: the decoder, the encoder, or both for the app's VAE playground "
              "(-o is then a folder, default ~/Library/Application Support/Whoodeo/VAE)",
-    )
-    parser.add_argument(
-        "--codec",
-        choices=("h264", "mpeg4", "mpeg2", "unknown"),
-        default=None,
-        help="latent_up with condition: the codec fixed into the package. Default: unknown",
     )
     return parser.parse_args(argv)
 
@@ -1030,22 +706,16 @@ def _latent_size(text):
 def main(argv=None):
     args = parse_args(argv)
     spec = load_generator(args.model)
-    if args.bench and spec.architecture.get("arch") == "vae2":
-        raise SystemExit("--bench compares upscalers. A vae2 decoder has no low frames")
-    if args.codec is not None and spec.architecture.get("condition") is None:
-        raise SystemExit(f"{args.model}: --codec needs a latent_up with condition")
     if args.out is not None:
         output = args.out
     else:
-        output = _default_output(args.model, spec, args.codec, args.part)
+        output = _default_output(args.model, spec, args.part)
     if args.conv_scale is not None and args.conv_scale <= 0:
         raise SystemExit("--conv-scale must be positive")
-    package, _spec = convert(
-        args.model, output, args.latent or LATENT_SIZES, args.low, args.vae, args.plan,
-        args.conv_scale, args.max_low, args.codec, args.part,
+    convert(
+        args.model, output, args.latent or LATENT_SIZES, args.low, args.vae,
+        args.conv_scale, args.max_low, args.part,
     )
-    if args.bench:
-        bench(package, args.model, args.bench, args.vae, args.codec)
 
 
 if __name__ == "__main__":
