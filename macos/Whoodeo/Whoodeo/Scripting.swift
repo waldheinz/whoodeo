@@ -198,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "scriptShowingComparison", "scriptComparisonComputing", "scriptComparisonCached", "scriptComparisonModel",
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
-        "scriptCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",
+        "scriptCodec", "scriptSourceCodec", "scriptActiveCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",
         "scriptCurrentFilm", "scriptFilms",
     ]
 }
