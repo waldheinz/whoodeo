@@ -4,8 +4,11 @@ scale: 2
 scale_flags: bicubic
 pix_fmt: yuv420p
 variants:
-  mpeg4-q08: "-c:v mpeg4 -q:v 8"
-  mpeg4-q12: "-c:v mpeg4 -q:v 12"
-  mpeg4-q16: "-c:v mpeg4 -q:v 16"
-  x264-crf28: "-c:v libx264 -crf 28 -preset medium"
-  x264-500k: "-c:v libx264 -b:v 500k -preset medium"
+  # Stages measured on real films (23.11.2026): h264 P-frame QP 17.5-28, median
+  # ~22.5 (crf18-24); Xvid/DivX quantizer P ~4 (2-6), B = 1.5*P + 1.
+  x264-crf18: "-c:v libx264 -crf 18 -preset medium"
+  x264-crf20: "-c:v libx264 -crf 20 -preset medium"
+  x264-crf22: "-c:v libx264 -crf 22 -preset medium"
+  x264-crf24: "-c:v libx264 -crf 24 -preset medium"
+  mpeg4-q04: "-c:v mpeg4 -q:v 4 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
+  mpeg4-q06: "-c:v mpeg4 -q:v 6 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
