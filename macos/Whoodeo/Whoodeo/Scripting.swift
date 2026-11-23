@@ -36,8 +36,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc var scriptShowingOriginal: Bool {
-        get { MainActor.assumeIsolated { Session.current?.showingOriginal ?? false } }
-        set { MainActor.assumeIsolated { Session.current?.showOriginal(newValue) } }
+        get { MainActor.assumeIsolated { Session.current?.screenSource == .original } }
+        set { MainActor.assumeIsolated { Self.show(.original, newValue) } }
+    }
+
+    @objc var scriptShowingComparison: Bool {
+        get { MainActor.assumeIsolated { Session.current?.screenSource == .comparison } }
+        set { MainActor.assumeIsolated { Self.show(.comparison, newValue) } }
+    }
+
+    @objc var scriptComparisonComputing: Bool {
+        MainActor.assumeIsolated {
+            guard let session = Session.current else { return false }
+            return session.comparisonComputing != nil || session.comparisonLoading
+        }
+    }
+
+    @objc var scriptComparisonCached: Bool {
+        MainActor.assumeIsolated { Session.current?.comparisonCached ?? false }
+    }
+
+    @objc var scriptComparisonModel: String {
+        get { MainActor.assumeIsolated { Session.current?.scriptComparisonName ?? "" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let problem = Session.current?.chooseComparison(named: newValue) else { return }
+                NSScriptCommand.current()?.scriptErrorNumber = errAENoSuchObject
+                NSScriptCommand.current()?.scriptErrorString = problem
+            }
+        }
+    }
+
+    /// Turning one source off returns to the upscale only when that source is on screen.
+    @MainActor
+    private static func show(_ source: ScreenSource, _ on: Bool) {
+        guard let session = Session.current else { return }
+        if on {
+            session.showSource(source)
+        } else if session.wantedSource == source {
+            session.showSource(.upscale)
+        }
     }
 
     @objc var scriptFillEnabled: Bool {
@@ -157,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let keys: Set<String> = [
         "scriptFrame", "scriptFrameCount", "scriptPlaying", "scriptShowingOriginal", "scriptFillEnabled",
+        "scriptShowingComparison", "scriptComparisonComputing", "scriptComparisonCached", "scriptComparisonModel",
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
         "scriptCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",

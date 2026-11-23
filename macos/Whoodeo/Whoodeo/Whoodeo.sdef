@@ -36,8 +36,20 @@
             <property name="playing" code="Wply" type="boolean" access="rw" description="Die Wiedergabe läuft.">
                 <cocoa key="scriptPlaying"/>
             </property>
-            <property name="showing original" code="Word" type="boolean" access="rw" description="Das Original statt der Hochskalierung zeigen, wie bei gedrückter Maustaste.">
+            <property name="showing original" code="Word" type="boolean" access="rw" description="Das Original statt der Hochskalierung zeigen, wie bei gedrückter Maustaste ohne Vergleichsmodell.">
                 <cocoa key="scriptShowingOriginal"/>
+            </property>
+            <property name="comparison model" code="Wcmp" type="text" access="rw" description="Das Vergleichsmodell in der Seitenleiste, wie bei model. Ein Klick ins Standbild zeigt dann dessen Hochskalierung statt des Originals. Leer hebt den Vergleich auf. Das Hauptmodell geht nicht.">
+                <cocoa key="scriptComparisonModel"/>
+            </property>
+            <property name="showing comparison" code="Wcon" type="boolean" access="rw" description="Lesen: Das Bild des Vergleichsmodells ist zu sehen. Setzen: wie gedrückte Maustaste mit Vergleichsmodell. Hält die Wiedergabe an; fehlt das Bild im Cache des Vergleichsmodells, wird es gerechnet und dann gezeigt.">
+                <cocoa key="scriptShowingComparison"/>
+            </property>
+            <property name="comparison computing" code="Wcmc" type="boolean" access="r" description="Das Vergleichsmodell lädt oder rechnet gerade ein Bild.">
+                <cocoa key="scriptComparisonComputing"/>
+            </property>
+            <property name="comparison cached" code="Wcmk" type="boolean" access="r" description="Das aktuelle Bild liegt im Cache des Vergleichsmodells.">
+                <cocoa key="scriptComparisonCached"/>
             </property>
             <property name="fill enabled" code="Wfil" type="boolean" access="rw" description="Fehlende Bilder im Hintergrund rechnen und speichern.">
                 <cocoa key="scriptFillEnabled"/>

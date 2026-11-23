@@ -60,6 +60,17 @@ final class Session: ObservableObject {
     @Published var failure: String?
     @Published var library: [LibraryModel] = []
     @Published var selection: URL?
+    /// Sidebar line whose upscale a click into a still shows instead of the original. Never the main model.
+    @Published private(set) var comparison: URL?
+    /// What the mouse button or a script asks for. The upscale when nothing is pressed.
+    @Published private(set) var wantedSource = ScreenSource.upscale
+    /// What the picture shows right now. A comparison frame that is still computing leaves the upscale.
+    @Published private(set) var screenSource = ScreenSource.upscale
+    /// Frame the comparison model is computing, nil when it is idle.
+    @Published private(set) var comparisonComputing: Int?
+    /// The comparison model package is loading.
+    @Published private(set) var comparisonLoading = false
+    @Published private(set) var comparisonError: String?
     @Published var confirmDelete = false
     @Published var deleteName = ""
     @Published var confirmRemove = false
@@ -94,6 +105,14 @@ final class Session: ObservableObject {
     private var store: FrameStore?
     /// The open film's originals for the screen. Nil without a film.
     private var originals: Originals?
+    /// The comparison model's archive for the open film and codec. Opened on first use.
+    private var comparisonStore: FrameStore?
+    private var comparisonOpened = false
+    /// Runs the comparison model, one frame on request. Created on the first missing frame.
+    private var comparisonEngine: Engine?
+    private var comparisonPackage: URL?
+    /// Counts comparison resets. A result from before the last reset is dropped.
+    private var comparisonEpoch = 0
     private var playGeneration = 0
     private var epoch = 0
     private var scrubbing = false
@@ -223,8 +242,52 @@ final class Session: ObservableObject {
     /// Match the sidebar line, for example "Schritt 21250 · flexibel", or a package name.
     /// Returns a message when nothing unique matches.
     func chooseModel(named query: String) -> String? {
+        switch matchModel(query) {
+        case .failure(let problem):
+            return problem.message
+        case .success(let model):
+            selection = model.url
+            openSelection()
+            return nil
+        }
+    }
+
+    /// Sidebar line of the comparison model, empty when there is none.
+    var scriptComparisonName: String {
+        guard let comparison else { return "" }
+        return library.first { $0.url == comparison }?.detail ?? ""
+    }
+
+    /// Short name of the comparison model for the note over the picture, for example "latent_up 12×128 · Schritt 6500".
+    var comparisonLabel: String {
+        guard let comparison, let model = library.first(where: { $0.url == comparison }) else { return "" }
+        let step = model.detail.components(separatedBy: " · ").first ?? model.detail
+        return "\(model.title) · \(step)"
+    }
+
+    /// Like `chooseModel`. An empty name clears the comparison.
+    func chooseComparison(named query: String) -> String? {
+        if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            setComparison(nil)
+            return nil
+        }
+        switch matchModel(query) {
+        case .failure(let problem):
+            return problem.message
+        case .success(let model):
+            guard model.url != selection else { return "Das Hauptmodell kann nicht zugleich Vergleich sein." }
+            setComparison(model.url)
+            return nil
+        }
+    }
+
+    private struct ModelMismatch: Error {
+        let message: String
+    }
+
+    private func matchModel(_ query: String) -> Result<LibraryModel, ModelMismatch> {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "Der Modellname ist leer." }
+        guard !trimmed.isEmpty else { return .failure(ModelMismatch(message: "Der Modellname ist leer.")) }
         func exact(_ model: LibraryModel) -> Bool {
             model.detail.caseInsensitiveCompare(trimmed) == .orderedSame
                 || model.url.lastPathComponent.caseInsensitiveCompare(trimmed) == .orderedSame
@@ -238,12 +301,10 @@ final class Session: ObservableObject {
         }
         guard hits.count == 1, let model = hits.first else {
             let names = (hits.isEmpty ? library : hits).map(\.detail).joined(separator: ", ")
-            if hits.isEmpty { return "Kein Modell „\(trimmed)“. Vorhanden: \(names)" }
-            return "Mehrere Modelle passen auf „\(trimmed)“: \(names)"
+            if hits.isEmpty { return .failure(ModelMismatch(message: "Kein Modell „\(trimmed)“. Vorhanden: \(names)")) }
+            return .failure(ModelMismatch(message: "Mehrere Modelle passen auf „\(trimmed)“: \(names)"))
         }
-        selection = model.url
-        openSelection()
-        return nil
+        return .success(model)
     }
 
     /// Add a film and show it. The same path keeps its id. Nil means it was not added; `failure` says why.
@@ -535,6 +596,7 @@ final class Session: ObservableObject {
     }
 
     func openSelection() {
+        if comparison != nil, comparison == selection { setComparison(nil) }
         guard let selection, let (url, codec) = resolvedPackage() else { return }
         UserDefaults.standard.set(selection.lastPathComponent, forKey: Self.lastModelKey)
         if url == modelURL { return }
@@ -739,18 +801,150 @@ final class Session: ObservableObject {
         }
         scrubbing = false
         scrubTask?.cancel()
+        // The comparison is for stills. Playback starts on the upscale.
+        if wantedSource == .comparison { showSource(.upscale) }
         playing = true
         playGeneration += 1
         Log.play.info("Wiedergabe ab Bild \(self.index + 1, privacy: .public)")
         beginPlayback()
     }
 
-    var showingOriginal: Bool { stage?.screenIfCreated()?.original == true }
+    /// While the mouse button is down. Without a comparison model the original, also during playback.
+    /// With one, the comparison of the still; a click during playback pauses first and stays paused.
+    func showAlternate(_ show: Bool) {
+        showSource(show ? (comparison == nil ? .original : .comparison) : .upscale)
+    }
 
-    /// The original instead of the upscale while the mouse button is down, also during playback.
-    func showOriginal(_ show: Bool) {
-        guard hasPicture, let stage else { return }
-        stage.screen().setOriginal(show)
+    func showSource(_ next: ScreenSource) {
+        wantedSource = next == .comparison && comparison == nil ? .upscale : next
+        if wantedSource == .comparison, playing {
+            finishPlay()
+            Log.play.info("Vergleich hält die Wiedergabe an")
+        }
+        refreshSource()
+    }
+
+    /// Point the screen at the wanted source for the frame it shows.
+    private func refreshSource() {
+        guard hasPicture, let stage, let reel = reel() else { return }
+        let source = screenSource(for: reel)
+        stage.screen().setSource(source, reel: reel)
+        screenSource = source
+    }
+
+    /// The comparison shows only in a still and only once its frame is stored. Until then the upscale
+    /// stays and the comparison model computes the frame.
+    private func screenSource(for reel: Reel) -> ScreenSource {
+        switch wantedSource {
+        case .upscale, .original:
+            return wantedSource
+        case .comparison:
+            guard comparison != nil, !playing else { return .upscale }
+            if reel.comparison?.contains(index) == true { return .comparison }
+            requestComparison(index)
+            return .upscale
+        }
+    }
+
+    /// The option-click and the context menu of a sidebar line.
+    func toggleComparison(_ url: URL) {
+        setComparison(comparison == url ? nil : url)
+    }
+
+    /// The main model cannot be its own comparison. A comparison on screen gives way to the upscale.
+    func setComparison(_ url: URL?) {
+        let next = url == selection ? nil : url
+        guard next != comparison else { return }
+        if wantedSource == .comparison { showSource(.upscale) }
+        comparison = next
+        dropComparison()
+        Log.model.info("Vergleich \(next?.lastPathComponent ?? "-", privacy: .public)")
+    }
+
+    /// Forget the comparison archive and its engine. Frames it stored stay on disk.
+    private func dropComparison() {
+        comparisonEpoch += 1
+        if let engine = comparisonEngine {
+            let store = comparisonStore
+            engine.settle { store?.flush() }
+        }
+        comparisonEngine = nil
+        comparisonStore = nil
+        comparisonPackage = nil
+        comparisonOpened = false
+        comparisonComputing = nil
+        comparisonLoading = false
+        comparisonError = nil
+    }
+
+    /// The package of the comparison line for the codec in force, the same choice the main model follows.
+    private func adoptComparison() {
+        guard !comparisonOpened, let comparison, let facts, let shownFilmID, facts.count > 0,
+              let model = library.first(where: { $0.url == comparison }) else { return }
+        comparisonOpened = true
+        let package = model.package(for: codecChoice.resolve(film: filmCodec)).url
+        guard package != modelURL else { return }
+        do {
+            comparisonStore = try FrameStore.open(filmID: shownFilmID, model: package, count: facts.count)
+            comparisonPackage = package
+        } catch {
+            comparisonError = error.localizedDescription
+            Log.model.error("Vergleichs-Cache: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Compute one frame with the comparison model and store it in its archive. Its own engine loads
+    /// the film and the package on first use, so the main model and its fill keep going.
+    private func requestComparison(_ frame: Int) {
+        guard comparisonComputing != frame, let facts, let shownFilmID,
+              let package = comparisonPackage, let store = comparisonStore else { return }
+        let token = comparisonEpoch
+        let engine: Engine
+        if let comparisonEngine {
+            engine = comparisonEngine
+        } else {
+            engine = Engine()
+            comparisonEngine = engine
+            comparisonLoading = true
+            Log.model.info("Vergleich lädt \(package.lastPathComponent, privacy: .public)")
+            engine.openFilm(facts.url, filmID: shownFilmID) { _ in }
+            engine.openModel(package) { [weak self] result in
+                Task { @MainActor in
+                    guard let self, token == self.comparisonEpoch else { return }
+                    self.comparisonLoading = false
+                    if case .failure(let error) = result {
+                        self.comparisonError = error.localizedDescription
+                        Log.model.error("Vergleichsmodell: \(error.localizedDescription, privacy: .public)")
+                    }
+                }
+            }
+        }
+        comparisonComputing = frame
+        comparisonError = nil
+        engine.request(frame, store: store) { [weak self] result in
+            Task { @MainActor in
+                guard let self, token == self.comparisonEpoch else { return }
+                if self.comparisonComputing == frame { self.comparisonComputing = nil }
+                switch result {
+                case .success(let shown):
+                    if !shown.fromCache {
+                        let timing = String(format: "%.0f ms", shown.milliseconds)
+                        Log.model.info("Vergleich rechnet Bild \(frame + 1, privacy: .public) · \(timing, privacy: .public)")
+                    }
+                    if self.wantedSource == .comparison { self.refreshSource() }
+                case .failure(let error):
+                    if error is CancellationError { return }
+                    self.comparisonError = error.localizedDescription
+                    Log.model.error("Vergleich Bild \(frame + 1, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
+    }
+
+    /// The comparison archive holds the frame under the playhead. For scripts.
+    var comparisonCached: Bool {
+        adoptComparison()
+        return comparisonStore?.contains(index) == true
     }
 
     func markIn() {
@@ -911,6 +1105,7 @@ final class Session: ObservableObject {
             }
         }
         if let modelURL, !urls.contains(modelURL) { clearModel() }
+        if let comparison, !library.contains(where: { $0.url == comparison }) { setComparison(nil) }
         if selection != nil, modelURL != nil, !loadingModel {
             // A codec package that just arrived replaces the fallback.
             syncCodecPackage()
@@ -941,6 +1136,7 @@ final class Session: ObservableObject {
     /// Publish the open index before the process exits. Dropping the archive publishes as well.
     func flushStore() {
         store?.flush()
+        comparisonStore?.flush()
     }
 
     /// Drop the pictures on screen. The archive on disk stays with its model.
@@ -952,6 +1148,7 @@ final class Session: ObservableObject {
         filling = nil
         resetFillHolds()
         store = nil
+        dropComparison()
         hasPicture = false
         milliseconds = nil
         coverage = Coverage(count: frameCount)
@@ -1020,7 +1217,7 @@ final class Session: ObservableObject {
         showCurrent()
     }
 
-    /// Playback hands ProRes samples, or the originals while the mouse is down, to the system video display.
+    /// Playback hands ProRes samples, or the originals or the comparison while the mouse is down, to the system video display.
     private func beginPlayback() {
         adoptStore()
         guard pixelWidth > 0, let stage, let reel = reel() else {
@@ -1139,13 +1336,16 @@ final class Session: ObservableObject {
 
     private func showStill() {
         guard hasPicture, let stage, let reel = reel() else { return }
-        stage.screen().show(index, reel: reel)
+        let source = screenSource(for: reel)
+        stage.screen().show(index, reel: reel, source: source)
+        screenSource = source
     }
 
     /// What the screen may show for the open film and model.
     private func reel() -> Reel? {
         guard let store, let facts else { return nil }
-        return Reel(store: store, originals: originals, fps: max(facts.fps, 1), count: frameCount)
+        adoptComparison()
+        return Reel(store: store, originals: originals, comparison: comparisonStore, fps: max(facts.fps, 1), count: frameCount)
     }
 
     private func resetFillHolds() {

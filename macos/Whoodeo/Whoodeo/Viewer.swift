@@ -3,7 +3,7 @@ import os
 import SwiftUI
 
 /// Holds the picture. Its frame is the picture. The video layer inside shows every frame,
-/// still or playing, upscale or original. The layer does not take clicks; this view does.
+/// still or playing, upscale, original or comparison. The layer does not take clicks; this view does.
 final class PictureView: NSView {
     var sharp = false {
         didSet {
@@ -73,7 +73,17 @@ final class PictureStage: NSView {
     var onZoom: ((Bool, CGFloat) -> Void)?
     var onFilm: ((URL) -> Void)?
     var onHover: ((Bool) -> Void)?
-    var onOriginal: ((Bool) -> Void)?
+    var onAlternate: ((Bool) -> Void)?
+    /// A short note over the picture, top left in the free area. Nil hides it.
+    var badge: String? {
+        didSet {
+            guard badge != oldValue else { return }
+            badgeLabel.stringValue = badge ?? ""
+            badgeLabel.isHidden = badge == nil
+            placeBadge()
+        }
+    }
+    private let badgeLabel = BadgeLabel()
 
     func screen() -> FrameScreen { picture.screen() }
 
@@ -98,6 +108,7 @@ final class PictureStage: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         addSubview(picture)
+        addSubview(badgeLabel)
         picture.stage = self
         registerForDraggedTypes(FilmDrop.pasteboardTypes)
     }
@@ -105,6 +116,7 @@ final class PictureStage: NSView {
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         addSubview(picture)
+        addSubview(badgeLabel)
         picture.stage = self
         registerForDraggedTypes(FilmDrop.pasteboardTypes)
     }
@@ -129,6 +141,16 @@ final class PictureStage: NSView {
         super.layout()
         liftSidebar()
         layoutPicture(recenter: false)
+        placeBadge()
+    }
+
+    /// The stage reaches under the sidebar and the bars, so SwiftUI overlays end up beneath the picture.
+    /// The note is a subview above it instead.
+    private func placeBadge() {
+        guard !badgeLabel.isHidden else { return }
+        let size = badgeLabel.fittingSize
+        let safe = safeRect()
+        badgeLabel.frame = CGRect(x: safe.minX + 10, y: safe.minY + 10, width: size.width + 16, height: size.height + 6)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -158,7 +180,7 @@ final class PictureStage: NSView {
         var showing = false
         if !movable.horizontal && !movable.vertical {
             showing = true
-            showOriginal(true)
+            showAlternate(true)
         }
 
         while true {
@@ -171,7 +193,7 @@ final class PictureStage: NSView {
             ) else {
                 if !panning && !showing {
                     showing = true
-                    showOriginal(true)
+                    showAlternate(true)
                 }
                 continue
             }
@@ -182,7 +204,7 @@ final class PictureStage: NSView {
             )
             if distance > 4, movable.horizontal || movable.vertical {
                 if showing {
-                    showOriginal(false)
+                    showAlternate(false)
                     showing = false
                 }
                 if !panning {
@@ -197,7 +219,7 @@ final class PictureStage: NSView {
                 place(origin)
             }
         }
-        if showing { showOriginal(false) }
+        if showing { showAlternate(false) }
         if panning { NSCursor.openHand.set() }
     }
 
@@ -338,8 +360,8 @@ final class PictureStage: NSView {
         onZoom?(false, next)
     }
 
-    private func showOriginal(_ show: Bool) {
-        onOriginal?(show)
+    private func showAlternate(_ show: Bool) {
+        onAlternate?(show)
     }
 
     private func pictureSize(in safe: CGRect) -> CGSize {
@@ -473,6 +495,30 @@ final class PictureStage: NSView {
     }
 }
 
+/// Small rounded note. It never takes clicks; the picture underneath does.
+private final class BadgeLabel: NSTextField {
+    init() {
+        super.init(frame: .zero)
+        isEditable = false
+        isSelectable = false
+        isBordered = false
+        drawsBackground = false
+        alignment = .center
+        font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        textColor = .labelColor
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.85).cgColor
+        layer?.cornerRadius = 8
+        isHidden = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+    }
+
+    override func hitTest(_: NSPoint) -> NSView? { nil }
+}
+
 private struct Axis {
     var low: CGFloat
     var high: CGFloat
@@ -491,7 +537,8 @@ struct Viewer: NSViewRepresentable {
     var onFilm: (URL) -> Void
     var onHover: (Bool) -> Void
     var onZoom: (Bool, CGFloat) -> Void
-    var onOriginal: (Bool) -> Void
+    var badge: String?
+    var onAlternate: (Bool) -> Void
     var onStage: (PictureStage) -> Void
 
     func makeNSView(context: Context) -> PictureStage {
@@ -502,7 +549,8 @@ struct Viewer: NSViewRepresentable {
         stage.onFilm = onFilm
         stage.onHover = onHover
         stage.onZoom = onZoom
-        stage.onOriginal = onOriginal
+        stage.onAlternate = onAlternate
+        stage.badge = badge
         let sameZoom = stage.zoomToFit == zoomToFit && abs(stage.magnification - magnification) < 0.0001
         let samePixels = stage.pixelWidth == pixelWidth && stage.pixelHeight == pixelHeight
         let sameInsets = stage.fallbackTop == fallbackTop

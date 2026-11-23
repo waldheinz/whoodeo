@@ -54,14 +54,22 @@ struct ContentView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            List(selection: $session.selection) {
+            List(selection: modelSelection) {
                 ForEach(session.library) { model in
                     Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(model.title)
-                            Text(model.detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.title)
+                                Text(model.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            if session.comparison == model.url {
+                                Spacer()
+                                Image(systemName: "rectangle.split.2x1")
+                                    .foregroundStyle(.secondary)
+                                    .help("Vergleichsmodell: Ein Klick ins Bild zeigt dieses Modell.")
+                            }
                         }
                     } icon: {
                         Image(systemName: model.symbol)
@@ -69,6 +77,10 @@ struct ContentView: View {
                     }
                     .tag(model.url)
                     .contextMenu {
+                        Button(session.comparison == model.url ? "Vergleich aufheben" : "Zum Vergleich") {
+                            session.toggleComparison(model.url)
+                        }
+                        .disabled(model.url == session.selection)
                         Button("In den Papierkorb legen", role: .destructive) {
                             session.askDelete(model.url)
                         }
@@ -101,6 +113,20 @@ struct ContentView: View {
                 .disabled(session.selection == nil)
             }
         }
+    }
+
+    /// A click picks the main model. An option-click marks a comparison model, and a second one clears it.
+    private var modelSelection: Binding<URL?> {
+        Binding(
+            get: { session.selection },
+            set: { next in
+                if NSEvent.modifierFlags.contains(.option), let next {
+                    if next != session.selection { session.toggleComparison(next) }
+                } else {
+                    session.selection = next
+                }
+            }
+        )
     }
 
     private var filmsList: some View {
@@ -152,6 +178,16 @@ struct ContentView: View {
         }
     }
 
+    /// While the comparison is asked for: which model, or what keeps it from the screen.
+    private var comparisonBadge: String? {
+        guard session.wantedSource == .comparison else { return nil }
+        let name = session.comparisonLabel
+        if let error = session.comparisonError { return "Vergleich \(name): \(error)" }
+        if session.screenSource == .comparison { return "Vergleich: \(name)" }
+        if session.comparisonLoading { return "Vergleich \(name): Modell lädt …" }
+        return "Vergleich \(name): rechnet Bild …"
+    }
+
     private var detail: some View {
         GeometryReader { geo in
             let insets = geo.safeAreaInsets
@@ -172,7 +208,8 @@ struct ContentView: View {
                         onZoom: { fits, factor in
                             session.noteZoom(fits: fits, magnification: factor)
                         },
-                        onOriginal: { session.showOriginal($0) },
+                        badge: comparisonBadge,
+                        onAlternate: { session.showAlternate($0) },
                         onStage: { session.attachStage($0) }
                     )
                 } else if session.loadingModel || (session.busy && !session.hasPicture) {

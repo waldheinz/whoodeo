@@ -3,26 +3,43 @@ import AVFoundation
 import CoreMedia
 import os
 
-/// What the screen can show for one film: the stored upscale or the decoded original, timed on the film clock.
+/// Which picture the screen shows: the upscale, the original, or the upscale of the comparison model.
+nonisolated enum ScreenSource: Sendable {
+    case upscale, original, comparison
+}
+
+/// What the screen can show for one film, timed on the film clock: the stored upscale, the decoded
+/// original, and the stored upscale of a comparison model.
 nonisolated struct Reel: Sendable {
     let store: FrameStore
     let originals: Originals?
+    /// The archive of the comparison model. The session computes a missing frame into it before showing it.
+    let comparison: FrameStore?
     let fps: Double
     let count: Int
 
-    func has(_ frame: Int, original: Bool) -> Bool {
+    func has(_ frame: Int, source: ScreenSource) -> Bool {
         guard frame >= 0, frame < count else { return false }
-        return original ? originals != nil : store.contains(frame)
+        switch source {
+        case .upscale: return store.contains(frame)
+        case .original: return originals != nil
+        case .comparison: return comparison?.contains(frame) == true
+        }
     }
 
-    func sample(_ frame: Int, original: Bool) throws -> CMSampleBuffer {
+    func sample(_ frame: Int, source: ScreenSource) throws -> CMSampleBuffer {
         let time = Self.time(frame, fps: fps)
         let duration = Self.time(1, fps: fps)
-        if original {
+        switch source {
+        case .original:
             guard let originals else { throw CLIError("Original fehlt") }
             return try originals.sample(at: frame, time: time, duration: duration)
+        case .comparison:
+            guard let comparison else { throw CLIError("Vergleichsmodell fehlt") }
+            return try comparison.sample(at: frame, time: time, duration: duration)
+        case .upscale:
+            return try store.sample(at: frame, time: time, duration: duration)
         }
-        return try store.sample(at: frame, time: time, duration: duration)
     }
 
     static func time(_ frame: Int, fps: Double) -> CMTime {
@@ -80,8 +97,8 @@ nonisolated final class Originals: @unchecked Sendable {
 
 /// The only way the picture reaches the screen. Stills and playback both go through the system
 /// video display: a still is one sample, playback a stream on a clock. The layer decodes ProRes
-/// and scales the picture. It shows one source at a time, the upscale or the original; switching
-/// flushes and feeds the other source from the frame on screen.
+/// and scales the picture. It shows one source at a time, the upscale, the original or the comparison;
+/// switching flushes and feeds the other source from the frame on screen.
 /// The clock waits until the renderer has decoded a cushion. A realtime clock that starts
 /// earlier drops frames that are already late and still advances at the film's speed.
 @MainActor
@@ -106,8 +123,8 @@ final class FrameScreen {
     private var onEvent: ((Event) -> Void)?
     private var playing = false
     private var reel: Reel?
-    /// The original instead of the upscale, while the mouse button is down.
-    private(set) var original = false
+    /// The original or the comparison instead of the upscale, while the mouse button is down.
+    private(set) var source = ScreenSource.upscale
     /// The still on screen, or where playback started.
     private var frame = 0
     private var clockStarted = false
@@ -173,33 +190,36 @@ final class FrameScreen {
         display.minificationFilter = filter
     }
 
-    /// Switch between upscale and original at the frame on screen. Playback keeps running.
-    func setOriginal(_ on: Bool) {
-        guard on != original else { return }
-        original = on
-        guard let reel else { return }
+    /// Switch the source at the frame on screen. Playback keeps running.
+    /// `reel` is the current one; the comparison may have been chosen after this picture went up.
+    func setSource(_ next: ScreenSource, reel current: Reel) {
+        guard next != source else { return }
+        source = next
+        guard reel != nil else { return }
+        reel = current
         if playing {
             start(at: currentFrame(), keepPicture: true)
         } else {
-            show(frame, reel: reel)
+            show(frame, reel: current)
         }
     }
 
-    /// One frame as a still. A frame the source does not have leaves the picture as it is.
-    func show(_ index: Int, reel: Reel) {
+    /// One frame as a still, from `source` when given. A frame the source does not have leaves the picture as it is.
+    func show(_ index: Int, reel: Reel, source next: ScreenSource? = nil) {
+        if let next { source = next }
         shutdownFeed()
         self.reel = reel
         fps = max(reel.fps, 1)
         count = reel.count
         frame = index
-        guard reel.has(index, original: original), let receiver else { return }
+        guard reel.has(index, source: source), let receiver else { return }
         let token = invalidate()
-        let original = original
+        let source = source
         synchronizer.setRate(0, time: Reel.time(index, fps: fps))
         let previous = feed
         feed = Task.detached {
             await previous?.value
-            guard let sample = try? reel.sample(index, original: original) else { return }
+            guard let sample = try? reel.sample(index, source: source) else { return }
             Self.displayImmediately(sample)
             await receiver.flush(removingDisplayedImage: false)
             guard self.tokenMatches(token) else { return }
@@ -273,7 +293,7 @@ final class FrameScreen {
             state.wake = true
             state.signaled = false
         }
-        let original = original
+        let source = source
         let previous = feed
         feed = Task { @MainActor in
             await previous?.value
@@ -283,7 +303,7 @@ final class FrameScreen {
             self.installObserver()
             let screen = self
             self.feed = Task.detached {
-                await screen.read(token: token, receiver: receiver, reel: reel, original: original, from: index)
+                await screen.read(token: token, receiver: receiver, reel: reel, source: source, from: index)
             }
         }
     }
@@ -328,12 +348,12 @@ final class FrameScreen {
     }
 
     private func thin(_ next: Int) -> Bool {
-        next >= count || reel?.has(next, original: original) != true
+        next >= count || reel?.has(next, source: source) != true
     }
 
     /// Wait for decoded ProRes before the clock runs. Originals arrive decoded already.
     private func preroll(_ next: Int) -> Bool {
-        !original && !thin(next)
+        source != .original && !thin(next)
     }
 
     private func startClock() {
@@ -395,7 +415,7 @@ final class FrameScreen {
         let cushion = next - startIndex
         let blocked = thin(next)
         // The renderer queues only a few decoded originals, fewer than the ProRes cushion.
-        let wanted = original ? 2 : 8
+        let wanted = source == .original ? 2 : 8
         if !clockStarted, cushion >= wanted || (blocked && cushion >= 1) {
             startClock()
         } else if holding, next > lastShown {
@@ -423,7 +443,7 @@ final class FrameScreen {
         token: Int,
         receiver: AVSampleBufferVideoRenderer.Receiver,
         reel: Reel,
-        original: Bool,
+        source: ScreenSource,
         from start: Int
     ) async {
         var cursor = start
@@ -431,7 +451,7 @@ final class FrameScreen {
         while !Task.isCancelled {
             if !tokenMatches(token) { return }
             if cursor >= reel.count { return }
-            if !reel.has(cursor, original: original) {
+            if !reel.has(cursor, source: source) {
                 let missing = cursor
                 await MainActor.run {
                     guard tokenMatches(token) else { return }
@@ -441,7 +461,7 @@ final class FrameScreen {
                 continue
             }
             do {
-                let sample = try reel.sample(cursor, original: original)
+                let sample = try reel.sample(cursor, source: source)
                 let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample)
                 let result = try await receiver.enqueue(ready)
                 switch result {
