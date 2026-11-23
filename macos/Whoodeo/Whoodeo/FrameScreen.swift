@@ -36,26 +36,27 @@ nonisolated final class Originals: @unchecked Sendable {
     private let url: URL
     private let lock = NSLock()
     private var film: Film?
-    private var transfer: ColorTransfer?
 
     init(url: URL) {
         self.url = url
     }
 
-    /// One original frame, through the same color conversion as the cache. The layer scales it.
+    /// One original frame as 16-bit RGB, tagged BT.709 like the cache. The layer scales it.
+    /// The color profile matters: without it the layer renders 709 darker than the ProRes upscales,
+    /// whose decoder attaches the same profile.
     func sample(at index: Int, time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
         lock.lock()
         defer { lock.unlock() }
         if film == nil { film = try Film.open(url) }
-        if transfer == nil { transfer = try ColorTransfer() }
         let decoded = try film!.decode(at: index)
-        let buffer = try transfer!.convert(
-            decoded.rgb,
-            width: decoded.width,
-            height: decoded.height,
-            format: kCVPixelFormatType_4444AYpCbCr16,
-            pool: nil
-        )
+        let buffer = try Pixels.rgba16(decoded.rgb, width: decoded.width, height: decoded.height)
+        CVBufferRemoveAllAttachments(buffer)
+        CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        if let tags = CVBufferCopyAttachments(buffer, .shouldPropagate),
+           let space = CVImageBufferCreateColorSpaceFromAttachments(tags)?.takeRetainedValue() {
+            CVBufferSetAttachment(buffer, kCVImageBufferCGColorSpaceKey, space, .shouldPropagate)
+        }
         var format: CMVideoFormatDescription?
         var status = CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
