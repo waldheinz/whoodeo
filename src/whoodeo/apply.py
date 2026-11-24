@@ -70,6 +70,11 @@ def load_checkpoint(path, device, vae=None, codec=None):
         if spec.architecture.get("condition") is not None:
             print(f"codec {codec or 'unknown'}", flush=True)
         reference = LatentUpReference(model, vae_model, codec).eval()
+        from whoodeo.spynet import AlignedReference, detect_align, load_spynet
+        method, weights = detect_align(spec.path)
+        if method == "spynet":
+            print(f"align spynet  weights {weights}  frozen", flush=True)
+            reference = AlignedReference(reference, load_spynet(weights, device), model.in_frames).eval()
         return reference, f"{label} + {vae_label} decoder", model.in_frames, step, spec.path
     if vae is not None:
         raise SystemExit("--vae is for a latent_up checkpoint")
@@ -137,6 +142,9 @@ class CoreMLModel:
             f"{package.name}  {self.arch or 'model'}  step {self.step}  unit {unit}  "
             f"conv scale {meta.get('whoodeo.conv_scale', '?')}"
         )
+        if meta.get("whoodeo.align"):
+            print(f"align {meta['whoodeo.align']}  host pre-step, as in training", flush=True)
+            self.label += f"  align {meta['whoodeo.align']}"
         self.condition = None
         if "condition" in inputs:
             from whoodeo.models.latent_up import CONDITIONS, condition_vector
@@ -153,6 +161,14 @@ class CoreMLModel:
             compute_units=units[unit],
             optimization_hints={"reshapeFrequency": ct.ReshapeFrequency.Infrequent},
         )
+        self.aligner = None
+        if meta.get("whoodeo.align") == "spynet":
+            from whoodeo.spynet import load_spynet, resolve_align_weights
+            packaged = package / "spynet" / "weights.pth"
+            weights = packaged if packaged.is_file() else resolve_align_weights("spynet_20210409-c6c1bd09.pth")
+            if weights is None or not Path(weights).is_file():
+                raise SystemExit(f"{package}: align is spynet, but the official SPyNet weights were not found")
+            self.aligner = load_spynet(weights, "cpu")
 
     def check_size(self, height, width):
         """The padded size, or SystemExit with what the package takes."""
@@ -178,7 +194,12 @@ class CoreMLModel:
 
         height, width = frames.shape[-2:]
         self.check_size(height, width)
-        padded, _h, _w = pad_to(frames.float().cpu(), self.pad) if self.pad > 1 else (frames, height, width)
+        frames = frames.float().cpu()
+        if self.aligner is not None:
+            from whoodeo.spynet import align_neighbors
+            with torch.no_grad():
+                frames = align_neighbors(self.aligner, frames, self.in_frames)
+        padded, _h, _w = pad_to(frames, self.pad) if self.pad > 1 else (frames, height, width)
         batch = padded.numpy().astype(self.dtype, copy=False)
         feed = {"frames": batch}
         if self.condition is not None:

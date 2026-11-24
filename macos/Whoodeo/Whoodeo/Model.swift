@@ -31,6 +31,10 @@ nonisolated struct PackageInfo {
     var conditionSize: Int = 0
     /// Name of the condition input, nil when the package has none.
     var conditionName: String? = nil
+    /// Neighbor alignment, "spynet" when the previous and next lows are warped first.
+    var align: String? = nil
+    /// An MLX `.mlxmodel` folder instead of a Core ML package.
+    var mlx: Bool = false
 
     var takesCondition: Bool { conditionSize > 0 && conditionName != nil }
 
@@ -39,6 +43,7 @@ nonisolated struct PackageInfo {
         if let stem { parts.append("stem \(stem)") }
         if let vote { parts.append("vote \(vote)") }
         if let step { parts.append("Schritt \(step)") }
+        if mlx { parts.append("MLX") }
         return parts.joined(separator: " ")
     }
 
@@ -109,7 +114,11 @@ nonisolated struct PackageInfo {
             pad: max(Int(meta["whoodeo.pad"] ?? "") ?? 1, 1),
             inputType: inputType == .float16 ? .float16 : .float32,
             conditionSize: conditionSize,
-            conditionName: conditionName
+            conditionName: conditionName,
+            align: {
+                let value = meta["whoodeo.align"] ?? ""
+                return value.isEmpty ? nil : value
+            }()
         )
     }
 }
@@ -123,14 +132,39 @@ nonisolated struct Prediction {
 
 nonisolated final class Predictor {
     let info: PackageInfo
-    let model: MLModel
+    /// The Core ML model, nil for an MLX model.
+    let model: MLModel?
+    /// The MLX align model (`.mlxmodel`), nil for a Core ML package.
+    private let mlx: MLXAlignModel?
     private var inputArray: MLMultiArray?
     private var conditionArray: MLMultiArray?
     /// Condition vector fed to a `-cond` package, nil when the package has no such input.
     private(set) var condition: [Float]?
+    /// Frozen SPyNet, nil when the package has no neighbor alignment.
+    private let aligner: SpyNetAligner?
 
     /// The app runs every package on the GPU.
     init(url: URL) throws {
+        if url.pathExtension == MLXAlignModel.fileExtension {
+            let loaded = try MLXAlignModel(url: url)
+            let c = loaded.config
+            mlx = loaded
+            model = nil
+            aligner = nil
+            info = PackageInfo(
+                arch: "latent_up", blocks: c.blocks, channels: c.block_widths.first ?? 0,
+                stem: nil, vote: nil, resScale: "", step: c.step, inFrames: c.in_frames, scale: 2,
+                widthMin: 4, widthMax: 8192, heightMin: 4, heightMax: 8192,
+                inputName: "frames", outputName: "image",
+                conditionSize: c.condition_size, conditionName: c.condition_size > 0 ? "condition" : nil,
+                align: c.align ?? "spynet", mlx: true
+            )
+            if info.takesCondition {
+                setCondition(.unknown)
+            }
+            return
+        }
+        mlx = nil
         let config = MLModelConfiguration()
         config.computeUnits = .cpuAndGPU
         var hints = MLOptimizationHints()
@@ -140,8 +174,14 @@ nonisolated final class Predictor {
         config.optimizationHints = hints
         // An mlpackage is not a compiled model. macOS does not compile it on load.
         let compiled = url.pathExtension == "mlmodelc" ? url : try MLModel.compileModel(at: url)
-        model = try MLModel(contentsOf: compiled, configuration: config)
-        info = try PackageInfo.read(model)
+        let loaded = try MLModel(contentsOf: compiled, configuration: config)
+        model = loaded
+        info = try PackageInfo.read(loaded)
+        if info.align == "spynet" {
+            aligner = try SpyNetAligner(url: url)
+        } else {
+            aligner = nil
+        }
         if info.takesCondition {
             setCondition(.unknown)
         }
@@ -164,10 +204,25 @@ nonisolated final class Predictor {
         guard stack.count == count else {
             throw CLIError("Stapel hat \(stack.count) Werte, erwartet \(count)")
         }
+        let started = CFAbsoluteTimeGetCurrent()
+        if let mlx {
+            // Padding, alignment, and the crop happen inside the MLX graph.
+            let values = condition ?? [Float](repeating: 0, count: info.conditionSize)
+            let image = mlx.predict(stack: stack, width: width, height: height, condition: values)
+            return Prediction(
+                image: image, width: 2 * width, height: 2 * height,
+                milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000
+            )
+        }
+        guard let model else { throw CLIError("kein Modell geladen") }
+        var source = stack
+        if let aligner {
+            source = try aligner.align(stack: source, width: width, height: height)
+        }
         let size = info.padded(width: width, height: height)
         let input = size.width == width && size.height == height
-            ? stack
-            : Self.pad(stack, channels: channels, width: width, height: height, to: size)
+            ? source
+            : Self.pad(source, channels: channels, width: width, height: height, to: size)
         let array = try inputBuffer(channels: channels, height: size.height, width: size.width)
         if array.dataType == .float16 {
             Self.write16(input, into: array)
@@ -185,7 +240,6 @@ nonisolated final class Predictor {
             features[name] = MLFeatureValue(multiArray: try conditionBuffer(values))
         }
         let provider = try MLDictionaryFeatureProvider(dictionary: features)
-        let started = CFAbsoluteTimeGetCurrent()
         let result = try model.prediction(from: provider)
         let milliseconds = (CFAbsoluteTimeGetCurrent() - started) * 1000
         guard let output = result.featureValue(for: info.outputName)?.multiArrayValue else {

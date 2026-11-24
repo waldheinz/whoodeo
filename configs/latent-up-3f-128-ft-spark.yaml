@@ -1,0 +1,121 @@
+# Fine-tune of the width-128 3-frame run train-20261122-165032 on spark-03
+# onto the current training data, 23.11.2026. Same recipe (width 128, vae2
+# 044750 of train-20261119-180935, val_every 500, plateau, loss, faces,
+# FiLM, in_frames 3, seed 42, ema 0.999), no alignment. Start with --model
+# from a finished checkpoint (weights and the EMA average in model.pt). A
+# new optimizer and a fresh plateau; the learning rate starts at lr. The
+# step counter starts at 0. 044750 is still the newest finished vae2, so
+# latent shift and scale stay those of that checkpoint.
+#
+#   whoodeo-train configs/latent-up-3f-128-ft-spark.yaml \
+#     --model /mnt/home-storinator-trem/whoodeo/runs/train-20261122-165032/checkpoints/011500
+#
+# Data: x264-crf18/20/22/24 and mpeg4-q04/q06/q08, no x264-crf26. make_low
+# writes into *.partial.mkv and only renames the file when it is complete,
+# so in-progress transcodes are not read. The previous 128er trained on
+# x264-crf20/22/24/26 and mpeg4-q08.
+#
+# This is the official successor of the 128er. spark-03 has no
+# publish_latest key, so the run publishes runs/latest like the old 128er.
+# The first checkpoint is step 0, the loaded 011500 weights.
+
+model:
+  arch: latent_up
+  # The final checkpoint of the vae2 run (stopped at min_lr, 22.11.2026).
+  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261119-180935/checkpoints/044750
+  latent: 16                # the vae2's channels (16 since vae2d)
+  channels: 128             # low resolution; 256 at 1/2, 512 at 1/4
+  widths: [1, 2, 4]         # multiples of channels: low, 1/2, 1/4
+  encoder_blocks: [2, 4]    # residual blocks at low and at 1/2
+  blocks: 12                # residual blocks at 1/4, dilations 1, 2, 4 in turn
+  # relu instead of silu, for the Neural Engine (see vae2e-spark.yaml). The
+  # vae2 above is relu too, so the whole Core ML program is relu.
+  activation: relu
+  # FiLM on the codec: h264, mpeg4, mpeg2 one-hot (unknown is all 0) + 8
+  # reserve slots at 0. Without it the network is latent-up-spark.yaml's.
+  condition: codec
+  # Previous, middle, next low frame; the clip's edges repeat the middle one.
+  in_frames: 3
+
+# Current training mix, same as the align run on spark-04: x264 crf18-24
+# and mpeg4 q04/q06/q08. crf26 is left out. The regex is searched against
+# each path relative to low/ (training and val).
+variants: "^(x264-crf(18|20|22|24)|mpeg4-q0[468])/"
+
+# Share of training frames whose codec is set to unknown (all 0), so the
+# model also works without metadata. Drawn on its own generator: the batches
+# are those of seed 42 without a condition. Validation passes the true codec
+# and logs val/psnr_unknown beside it.
+codec_unknown: 0.2
+
+# Chance per neighbor and training frame that it is swapped for the middle
+# frame of another frame of the batch (same size, mostly another film), a
+# stand-in for a scene cut, so the network learns to ignore an unrelated
+# neighbor. About 19% of the frames get at least one. Own generator: the
+# batches are those of seed 42. Validation reads the true neighbors.
+scene_cut: 0.1
+
+# Moving average of the weights after each step (see whoodeo/ema.py), about
+# the last 1000 steps. Validation, its images, and model.pt use it; train.pt
+# keeps the trained weights for --resume.
+ema: 0.999
+
+# Copy the vae2's 6 latent blocks into the last 6 blocks at 1/4 and its head
+# (shift and scale folded in). Fresh runs only. Off, as in latent-up-spark.yaml.
+init_from_vae: false
+
+batch: 8          # batch 6 used about 70 of 121 GB (6.5 s/step at 640x360)
+lr: 1.0e-4
+schedule:
+  kind: plateau
+  patience: 8
+  factor: 0.5
+  min_delta: 0.01
+  min_lr: 1.0e-6
+holdout: 0.1
+val_every: 500
+val_count: 96
+seed: 42
+# The loss is the sum of weight x raw. latent, L1 on the normalized code, is
+# the main term. The image terms are the vae2g recipe as it is, without a
+# factor: oklab 4.5 (channels 1/1/1), ms_ssim 1, vgg relu2_2 0.230 / relu3_4
+# 0.155, the weights vae2f/vae2g were calibrated with on vae2d (32 val
+# frames, 21.10.2026: oklab + ms_ssim about 23% beside VGG, the share pixel 1
+# + color 5.5 had), so the balance among them is the one this decoder was
+# trained under. See configs/vae2g-spark.yaml.
+#
+# Before: pixel 0.75 (l1), vgg relu2_2 0.1725 / relu3_4 0.11625, color 4.125
+# (oklab, pool 16), that is the vae2d recipe (pixel 1, vgg 0.230 / 0.155,
+# color 5.5) times 0.75. Measured on a 200-step trial with the full vae2d
+# weights (96 val frames): at step 0 the image part was 0.60 against latent
+# 0.74 (an untrained decode), at step 100 0.26 against 0.59, at step 200 0.22
+# against 0.52, about 42%, vgg 0.15 of it and barely moving. Times 0.75 was
+# about 1/3 of the latent term over the first few hundred steps. Here the
+# image terms are at full weight; vgg has a floor at the vae2g roundtrip, so
+# as the latent L1 falls the image part will gain share; lower these if it
+# starts to dominate.
+loss:
+  terms:
+    - name: latent       # L1 on the normalized code against the vae2g code of the master, face-weighted
+      weight: 1.0
+    - name: oklab        # L1 on Oklab at full resolution, replaces pixel (0.75) and color (4.125)
+      weight: 4.5          # vae2g: 1/1/1, raw 0.00313 on vae2d, 4.5 keeps ~23% beside VGG
+      channels: [1.0, 1.0, 1.0]   # L, a, b: no extra chroma weight, as in vae2g
+    - name: ms_ssim      # 1 - MS-SSIM on Oklab L, 5 scales, as in vae2g
+      weight: 1.0
+      scales: 5
+    - name: vgg          # the vae2g weights; before 0.1725 / 0.11625 (x 0.75)
+      layers:
+        relu2_2: 0.230
+        relu3_4: 0.155
+
+# Face weighting, the vae2g values. YuNet runs on the master of each pair in
+# the loader thread (validation: main thread). oklab, ms_ssim, and vgg take
+# the weight map of the master (mean 1 per frame), the latent L1 the same map
+# area-pooled by 8 onto the latent grid, again mean 1 per frame. Not part of
+# the loss recipe: a resume may change it, weight 1 is off.
+faces:
+  weight: 3.0      # inside a face, before the mean-1 normalisation per frame
+  score: 0.6       # YuNet threshold; a missed face only means weight 1 there
+  expand: 1.2      # each box grows by this about its center
+  feather: 0.1     # Gaussian edge, sigma as a share of the grown box's shorter side

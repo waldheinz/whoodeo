@@ -1,0 +1,78 @@
+# latent-up-3f-128 with frozen SPyNet neighbor alignment, spark-04, 23.11.2026.
+# Same recipe as train-20261122-165032 on spark-03 (width 128, vae2 044750,
+# val_every 500, plateau, loss, faces, FiLM, in_frames 3, seed 42), started
+# fresh (no --model). Before the generator, SPyNet warps the previous and
+# next low frame onto the middle low frame. SPyNet stays frozen. The
+# generator itself is unchanged, including the codec FiLM.
+#
+#   whoodeo-train configs/latent-up-3f-128-align-spark.yaml
+#
+# Data differs from the 128er: x264-crf26 is left out, and every finished
+# low that is already on disk is used (x264-crf18/20/22/24 and mpeg4-q04/
+# q06/q08). make_low writes into *.partial.mkv and only renames the file
+# when it is complete, so in-progress transcodes are not read. The 128er
+# trained on x264-crf20/22/24/26 and mpeg4-q08.
+#
+# The global runs/latest is left on the 128er. This run still has its own
+# latest inside its run directory.
+#
+# Reference: the 128er at the same step count. Do not touch spark-03.
+
+model:
+  arch: latent_up
+  vae: /mnt/home-storinator-trem/whoodeo/runs/train-20261119-180935/checkpoints/044750
+  latent: 16
+  channels: 128
+  widths: [1, 2, 4]
+  encoder_blocks: [2, 4]
+  blocks: 12
+  activation: relu
+  condition: codec
+  in_frames: 3
+
+variants: "^(x264-crf(18|20|22|24)|mpeg4-q0[468])/"
+
+# Frozen SPyNet, official BasicVSR weights (also inside FTVSR_REDS.pth).
+align: spynet
+align_weights: /home/trem/ftvsr/weights/spynet_20210409-c6c1bd09.pth
+
+# Do not retarget the global runs/latest; the 128er on spark-03 owns it.
+publish_latest: false
+
+codec_unknown: 0.2
+scene_cut: 0.1
+ema: 0.999
+init_from_vae: false
+
+batch: 8
+lr: 1.0e-4
+schedule:
+  kind: plateau
+  patience: 8
+  factor: 0.5
+  min_delta: 0.01
+  min_lr: 1.0e-6
+holdout: 0.1
+val_every: 500
+val_count: 96
+seed: 42
+loss:
+  terms:
+    - name: latent
+      weight: 1.0
+    - name: oklab
+      weight: 4.5
+      channels: [1.0, 1.0, 1.0]
+    - name: ms_ssim
+      weight: 1.0
+      scales: 5
+    - name: vgg
+      layers:
+        relu2_2: 0.230
+        relu3_4: 0.155
+
+faces:
+  weight: 3.0
+  score: 0.6
+  expand: 1.2
+  feather: 0.1

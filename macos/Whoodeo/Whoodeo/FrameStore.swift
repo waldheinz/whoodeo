@@ -149,6 +149,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
     static let unitSuffix = "gpu"
 
     /// Folder name of a model's archive, optionally plus the condition of a `-cond` package.
+    /// The digest is of this package's path and weight.bin, so an align package
+    /// does not share a cache with a model that has no alignment.
     static func folderName(model: URL, condition: String? = nil) -> String {
         var name = "\(digest(identity(model)))-\(unitSuffix)"
         if let condition, !condition.isEmpty {
@@ -859,6 +861,11 @@ nonisolated final class FrameStore: @unchecked Sendable {
     private static func identity(_ url: URL) -> String {
         let file = url.standardizedFileURL
         let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey])
+        if values?.isDirectory == true, file.pathExtension == MLXAlignModel.fileExtension {
+            let weights = file.appendingPathComponent("model.safetensors")
+            let config = file.appendingPathComponent("config.json")
+            return "\(file.path)\n\(stamp(weights))\n\(stamp(config))"
+        }
         if values?.isDirectory == true {
             let weights = file.appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
             let model = file.appendingPathComponent("Data/com.apple.CoreML/model.mlmodel")

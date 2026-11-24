@@ -17,7 +17,7 @@ nonisolated struct LibraryModel: Identifiable, Hashable {
     static func read(_ url: URL) -> LibraryModel {
         let stem = url.deletingPathExtension().lastPathComponent
         guard let match = stem.firstMatch(
-            of: /^(?:train-(\d{8})-(\d{4})\d{2}-)?(vote|edsr|latent_up)-(\d+)x(\d+)-step(\d+)(?:-(\d+)f)?-([a-z]+)(?:-cond)?$/
+            of: /^(?:train-(\d{8})-(\d{4})\d{2}-)?(vote|edsr|latent_up)-(\d+)x(\d+)-step(\d+)(?:-(\d+)f)?-([a-z]+)(?:-align)?(?:-cond)?$/
         ) else {
             return LibraryModel(
                 url: url, title: stem, detail: "Core ML",
@@ -44,9 +44,16 @@ nonisolated struct LibraryModel: Identifiable, Hashable {
             symbol: "arrow.up.left.and.arrow.down.right",
             tint: arch == "latent_up" ? .purple : .blue
         )
+        if stem.contains("-align") {
+            model.detail += " · Ausrichtung"
+        }
         if stem.hasSuffix("-cond") {
             model.conditionInput = true
             model.detail += " · Codec-Bedingung"
+        }
+        if url.pathExtension == MLXAlignModel.fileExtension {
+            model.title += " · MLX"
+            model.tint = .orange
         }
         return model
     }
@@ -81,7 +88,7 @@ nonisolated enum ModelLibrary {
             options: [.skipsHiddenFiles]
         )) ?? []
         return urls
-            .filter { $0.pathExtension == "mlpackage" }
+            .filter { $0.pathExtension == "mlpackage" || $0.pathExtension == MLXAlignModel.fileExtension }
             .sorted { modified($0) > modified($1) }
             .map(LibraryModel.read)
     }
@@ -93,7 +100,7 @@ nonisolated enum ModelLibrary {
         let stem = source.deletingPathExtension().lastPathComponent
         var number = 2
         while FileManager.default.fileExists(atPath: dest.path) {
-            dest = folder.appendingPathComponent("\(stem)-\(number).mlpackage")
+            dest = folder.appendingPathComponent("\(stem)-\(number).\(source.pathExtension)")
             number += 1
         }
         return dest

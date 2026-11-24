@@ -420,6 +420,55 @@ def _smooth_frames(height, width, seed=0, frames=1):
     return torch.nn.functional.interpolate(coarse, size=(height, width), mode="bilinear", align_corners=False)
 
 
+def convert_spynet_blocks(weights, dest):
+    """Write the six official SPyNet basic modules as flexible Core ML packages.
+
+    The official weights are frozen, so the same blocks serve every align
+    package. Spatial size is a range (batch 2, 8 channels in, 2 out). The
+    resize to a multiple of 32 and the warp stay on the host: a flexible
+    graph that includes them does not run.
+    """
+    import shutil
+
+    dest = Path(dest)
+    blocks = [dest / f"block{index}.mlpackage" for index in range(6)]
+    if dest.is_dir() and all(path.is_dir() for path in blocks):
+        return dest
+    from whoodeo.spynet import load_spynet
+
+    ct = _coremltools()
+    network = load_spynet(weights, "cpu").eval()
+    dest.mkdir(parents=True, exist_ok=True)
+    shape = ct.Shape(shape=(
+        2,
+        8,
+        ct.RangeDim(lower_bound=2, upper_bound=736, default=12),
+        ct.RangeDim(lower_bound=2, upper_bound=1280, default=20),
+    ))
+    example = torch.zeros(2, 8, 12, 20)
+    for index, block in enumerate(network.basic_module):
+        with torch.no_grad():
+            traced = torch.jit.trace(block, example)
+        mlmodel = ct.convert(
+            traced,
+            convert_to="mlprogram",
+            inputs=[ct.TensorType(name="x", shape=shape, dtype=np.float32)],
+            outputs=[ct.TensorType(name="y", dtype=np.float32)],
+            compute_precision=ct.precision.FLOAT32,
+            minimum_deployment_target=ct.target.iOS18,
+        )
+        path = blocks[index]
+        if path.exists():
+            shutil.rmtree(path)
+        mlmodel.save(str(path))
+        print(f"wrote {path}", flush=True)
+    import shutil
+    source = Path(weights)
+    if source.is_file():
+        shutil.copy2(source, dest / "weights.pth")
+    return dest
+
+
 def convert_latent_up(
     ct, spec, output, low_sizes, vae_override, conv_scale=CONV_SCALE, max_low=LOW_MAX,
 ):
@@ -449,6 +498,17 @@ def convert_latent_up(
         )
     folded = LatentUpExport(model, vae).eval()
     export = scale_convs(folded, conv_scale)
+    from whoodeo.spynet import detect_align
+    align, align_weights = detect_align(spec.path)
+    if align == "spynet":
+        # SPyNet and the warp stay a host pre-step: a flexible Core ML graph
+        # with grid_sample / resize-to-next-32 does not run (shapeless output, error -7).
+        # A fixed-size package would work, but the app takes any HD size up to 1280×720.
+        print(
+            f"align spynet  weights {align_weights}  frozen, host pre-step "
+            f"(six Core ML blocks in the package; warp stays on the host)",
+            flush=True,
+        )
     # Neither the fold nor the conv scale may change the picture. fp32 on the CPU, padded and unpadded.
     with torch.no_grad():
         for height, width in ((96, 128), (90, 130)):
@@ -546,6 +606,8 @@ def convert_latent_up(
         meta["whoodeo.condition_size"] = str(condition_size)
         meta["whoodeo.codecs"] = ",".join(CODECS)
         meta["whoodeo.reserve"] = str(RESERVE)
+    if align == "spynet":
+        meta["whoodeo.align"] = "spynet"
     _assign_metadata(mlmodel, meta)
     output = Path(output)
     if output.exists():
@@ -553,6 +615,9 @@ def convert_latent_up(
         shutil.rmtree(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     mlmodel.save(str(output))
+    if align == "spynet":
+        sidecar = convert_spynet_blocks(align_weights, output / "spynet")
+        print(f"wrote {sidecar}", flush=True)
     print(f"wrote {output}", flush=True)
     return output, spec
 
@@ -607,6 +672,13 @@ def _safe_name(text):
     return cleaned or "model"
 
 
+def _package_align(checkpoint):
+    """True when the run's config asks for neighbor alignment."""
+    from whoodeo.spynet import detect_align
+    method, _weights = detect_align(checkpoint)
+    return method == "spynet"
+
+
 def package_filename(checkpoint, spec, part=None):
     """Stable name the sidebar can read without opening the package. A FiLM latent_up ends in -cond.
 
@@ -626,6 +698,8 @@ def package_filename(checkpoint, spec, part=None):
     kind = {"vae2": "decoder", "latent_up": "hd"}.get(arch, "flex")
     if arch == "vae2" and part == "encoder":
         kind = "encoder"
+    if _package_align(checkpoint):
+        kind += "-align"
     if spec.architecture.get("condition") is not None:
         kind += "-cond"
     return f"{_run_slug(checkpoint)}-{arch}-{shape}-{step_part}-{kind}.mlpackage"

@@ -22,6 +22,11 @@ whoodeo-make-low = "whoodeo.make_low:main"
 whoodeo-board = "whoodeo.board:main"
 whoodeo-coreml = "whoodeo.coreml:main"
 
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.32.4 ; sys_platform == 'darwin'",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
