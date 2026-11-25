@@ -5,8 +5,8 @@
 
 An `out` ending in .mlxmodel is a folder with model.safetensors and
 config.json, the format the Mac app reads. `--app` writes that folder into
-~/Library/Application Support/Whoodeo/Models under the name an export of
-the same checkpoint gets, with .mlxmodel instead of .mlpackage.
+~/Library/Application Support/Whoodeo/Models as
+<run>-latent_up-<blocks>x<channels>-step<step>-3f-hd-align[-cond].mlxmodel.
 
 Loads the same model whoodeo-apply builds (latent_up with its frozen SPyNet
 inside, and its vae2) on the CPU. Conv kernels go from torch
@@ -29,8 +29,8 @@ def load_reference(checkpoint, vae=None, codec=None):
 
     torch.set_grad_enabled(False)
     reference, _label, in_frames, step, path = load_checkpoint(checkpoint, torch.device("cpu"), vae, codec)
-    if in_frames != 3 or getattr(reference.model, "align", None) is None:
-        raise SystemExit(f"{checkpoint}: not a 3-frame latent_up with feature alignment")
+    if in_frames != 3:
+        raise SystemExit(f"{checkpoint}: the MLX port takes a 3-frame latent_up, not {in_frames} frames")
     return reference, reference.model, reference.vae, step
 
 
@@ -68,8 +68,8 @@ def convert(checkpoint, out, vae=None):
         "vae_activation": vae_model.activation,
         "vae_blocks": len(vae_model.decoder.mid),
         "decoder_blocks_run": [len(stage.blocks) for stage in vae_model.decoder.ups],
-        # Precision the app computes latent_up and the decoder in, as the Core ML
-        # export did; SPyNet and its flow stay fp32. The weights are stored fp32.
+        # Precision the app computes latent_up and the decoder in; SPyNet and its
+        # flow stay fp32. The weights are stored fp32.
         "compute": "float16",
     }
     if config["vae_activation"] != config["activation"]:

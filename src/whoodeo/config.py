@@ -31,7 +31,7 @@ VGG_LAYERS = {
 }
 
 TERM_NAMES = ("pixel", "vgg", "gan", "color", "oklab", "ms_ssim", "mu_l2", "scale_eq", "latent")
-# Terms that read the picture in color or structure, for vae, vae2, and latent_up.
+# Terms that read the picture in color or structure.
 IMAGE_TERMS = ("color", "oklab", "ms_ssim")
 # Weights of Oklab L, a, b in the oklab term when the file leaves channels out.
 # Measured on vae2d step 15755 (32 val frames, full resolution): mean |dL|
@@ -44,13 +44,9 @@ MS_SSIM_SCALES = 5
 # vae2 terms that stand beside the objective: in the step loss, not in val.
 SIDE_TERMS = ("mu_l2", "scale_eq")
 SCALE_EQ_FACTORS = (2, 4)
-# Spaces the color term compares in, the first the default.
-COLOR_SPACES = ("ycbcr", "oklab")
 # Pooling factor of the color term when the file leaves pool out.
 COLOR_POOL = 8
 
-# Architectures that reconstruct a master frame through a latent.
-VAE_ARCHS = ("vae", "vae2")
 # The upscaler that predicts the code of a frozen vae2 from the low frame.
 LATENT_ARCH = "latent_up"
 
@@ -60,7 +56,7 @@ class Term:
     """One loss term. weight multiplies its raw value.
 
     vgg has no term weight: `layers` pairs each layer with its own weight.
-    color compares in `space` after a 1/`pool` average pool.
+    color compares in Oklab after a 1/`pool` average pool.
     """
 
     name: str
@@ -71,7 +67,6 @@ class Term:
     disc_lr: float | None = None
     start: int | None = None
     factors: tuple[int, ...] | None = None
-    space: str | None = None
     pool: int | None = None
     channels: tuple[float, ...] | None = None
     scales: int | None = None
@@ -89,7 +84,6 @@ class Term:
         elif self.name == "scale_eq":
             item["factors"] = list(self.factors)
         elif self.name == "color":
-            item["space"] = self.space
             item["pool"] = self.pool
         elif self.name == "oklab":
             item["channels"] = [round(value, 8) for value in self.channels]
@@ -145,25 +139,12 @@ class TrainConfig:
     out: Path | None
     terms: tuple[Term, ...]
     schedule: Schedule
-    radius: int | None = None
-    stem: int | None = None
-    vote: int | None = None
-    sharpness: float | None = None
-    reject: bool | None = None
-    levels: int | None = None
-    bilinear: bool | None = None
-    codes: int | None = None
-    patch: int | None = None
-    res_scale: float | None = None
     variants: str | None = None
     latent: int | None = None
     factor: int | None = None
-    beta: float | None = None
     encoder_blocks: tuple[int, ...] | None = None
     decoder_blocks: tuple[int, ...] | None = None
     widths: tuple[int, ...] | None = None
-    decoder_widths: tuple[int, ...] | None = None
-    posterior: str | None = None
     crop: int | None = None
     freeze_encoder: bool = False
     # Training noise on the vae2 latent. Not part of the loss recipe, so a
@@ -171,11 +152,9 @@ class TrainConfig:
     latent_noise_tau: float = 0.0
     # latent_up: the frozen vae2 checkpoint directory, resolved at load.
     vae: str | None = None
-    # latent_up: start the 1/4 blocks and the head from the vae2 encoder.
-    init_from_vae: bool = False
     # vae2 and latent_up: silu or relu. None is silu, as before the option.
     activation: str | None = None
-    # vae and vae2: face-weighted image terms. None (or weight 1) is off,
+    # vae2 and latent_up: face-weighted image terms. None (or weight 1) is off,
     # and then no detector runs.
     faces: Faces | None = None
     # latent_up: FiLM on a condition vector (models.latent_up.CONDITIONS), None is off.
@@ -187,12 +166,12 @@ class TrainConfig:
     # Validation, the preview, and model.pt use the average. Not part of the
     # loss recipe, so a resume may change it.
     ema: float | None = None
-    # latent_up with in_frames > 1: chance per neighbor and training frame
+    # latent_up: chance per neighbor and training frame
     # that it is swapped for the middle frame of another frame of the batch,
     # a stand-in for a scene cut. Not part of the loss recipe.
     scene_cut: float = 0.0
-    # latent_up with in_frames > 1: the official SPyNet weights its frozen
-    # FeatureAlign starts from in a fresh run. Required there; a resume or
+    # latent_up: the official SPyNet weights its frozen FeatureAlign starts
+    # from in a fresh run. Required there; a resume or
     # --model takes SPyNet from the checkpoint.
     spynet_weights: Path | None = None
     # When false, a checkpoint does not retarget the global runs/latest.
@@ -201,12 +180,8 @@ class TrainConfig:
 
     def arch_key(self):
         return model_key(
-            self.arch, self.blocks, self.channels, self.in_frames,
-            self.radius, self.stem, self.sharpness, self.reject, self.levels,
-            self.bilinear, self.codes, self.patch, self.res_scale, self.vote,
-            self.latent, self.factor, self.beta,
-            self.encoder_blocks, self.decoder_blocks, self.widths, self.decoder_widths,
-            self.posterior, self.vae, self.activation, self.condition,
+            self.arch, self.blocks, self.channels, self.in_frames, self.latent, self.factor,
+            self.encoder_blocks, self.decoder_blocks, self.widths, self.vae, self.activation, self.condition,
         )
 
     def loss_recipe(self):
@@ -221,144 +196,70 @@ class TrainConfig:
     def objective_terms(self):
         """Terms summed into the objective as weight * raw.
 
-        A vae2 gan term stands outside: its weight multiplies the adaptive
-        weight, and the validation objective leaves it out. So do mu_l2 and
-        scale_eq, which the training step adds.
+        The gan term (vae2 only) stands outside: its weight multiplies the
+        adaptive weight, and the validation objective leaves it out. So do
+        mu_l2 and scale_eq, which the training step adds.
         """
         return tuple(
             item for item in self.terms
-            if not (self.arch == "vae2" and item.name == "gan")
-            and item.name not in SIDE_TERMS
+            if item.name != "gan" and item.name not in SIDE_TERMS
         )
 
 
 def shape_text(arch, blocks, channels, in_frames, *extra):
-    if blocks is None:
-        text = f"{arch} in_frames {in_frames}"
-    else:
-        text = f"{arch} {blocks}x{channels} in_frames {in_frames}"
-    if arch == "shift":
-        radius, stem, sharpness, reject = extra
-        text += (
-            f" radius {radius} stem {stem} "
-            f"sharpness {sharpness:g} reject {str(reject).lower()}"
-        )
-    elif arch == "pyramid":
-        levels, stem, radius = extra
-        text += f" levels {levels} stem {stem} radius {radius}"
-    elif arch == "vq":
-        codes, patch, bilinear = extra
-        text += f" codes {codes} patch {patch} bilinear {str(bilinear).lower()}"
-    elif arch == "edsr":
-        res_scale, = extra
-        text += f" res_scale {res_scale:g}"
-    elif arch == "vote":
-        stem, vote, res_scale = extra
-        text = (
-            f"vote {blocks}x{channels} stem {stem} vote {vote} "
-            f"res_scale {res_scale:g}"
-        )
-    elif arch == LATENT_ARCH:
+    if arch == LATENT_ARCH:
         latent, encoder_blocks, widths, vae, activation, condition = extra
         text = (
             f"{arch} {blocks}x{channels} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in encoder_blocks)} "
-            f"widths {'/'.join(str(item) for item in widths)} vae {vae}"
+            f"widths {'/'.join(str(item) for item in widths)} vae {vae} in_frames {in_frames}"
         )
-        if in_frames != 1:
-            text += f" in_frames {in_frames}"
         if activation != "silu":
             text += f" activation {activation}"
         if condition is not None:
             text += f" condition {condition}"
-    elif arch in VAE_ARCHS:
-        latent, factor, *levels = extra
-        text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
-        if levels:
-            *levels, posterior, activation = levels
-            text += layout_text(factor, *levels)
-            if posterior != "gaussian":
-                text += f" posterior {posterior}"
-            if activation != "silu":
-                text += f" activation {activation}"
+        return text
+    latent, factor, *levels, activation = extra
+    text = f"{arch} {blocks}x{channels} latent {latent} factor {factor}"
+    text += layout_text(factor, *levels)
+    if activation != "silu":
+        text += f" activation {activation}"
     return text
 
 
 def model_key(
-    arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-    bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-    encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None, vae=None, activation=None, condition=None,
+    arch, blocks, channels, in_frames, latent, factor,
+    encoder_blocks=None, decoder_blocks=None, widths=None, vae=None, activation=None, condition=None,
 ):
     key = (arch, blocks, channels, in_frames)
-    if arch == "shift":
-        return key + (radius, stem, float(sharpness), reject)
-    if arch == "pyramid":
-        return key + (levels, stem, radius)
-    if arch == "vq":
-        return key + (codes, patch, bilinear)
-    if arch == "edsr":
-        return key + (float(res_scale),)
-    if arch == "vote":
-        return key + (stem, vote, float(res_scale))
-    if arch == "vae2":
-        # beta weighs the KL in the loss. It does not shape the weights.
-        # The levels compare with their defaults filled in.
-        return key + (latent, factor) + layout(
-            factor, encoder_blocks, decoder_blocks, widths, decoder_widths,
-        ) + (posterior or "gaussian", activation or "silu")
-    if arch in VAE_ARCHS:
-        return key + (latent, factor)
     if arch == LATENT_ARCH:
         # The vae2 is the checkpoint directory the config resolved to.
         return key + (latent,) + latent_layout(encoder_blocks, widths) + (
             vae, activation or "silu", condition,
         )
-    return key
+    # The levels compare with their defaults filled in.
+    return key + (latent, factor) + layout(factor, encoder_blocks, decoder_blocks, widths) + (
+        activation or "silu",
+    )
 
 
 def architecture_dict(cfg):
     """The model mapping stored next to the generator weights."""
     item = {"arch": cfg.arch}
-    if cfg.arch not in ("vote", *VAE_ARCHS):
+    if cfg.arch == LATENT_ARCH:
         item["in_frames"] = cfg.in_frames
-    if cfg.blocks is not None:
-        item["blocks"] = cfg.blocks
-    if cfg.channels is not None:
-        item["channels"] = cfg.channels
-    if cfg.arch == "shift":
-        item["radius"] = cfg.radius
-        item["stem"] = cfg.stem
-        item["sharpness"] = cfg.sharpness
-        item["reject"] = cfg.reject
-    elif cfg.arch == "pyramid":
-        item["levels"] = cfg.levels
-        item["stem"] = cfg.stem
-        item["radius"] = cfg.radius
-    elif cfg.arch == "vq":
-        item["bilinear"] = cfg.bilinear
-        item["codes"] = cfg.codes
-        item["patch"] = cfg.patch
-    elif cfg.arch == "edsr":
-        item["res_scale"] = cfg.res_scale
-    elif cfg.arch == "vote":
-        item["stem"] = cfg.stem
-        item["vote"] = cfg.vote
-        item["res_scale"] = cfg.res_scale
-    elif cfg.arch in VAE_ARCHS:
+    item["blocks"] = cfg.blocks
+    item["channels"] = cfg.channels
+    if cfg.arch == "vae2":
         item["latent"] = cfg.latent
         item["factor"] = cfg.factor
-        if cfg.beta is not None:
-            item["beta"] = cfg.beta
-        if cfg.posterior is not None:
-            item["posterior"] = cfg.posterior
-        for name in ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths"):
+        for name in ("encoder_blocks", "decoder_blocks", "widths"):
             value = getattr(cfg, name)
             if value is not None:
                 item[name] = list(value)
         if cfg.activation is not None:
             item["activation"] = cfg.activation
-    elif cfg.arch == LATENT_ARCH:
+    else:
         item["latent"] = cfg.latent
         for name in ("encoder_blocks", "widths"):
             value = getattr(cfg, name)
@@ -375,7 +276,7 @@ def architecture_dict(cfg):
 def assert_resume_matches(cfg, architecture, loss, checkpoint):
     """The checkpoint must be the same network and the same loss.
 
-    Learning rates, the schedule, and a vae beta may change. beta comes from the config.
+    Learning rates and the schedule may change; they come from the config.
     """
     saved_key = model_key(*parse_model(architecture, f"{checkpoint}: architecture"))
     if saved_key != cfg.arch_key():
@@ -399,9 +300,8 @@ def load_config(path, architecture=None, architecture_from=None):
     where = str(path)
 
     (
-        arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation, condition,
+        arch, blocks, channels, in_frames, latent, factor,
+        encoder_blocks, decoder_blocks, widths, vae, activation, condition,
     ) = _take_model(
         data, where, architecture, architecture_from,
     )
@@ -418,29 +318,21 @@ def load_config(path, architecture=None, architecture_from=None):
     variants = _take_variants(data, where)
     crop = _take_crop(data, where)
     freeze_encoder = _take_flag(data, "freeze_encoder", where)
-    init_from_vae = _take_flag(data, "init_from_vae", where)
     latent_noise_tau = _take_latent_noise(data, where, arch)
     faces = _take_faces(data, where, arch)
     codec_unknown = _take_codec_unknown(data, where, condition)
     ema = _take_ema(data, where)
-    scene_cut = _take_scene_cut(data, where, arch, in_frames)
-    spynet_weights = _take_spynet_weights(data, where, arch, in_frames)
+    scene_cut = _take_scene_cut(data, where, arch)
+    spynet_weights = _take_spynet_weights(data, where, arch)
     publish_latest = _take_publish_latest(data, where)
     terms = _take_loss(data, where, arch)
-    if arch in VAE_ARCHS:
+    if arch == "vae2":
         if variants is not None:
             raise SystemExit(f"{where}: {arch} does not take variants")
-        if arch == "vae" and any(term.name == "gan" for term in terms):
-            raise SystemExit(f"{where}: vae does not take a gan term")
         if crop is not None and crop % factor != 0:
             raise SystemExit(f"{where}: crop must be a multiple of factor {factor}")
     elif crop is not None:
-        raise SystemExit(f"{where}: only vae and vae2 use crop")
-    for name in IMAGE_TERMS:
-        if arch not in (*VAE_ARCHS, LATENT_ARCH) and any(term.name == name for term in terms):
-            raise SystemExit(f"{where}: only vae, vae2, and latent_up use a {name} term")
-    if init_from_vae and arch != LATENT_ARCH:
-        raise SystemExit(f"{where}: only latent_up takes init_from_vae")
+        raise SystemExit(f"{where}: only vae2 uses crop")
     if arch != "vae2" and any(term.start is not None for term in terms):
         raise SystemExit(f"{where}: only a vae2 gan term takes start")
     if freeze_encoder and arch != "vae2":
@@ -468,28 +360,14 @@ def load_config(path, architecture=None, architecture_from=None):
         steps=steps,
         out=out,
         terms=tuple(terms),
-        radius=radius,
-        stem=stem,
-        sharpness=sharpness,
-        reject=reject,
-        levels=levels,
-        bilinear=bilinear,
-        codes=codes,
-        patch=patch,
-        res_scale=res_scale,
-        vote=vote,
         variants=variants,
         latent=latent,
         factor=factor,
-        beta=beta,
         encoder_blocks=encoder_blocks,
         decoder_blocks=decoder_blocks,
         widths=widths,
-        decoder_widths=decoder_widths,
-        posterior=posterior,
         vae=vae,
         activation=activation,
-        init_from_vae=init_from_vae,
         latent_noise_tau=latent_noise_tau,
         faces=faces,
         condition=condition,
@@ -583,64 +461,29 @@ def parse_model(model, where):
         raise SystemExit(f"{where} must be a mapping")
     model = dict(model)
     arch = _take_choice(model, "arch", where, PRESETS)
-    preset = PRESETS[arch]
-    if arch == "vote":
+    if arch == "vae2":
         if "in_frames" in model:
-            raise SystemExit(
-                f"{where}: vote reads the previous, middle, and next frame "
-                "and does not take in_frames"
-            )
-        in_frames = 3
-    elif arch in VAE_ARCHS:
-        if "in_frames" in model:
-            raise SystemExit(
-                f"{where}: {arch} reads one master frame and does not take in_frames"
-            )
+            raise SystemExit(f"{where}: vae2 reads one master frame and does not take in_frames")
         in_frames = 1
-    elif arch in ("vq", "swinir", "swinir_light", "swinir_real", "edsr", LATENT_ARCH) and "in_frames" not in model:
-        in_frames = 1
+        # The vae2 checkpoints still name the fixed posterior, the only one left.
+        if model.get("posterior", "fixed") != "fixed":
+            raise SystemExit(f"{where}: posterior {model['posterior']!r} is gone, vae2 has a fixed posterior")
+        model.pop("posterior", None)
     else:
         in_frames = _take_int(model, "in_frames", where, positive=True)
-    if arch == "espcn":
-        if "blocks" in model or "channels" in model:
-            raise SystemExit(f"{where}: espcn has a fixed size")
-        blocks = None
-        channels = None
-    else:
-        blocks = _take_int(model, "blocks", where, positive=True)
-        channels = _take_int(model, "channels", where, positive=True)
-    radius, stem, sharpness, reject = _take_shift(model, arch, where)
-    levels = None
-    if arch == "pyramid":
-        levels, stem, radius = _take_pyramid(model, where)
-    bilinear, codes, patch = _take_vq(model, arch, where)
-    posterior = _take_posterior(model, arch, where)
-    latent, factor, beta = _take_vae(model, arch, where, posterior)
-    encoder_blocks, decoder_blocks, widths, decoder_widths = _take_levels(model, arch, factor, where)
+        if in_frames < 3 or in_frames % 2 != 1:
+            raise SystemExit(f"{where}: latent_up in_frames must be odd and at least 3")
+    blocks = _take_int(model, "blocks", where, positive=True)
+    channels = _take_int(model, "channels", where, positive=True)
+    latent, factor = _take_vae(model, arch, where)
+    encoder_blocks, decoder_blocks, widths = _take_levels(model, arch, factor, where)
     vae = _take_vae_path(model, arch, where)
     activation = _take_activation(model, arch, where)
     condition = _take_condition(model, arch, where)
-    vote = None
-    if arch == "vote":
-        stem = _take_int(model, "stem", where)
-        if stem < 0:
-            raise SystemExit(f"{where}: stem must be zero or positive")
-        vote = _take_int(model, "vote", where)
-        if vote < 0:
-            raise SystemExit(f"{where}: vote must be zero or positive")
-    res_scale = _take_res_scale(model, arch, where)
     _reject_unknown(model, where)
-    if in_frames % 2 != 1:
-        raise SystemExit(f"{where}: in_frames must be odd")
-    fixed = preset["frames"]
-    if fixed is not None and in_frames != fixed:
-        raise SystemExit(f"{where}: {arch} takes {fixed} input frame, not {in_frames}")
-    if arch in ("shift", "pyramid") and in_frames < 3:
-        raise SystemExit(f"{where}: {arch} needs at least 3 input frames")
     return (
-        arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, vae, activation, condition,
+        arch, blocks, channels, in_frames, latent, factor,
+        encoder_blocks, decoder_blocks, widths, vae, activation, condition,
     )
 
 
@@ -675,12 +518,12 @@ def _take_ema(data, where):
     return value
 
 
-def _take_scene_cut(data, where, arch, in_frames):
+def _take_scene_cut(data, where, arch):
     """scene_cut: the chance per neighbor that it comes from another frame of the batch."""
     if "scene_cut" not in data:
         return 0.0
-    if arch != LATENT_ARCH or in_frames < 3:
-        raise SystemExit(f"{where}: scene_cut needs a latent_up with in_frames 3 or more")
+    if arch != LATENT_ARCH:
+        raise SystemExit(f"{where}: only latent_up takes scene_cut")
     value = _take_float(data, "scene_cut", where)
     if not 0 <= value <= 1:
         raise SystemExit(f"{where}: scene_cut must be from 0 to 1")
@@ -691,8 +534,6 @@ def _take_activation(data, arch, where):
     """vae2 and latent_up activation as written, None when left out (silu)."""
     if "activation" not in data:
         return None
-    if arch not in ("vae2", LATENT_ARCH):
-        raise SystemExit(f"{where}: only vae2 and latent_up take activation")
     return _take_choice(data, "activation", where, ACTIVATIONS)
 
 
@@ -708,15 +549,6 @@ def _take_vae_path(data, arch, where):
     if not isinstance(value, str) or not value.strip():
         raise SystemExit(f"{where}: vae must be a path")
     return str(Path(value).expanduser())
-
-
-def _take_posterior(data, arch, where):
-    """vae2 posterior as written, None when left out (gaussian)."""
-    if "posterior" not in data:
-        return None
-    if arch != "vae2":
-        raise SystemExit(f"{where}: only vae2 takes posterior")
-    return _take_choice(data, "posterior", where, ("gaussian", "fixed"))
 
 
 def _take_latent_noise(data, where, arch):
@@ -740,8 +572,6 @@ def _take_faces(data, where, arch):
     """faces: {weight: w, score: s, expand: e, feather: f}. None when off (w 1)."""
     if "faces" not in data:
         return None
-    if arch not in (*VAE_ARCHS, LATENT_ARCH):
-        raise SystemExit(f"{where}: only vae, vae2, and latent_up take faces")
     raw = data.pop("faces")
     label = f"{where}: faces"
     if not isinstance(raw, dict):
@@ -762,7 +592,7 @@ def _take_faces(data, where, arch):
     return Faces(weight=weight, score=score, expand=expand, feather=feather)
 
 
-_LEVEL_KEYS = ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths")
+_LEVEL_KEYS = ("encoder_blocks", "decoder_blocks", "widths")
 
 
 def _take_levels(data, arch, factor, where):
@@ -771,9 +601,8 @@ def _take_levels(data, arch, factor, where):
     latent_up takes encoder_blocks (low, 1/2) and widths (low, 1/2, 1/4) only.
     """
     if arch == LATENT_ARCH:
-        foreign = [name for name in ("decoder_blocks", "decoder_widths") if name in data]
-        if foreign:
-            raise SystemExit(f"{where}: latent_up does not use {', '.join(foreign)}")
+        if "decoder_blocks" in data:
+            raise SystemExit(f"{where}: latent_up does not use decoder_blocks")
         encoder_blocks = data.pop("encoder_blocks", None)
         widths = data.pop("widths", None)
         latent_layout(encoder_blocks, widths, where=where)
@@ -781,73 +610,22 @@ def _take_levels(data, arch, factor, where):
             None if encoder_blocks is None else tuple(encoder_blocks),
             None,
             None if widths is None else tuple(widths),
-            None,
         )
-    if arch != "vae2":
-        foreign = [name for name in _LEVEL_KEYS if name in data]
-        if foreign:
-            raise SystemExit(f"{where}: only vae2 uses {', '.join(foreign)}")
-        return None, None, None, None
     raw = [data.pop(name, None) for name in _LEVEL_KEYS]
     layout(factor, *raw, where=where)
     return tuple(None if value is None else tuple(value) for value in raw)
 
 
-def _take_res_scale(data, arch, where):
-    if arch not in ("edsr", "vote"):
-        if "res_scale" in data:
-            raise SystemExit(f"{where}: only edsr and vote use res_scale")
-        return None
-    return _take_float(data, "res_scale", where, positive=True)
-
-
-def _take_vq(data, arch, where):
-    if arch != "vq":
-        foreign = [name for name in ("bilinear", "codes", "patch") if name in data]
-        if foreign:
-            names = ", ".join(foreign)
-            raise SystemExit(f"{where}: only vq uses {names}")
-        return None, None, None
-    if "bilinear" not in data:
-        bilinear = True
-    else:
-        bilinear = _take_bool(data, "bilinear", where)
-    codes = _take_int(data, "codes", where, positive=True, default=1024)
-    if codes > 65536:
-        raise SystemExit(f"{where}: codes must be from 1 to 65536")
-    patch = _take_int(data, "patch", where, positive=True, default=4)
-    if patch > 16:
-        raise SystemExit(f"{where}: patch must be from 1 to 16")
-    return bilinear, codes, patch
-
-
-def _take_vae(data, arch, where, posterior=None):
+def _take_vae(data, arch, where):
     if arch == LATENT_ARCH:
-        foreign = [name for name in ("factor", "beta") if name in data]
-        if foreign:
-            raise SystemExit(
-                f"{where}: latent_up does not take {', '.join(foreign)}. "
-                "The factor is the vae2's over 2"
-            )
-        return _take_int(data, "latent", where, positive=True), None, None
-    if arch not in VAE_ARCHS:
-        foreign = [name for name in ("latent", "factor", "beta") if name in data]
-        if foreign:
-            names = ", ".join(foreign)
-            raise SystemExit(f"{where}: only vae and vae2 use {names}")
-        return None, None, None
+        if "factor" in data:
+            raise SystemExit(f"{where}: latent_up does not take factor. The factor is the vae2's over 2")
+        return _take_int(data, "latent", where, positive=True), None
     latent = _take_int(data, "latent", where, positive=True)
     factor = _take_int(data, "factor", where, positive=True)
     if factor < 2 or factor > 16 or factor & (factor - 1):
         raise SystemExit(f"{where}: factor must be a power of two from 2 to 16")
-    if posterior == "fixed":
-        if "beta" in data:
-            raise SystemExit(
-                f"{where}: posterior fixed has no KL, so beta does nothing. Remove beta"
-            )
-        return latent, factor, None
-    beta = _take_float(data, "beta", where, positive=True)
-    return latent, factor, beta
+    return latent, factor
 
 
 def _take_flag(data, key, where):
@@ -858,40 +636,13 @@ def _take_flag(data, key, where):
 
 
 def _take_crop(data, where):
-    """A fixed window for a vae. Missing means the whole frame. Empty is an error."""
+    """A fixed window for a vae2. Missing means the whole frame. Empty is an error."""
     if "crop" not in data:
         return None
     value = data.pop("crop")
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SystemExit(f"{where}: crop must be a positive integer")
     return value
-
-
-def _take_shift(data, arch, where):
-    if arch != "shift":
-        return None, None, None, None
-    radius = _take_int(data, "radius", where)
-    if radius < 0 or radius > 16:
-        raise SystemExit(f"{where}: radius must be from 0 to 16")
-    stem = _take_int(data, "stem", where)
-    if stem < 0:
-        raise SystemExit(f"{where}: stem must be zero or positive")
-    sharpness = _take_float(data, "sharpness", where, positive=True)
-    reject = _take_bool(data, "reject", where)
-    return radius, stem, sharpness, reject
-
-
-def _take_pyramid(data, where):
-    levels = _take_int(data, "levels", where, positive=True)
-    if levels > 6:
-        raise SystemExit(f"{where}: levels must be from 1 to 6")
-    stem = _take_int(data, "stem", where)
-    if stem < 0:
-        raise SystemExit(f"{where}: stem must be zero or positive")
-    radius = _take_int(data, "radius", where)
-    if radius < 0 or radius > 8:
-        raise SystemExit(f"{where}: radius must be from 0 to 8")
-    return levels, stem, radius
 
 
 SCHEDULE_KINDS = ("const", "cosine", "plateau")
@@ -1042,8 +793,8 @@ def _take_loss(data, where, arch=None):
 
     A weight is any positive multiplier. vgg weighs each layer under layers.
 
-    color is L1 on average-pooled color, for vae and vae2. `space` is ycbcr
-    (the default) or oklab, `pool` the pooling factor (default 8). oklab is
+    color is L1 on average-pooled Oklab, for vae2, `pool` the pooling
+    factor (default 8). oklab is
     L1 on Oklab L, a, b at full resolution, `channels` their weights (default
     1, 3, 3). ms_ssim is 1 - MS-SSIM on Oklab L, `scales` the number of
     scales (default 5). A vae2 gan
@@ -1092,12 +843,8 @@ def _take_loss(data, where, arch=None):
             layers = _take_layers(raw, label)
             terms.append(Term(name=name, weight=None, layers=layers))
         elif name == "color":
-            space = raw.pop("space", COLOR_SPACES[0])
-            if space not in COLOR_SPACES:
-                known = ", ".join(COLOR_SPACES)
-                raise SystemExit(f"{label}: unknown space {space!r}. choices: {known}")
             pool = _take_int(raw, "pool", label, positive=True, default=COLOR_POOL)
-            terms.append(Term(name=name, weight=weight, space=space, pool=pool))
+            terms.append(Term(name=name, weight=weight, pool=pool))
         elif name == "oklab":
             channels = raw.pop("channels", list(OKLAB_CHANNELS))
             if (
@@ -1240,12 +987,12 @@ def _pop_value(data, key, where, default):
     return value
 
 
-def _take_spynet_weights(data, where, arch, in_frames):
-    """The SPyNet checkpoint for a multi-frame latent_up, None otherwise."""
+def _take_spynet_weights(data, where, arch):
+    """The SPyNet checkpoint for a latent_up, None otherwise."""
     if "spynet_weights" not in data:
         return None
-    if arch != LATENT_ARCH or in_frames < 3:
-        raise SystemExit(f"{where}: spynet_weights is for a latent_up with in_frames 3 or more")
+    if arch != LATENT_ARCH:
+        raise SystemExit(f"{where}: only latent_up takes spynet_weights")
     weights = _take_path(data, "spynet_weights", where)
     if not weights.is_file():
         raise SystemExit(f"{where}: spynet_weights is not a file: {weights}")

@@ -1,245 +1,60 @@
 """Named networks shared by train and apply.
 
-`modified` is a residual ESPCN. `deform` keeps that stack and aligns the
-neighbor frames with a deformable 3x3. `shift` aligns them with a dense
-integer search. `pyramid` aligns them with a coarse-to-fine flow. `vq`
-keeps the residual stack, reads one frame, and quantizes the correction.
-`espcn` and `edsr` are the other architectures. `vote` is an EDSR trunk
-that adds a shared vote from the previous and next frame. `vae` reconstructs
-one frame through a spatial Gaussian. `vae2` does the same with tapered
-widths and no normalization, so its decoder runs on the Neural Engine.
-`latent_up` maps a low frame to the code of a frozen vae2, whose decoder
-gives the 2x picture; `condition: codec` adds FiLM on the codec of the low frame,
-`in_frames: 3` the previous and next frame. `swinir`,
-`swinir_light`, and `swinir_real` are SwinIR at 2x: one shared trunk, three
-reconstruction heads. The training config sets depth, width, and input frames.
+`vae2` reconstructs one frame through a code of `latent` channels, with
+tapered widths and no normalization. `latent_up` maps three low frames to the
+code of a frozen vae2, whose decoder gives the 2x picture; `condition: codec`
+adds FiLM on the codec of the low frame. The training config sets depth,
+width, and the layout.
 """
 
-from whoodeo.models.deform import DeformESPCN
-from whoodeo.models.edsr import EDSR
 from whoodeo.models.latent_up import LatentUp, latent_layout
-from whoodeo.models.espcn import ESPCN
-from whoodeo.models.modified import ModifiedESPCN
-from whoodeo.models.pyramid import PyramidESPCN
-from whoodeo.models.shift import ShiftESPCN
-from whoodeo.models.swinir import SwinIR
-from whoodeo.models.vae import VAE
 from whoodeo.models.vae2 import VAE2, layout_text
-from whoodeo.models.vote import VoteEDSR
-from whoodeo.models.vq import CODES, PATCH, VQESPCN
-
-# Six Swin layers per residual block, six heads. Channels must divide by the heads.
-_SWINIR_LAYERS = 6
-_SWINIR_HEADS = 6
-_SWINIR_UPSAMPLER = {
-    "swinir": "pixelshuffle",
-    "swinir_light": "pixelshuffledirect",
-    "swinir_real": "nearest+conv",
-}
 
 PRESETS = {
-    "modified": {"blocks": 32, "channels": 64, "frames": None},
-    "deform": {"blocks": 32, "channels": 64, "frames": None},
-    "shift": {"blocks": 8, "channels": 64, "frames": None},
-    "pyramid": {"blocks": 8, "channels": 64, "frames": None},
-    "vq": {"blocks": 8, "channels": 64, "frames": 1},
-    "espcn": {"blocks": None, "channels": None, "frames": 1},
-    "edsr": {"blocks": 32, "channels": 256, "frames": 1},
-    "vote": {"blocks": 14, "channels": 64, "frames": 3},
-    "vae": {"blocks": 4, "channels": 64, "frames": 1},
-    "vae2": {"blocks": 6, "channels": 64, "frames": 1},
-    "latent_up": {"blocks": 12, "channels": 64, "frames": None},
-    "swinir": {"blocks": 6, "channels": 180, "frames": 1},
-    "swinir_light": {"blocks": 4, "channels": 60, "frames": 1},
-    "swinir_real": {"blocks": 6, "channels": 180, "frames": 1},
+    "vae2": {"blocks": 6, "channels": 64},
+    "latent_up": {"blocks": 12, "channels": 64},
 }
+
 
 def _activation_text(activation):
     return "" if activation in (None, "silu") else f" activation {activation}"
 
 
 def build_model(
-    arch, blocks=None, channels=None, in_frames=5, *,
-    radius=None, stem=None, sharpness=None, reject=None, levels=None,
-    bilinear=None, codes=None, patch=None, res_scale=None, vote=None,
-    latent=None, factor=None, beta=None,
-    encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-    posterior=None, activation=None, condition=None,
+    arch, blocks=None, channels=None, in_frames=3, *,
+    latent=None, factor=None, encoder_blocks=None, decoder_blocks=None, widths=None,
+    activation=None, condition=None,
 ):
     if arch not in PRESETS:
         known = ", ".join(sorted(PRESETS))
         raise SystemExit(f"unknown arch {arch}. choices: {known}")
     preset = PRESETS[arch]
-    fixed_frames = preset["frames"]
-    if fixed_frames is not None and in_frames != fixed_frames:
-        raise SystemExit(f"{arch} takes {fixed_frames} input frame, not {in_frames}")
-    if arch == "espcn":
-        if blocks is not None or channels is not None:
-            raise SystemExit("espcn has a fixed size")
-        model = ESPCN()
-        label = f"espcn in_frames 1 parameters {sum(p.numel() for p in model.parameters())}"
-        return model, label
-
     depth = preset["blocks"] if blocks is None else blocks
     width = preset["channels"] if channels is None else channels
     if depth < 1 or width < 1:
         raise SystemExit("blocks and channels must be positive")
-    if arch == "modified":
-        model = ModifiedESPCN(num_res_blocks=depth, num_filters=width, in_frames=in_frames)
-    elif arch == "deform":
-        model = DeformESPCN(num_res_blocks=depth, num_filters=width, in_frames=in_frames)
-    elif arch == "shift":
-        _check_shift(radius, stem, sharpness, reject)
-        model = ShiftESPCN(width, depth, in_frames, radius, stem, sharpness, reject)
-    elif arch == "pyramid":
-        _check_pyramid(levels, stem, radius)
-        model = PyramidESPCN(width, depth, in_frames, levels, stem, radius)
-    elif arch == "vq":
-        if bilinear is None:
-            bilinear = True
-        if codes is None:
-            codes = CODES
-        if patch is None:
-            patch = PATCH
-        _check_vq(codes, patch, bilinear)
-        model = VQESPCN(
-            num_res_blocks=depth, num_filters=width, bilinear=bilinear, codes=codes, patch=patch,
-        )
-    elif arch in _SWINIR_UPSAMPLER:
-        if width % _SWINIR_HEADS != 0:
-            raise SystemExit(f"{arch} channels must be divisible by {_SWINIR_HEADS}")
-        model = SwinIR(
-            embed_dim=width,
-            depths=[_SWINIR_LAYERS] * depth,
-            num_heads=[_SWINIR_HEADS] * depth,
-            upsampler=_SWINIR_UPSAMPLER[arch],
-        )
-    elif arch == "vote":
-        _check_vote(stem, vote, res_scale)
-        model = VoteEDSR(depth, width, float(res_scale), stem, vote)
-    elif arch == "vae":
-        _check_vae(latent, factor, beta)
-        model = VAE(width, depth, latent, factor, beta)
-    elif arch == "latent_up":
-        if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
-            raise SystemExit("latent must be a positive integer")
+    if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
+        raise SystemExit("latent must be a positive integer")
+    if arch == "latent_up":
         model = LatentUp(width, depth, latent, encoder_blocks, widths, activation, condition, in_frames)
-    elif arch == "vae2":
-        _check_vae(latent, factor, beta if posterior != "fixed" else 1.0)
-        model = VAE2(
-            width, depth, latent, factor, beta,
-            encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, activation,
-        )
-    else:
-        _check_edsr(res_scale)
-        model = EDSR(depth, width, float(res_scale))
-    count = sum(p.numel() for p in model.parameters())
-    if arch == "shift":
-        label = (
-            f"shift {depth}x{width} in_frames {in_frames} "
-            f"radius {radius} stem {stem} sharpness {sharpness:g} "
-            f"reject {str(reject).lower()} parameters {count}"
-        )
-    elif arch == "pyramid":
-        label = (
-            f"pyramid {depth}x{width} in_frames {in_frames} "
-            f"levels {levels} stem {stem} radius {radius} parameters {count}"
-        )
-    elif arch == "vq":
-        label = (
-            f"vq {depth}x{width} in_frames {in_frames} "
-            f"codes {codes} patch {patch} bilinear {str(bilinear).lower()} "
-            f"parameters {count}"
-        )
-    elif arch == "edsr":
-        label = (
-            f"edsr {depth}x{width} res_scale {float(res_scale):g} "
-            f"in_frames {in_frames} parameters {count}"
-        )
-    elif arch == "vote":
-        label = (
-            f"vote {depth}x{width} stem {stem} vote {vote} "
-            f"res_scale {float(res_scale):g} parameters {count}"
-        )
-    elif arch == "latent_up":
+        count = sum(p.numel() for p in model.parameters())
         chosen_blocks, chosen_widths = latent_layout(encoder_blocks, widths)
         label = (
             f"latent_up {depth}x{width} latent {latent} "
             f"encoder_blocks {'/'.join(str(item) for item in chosen_blocks)} "
             f"widths {'/'.join(str(item) for item in chosen_widths)}"
-            f"{'' if in_frames == 1 else f' in_frames {in_frames}'}"
+            f" in_frames {in_frames}"
             f"{_activation_text(activation)}"
             f"{'' if condition is None else f' condition {condition}'} parameters {count}"
         )
-    elif arch in ("vae", "vae2"):
-        levels = ""
-        if arch == "vae2":
-            levels = layout_text(factor, encoder_blocks, decoder_blocks, widths, decoder_widths)
-        kl = "posterior fixed" if posterior == "fixed" else f"beta {float(beta):g}"
-        label = (
-            f"{arch} {depth}x{width} latent {latent} factor {factor}{levels} "
-            f"{kl}{_activation_text(activation)} parameters {count}"
-        )
-    else:
-        label = f"{arch} {depth}x{width} in_frames {in_frames} parameters {count}"
-    return model, label
-
-
-def _check_vae(latent, factor, beta):
-    if isinstance(latent, bool) or not isinstance(latent, int) or latent < 1:
-        raise SystemExit("latent must be a positive integer")
+        return model, label
     if isinstance(factor, bool) or not isinstance(factor, int) or factor < 2 or factor > 16 or factor & (factor - 1):
         raise SystemExit("factor must be a power of two from 2 to 16")
-    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or float(beta) <= 0:
-        raise SystemExit("beta must be a positive number")
-
-
-def _check_edsr(res_scale):
-    if res_scale is None:
-        raise SystemExit("arch edsr needs res_scale")
-    if isinstance(res_scale, bool) or not isinstance(res_scale, (int, float)) or float(res_scale) <= 0:
-        raise SystemExit("res_scale must be a positive number")
-
-
-def _check_vote(stem, vote, res_scale):
-    if res_scale is None:
-        raise SystemExit("arch vote needs res_scale")
-    if isinstance(res_scale, bool) or not isinstance(res_scale, (int, float)) or float(res_scale) <= 0:
-        raise SystemExit("res_scale must be a positive number")
-    if isinstance(stem, bool) or not isinstance(stem, int) or stem < 0:
-        raise SystemExit("arch vote needs stem, an integer >= 0")
-    if isinstance(vote, bool) or not isinstance(vote, int) or vote < 0:
-        raise SystemExit("arch vote needs vote, an integer >= 0")
-
-
-def _check_vq(codes, patch, bilinear):
-    if isinstance(codes, bool) or not isinstance(codes, int) or codes < 1 or codes > 65536:
-        raise SystemExit("codes must be an integer from 1 to 65536")
-    if isinstance(patch, bool) or not isinstance(patch, int) or patch < 1 or patch > 16:
-        raise SystemExit("patch must be an integer from 1 to 16")
-    if not isinstance(bilinear, bool):
-        raise SystemExit("bilinear must be true or false")
-
-
-def _check_shift(radius, stem, sharpness, reject):
-    if radius is None or stem is None or sharpness is None or reject is None:
-        raise SystemExit("arch shift needs radius, stem, sharpness, and reject")
-    if isinstance(radius, bool) or not isinstance(radius, int) or radius < 0 or radius > 16:
-        raise SystemExit("radius must be an integer from 0 to 16")
-    if isinstance(stem, bool) or not isinstance(stem, int) or stem < 0:
-        raise SystemExit("stem must be an integer >= 0")
-    if isinstance(sharpness, bool) or not isinstance(sharpness, (int, float)) or float(sharpness) <= 0:
-        raise SystemExit("sharpness must be a positive number")
-    if not isinstance(reject, bool):
-        raise SystemExit("reject must be true or false")
-
-
-def _check_pyramid(levels, stem, radius):
-    if levels is None or stem is None or radius is None:
-        raise SystemExit("arch pyramid needs levels, stem, and radius")
-    if isinstance(levels, bool) or not isinstance(levels, int) or levels < 1 or levels > 6:
-        raise SystemExit("levels must be an integer from 1 to 6")
-    if isinstance(stem, bool) or not isinstance(stem, int) or stem < 0:
-        raise SystemExit("stem must be an integer >= 0")
-    if isinstance(radius, bool) or not isinstance(radius, int) or radius < 0 or radius > 8:
-        raise SystemExit("radius must be an integer from 0 to 8")
+    model = VAE2(width, depth, latent, factor, encoder_blocks, decoder_blocks, widths, activation)
+    count = sum(p.numel() for p in model.parameters())
+    levels = layout_text(factor, encoder_blocks, decoder_blocks, widths)
+    label = (
+        f"vae2 {depth}x{width} latent {latent} factor {factor}{levels}"
+        f"{_activation_text(activation)} parameters {count}"
+    )
+    return model, label

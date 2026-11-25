@@ -19,14 +19,6 @@ import torch.nn.functional as F
 
 from whoodeo.config import VGG_LAYERS
 
-# BT.709 RGB to Y, Cb, Cr, one row each.
-_YCBCR = (
-    (0.2126, 0.7152, 0.0722),
-    (-0.1146, -0.3854, 0.5),
-    (0.5, -0.4542, -0.0458),
-)
-# Cb and Cr count twice as much as Y: the term is there for color drift.
-_YCBCR_WEIGHT = (1.0, 2.0, 2.0)
 # Oklab (Ottosson 2020, https://bottosson.github.io/posts/oklab/): linear sRGB
 # to LMS, and the cube-rooted LMS to L, a, b.
 _OKLAB_M1 = (
@@ -39,8 +31,7 @@ _OKLAB_M2 = (
     (1.9779984951, -2.4285922050, 0.4505937099),
     (0.0259040371, 0.7827717662, -0.8086757660),
 )
-# a and b count twice as much as L, as Cb and Cr do: the term is there for
-# color drift. Oklab scales a and b so that a step is about as visible as the
+# a and b count twice as much as L: the term is there for color drift. Oklab scales a and b so that a step is about as visible as the
 # same step in L. On vae2c (step 2416, 1/16 pool) the mean |dL|, |da|, |db|
 # came out about equal, 0.0079, 0.0079, 0.0093, so a and b carry 4/5 of it.
 _OKLAB_WEIGHT = (1.0, 2.0, 2.0)
@@ -68,24 +59,17 @@ def pixel_loss(pred, high, kind):
     return F.mse_loss(pred, high)
 
 
-def color_loss(pred, high, space, pool):
-    """L1 on 1/pool average-pooled color, the chroma channels weighted twice.
+def color_loss(pred, high, pool):
+    """L1 on 1/pool average-pooled Oklab L, a, b, the chroma channels weighted twice.
 
-    `space` is ycbcr or oklab. ycbcr pools the gamma sRGB frames and compares
-    BT.709 Y, Cb, Cr. oklab pools in linear light and compares Oklab L, a, b.
-    Pooling first leaves texture to the other terms, so this reads the slow
-    color of flat areas. A remainder below `pool` on an edge is left out.
+    The frames pool in linear light. Pooling first leaves texture to the
+    other terms, so this reads the slow color of flat areas. A remainder below
+    `pool` on an edge is left out.
     """
-    if space == "oklab":
-        diff = oklab(F.avg_pool2d(srgb_linear(pred), pool)) - oklab(
-            F.avg_pool2d(srgb_linear(high), pool)
-        )
-        weights = _OKLAB_WEIGHT
-    else:
-        matrix = pred.new_tensor(_YCBCR)
-        pooled = F.avg_pool2d(pred, pool) - F.avg_pool2d(high, pool)
-        diff = torch.einsum("ij,bjhw->bihw", matrix, pooled)
-        weights = _YCBCR_WEIGHT
+    diff = oklab(F.avg_pool2d(srgb_linear(pred), pool)) - oklab(
+        F.avg_pool2d(srgb_linear(high), pool)
+    )
+    weights = _OKLAB_WEIGHT
     weight = pred.new_tensor(weights).view(1, 3, 1, 1)
     return (diff.abs() * weight).mean() * 3.0 / float(sum(weights))
 

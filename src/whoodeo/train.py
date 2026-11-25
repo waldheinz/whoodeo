@@ -12,10 +12,9 @@ when it has fewer, so a lone size still fills whole batches. Each film draws
 one variant per sample it received, with the same rule. Two spans of frames
 are held out for validation.
 
-`arch: vae` reconstructs master frames and does not read a low variant.
+`arch: vae2` reconstructs master frames and does not read a low variant.
 Without crop each sample is the whole frame, and a batch stays inside one
 master size. With crop every sample is that window, so sizes can share a batch.
-`arch: vae2` reads the same batches.
 
 A vae2 may add a gan term. Its discriminator trains from the first step. Its
 generator term joins at `start` with the adaptive weight of latent diffusion:
@@ -39,8 +38,7 @@ the objective, times its weight.
 Each vae2 validation also logs val_noise/psnr_<s> for s 0.1, 0.3, 0.5: the PSNR
 of decode(μ + s * std_c * N(0, 1)) with a fixed seed, std_c the std of the
 validation μ per channel. val_noise/scale_eq_psnr decodes the 2 x 2 pooled μ against
-the 2 x 2 pooled frame. `python -m whoodeo.eval_latent <checkpoint>` computes
-the same numbers for a saved checkpoint.
+the 2 x 2 pooled frame.
 
 Training batches are decoded on one side thread into a queue of three CPU
 batches. The frames of a batch are read at the same time, on a pool of
@@ -50,11 +48,11 @@ and the seek, and parallel reads hide it.
 An unreadable training clip is logged and the loader draws a new batch.
 The step copies a batch onto the device. Validation reads on the main thread.
 
-faces: {weight, score, expand, feather} (vae, vae2, and latent_up) runs
+faces: {weight, score, expand, feather} (vae2 and latent_up) runs
 OpenCV YuNet on the CPU on every final training frame, in the loader thread,
 and on the validation frames; for latent_up on the master of each pair. The soft face mask rides in the batch; the step turns it
 into 1 + (weight - 1) x mask divided by its mean per frame and weighs oklab,
-ms_ssim, and vgg with it (scale_eq, mu_l2 and the KL stay unweighted).
+ms_ssim, and vgg with it (scale_eq and mu_l2 stay unweighted).
 train_raw/face_fraction and val_raw/face_fraction are the share of face
 pixels, val/psnr_face and val/psnr_nonface the PSNR over face and other
 pixels. The live page draws the boxes on recon (upscale) and master. latent_up
@@ -65,18 +63,17 @@ Weight 1 or no faces: section runs no detector. See whoodeo.faces.
 
 The loss is the sum of weight * raw over the terms in the file. A weight
 is a multiplier, not a share, and nothing is calibrated on the network.
-vgg weighs each of its layers. A vae adds beta times the KL, a gan term
-adds as above.
+vgg weighs each of its layers. A gan term adds as above.
 
 TensorBoard groups tags by their first segment, so the headline numbers sit
 in train/ and val/ and the details in groups of their own:
 train/loss, train/lr, and the weighted terms (train/pixel, train/vgg, ...);
 val/loss, val/psnr, and the weighted terms on the validation frames;
-train_raw/ and val_raw/ the unweighted terms, vgg as vgg_<layer>, the KL as
-kl, and for vae2 train_raw/mu_l2, scale_eq, scale_eq_factor, gan, and
-gan_weight; train_latent/ and val_latent/ the latent statistics, with the
-val_latent/mu histogram and the val_latent/channels table; val_noise/ the
-vae2 robustness PSNRs; val_ref/ the latent_up reference PSNRs; and for vote
+train_raw/ and val_raw/ the unweighted terms, vgg as vgg_<layer>, and for
+vae2 train_raw/mu_l2, scale_eq, scale_eq_factor, gan, and gan_weight;
+train_latent/ and val_latent/ the latent statistics, with the val_latent/mu
+histogram and the val_latent/channels table; val_noise/ the vae2 robustness
+PSNRs; val_ref/ the latent_up reference PSNRs; and for latent_up
 train_neighbor/ and val_neighbor/. val/psnr is the mean PSNR of the clamped
 output over the validation frames, comparable across loss weights.
 
@@ -93,11 +90,8 @@ run. A resume keeps the dropped rate and the miss count when lr is the
 same peak. The discriminator, when there is one, keeps the same fraction
 of disc_lr.
 
-A fresh run validates once at step 0, before any update. Where the last
-layer starts at zero, that pass is the bilinear upscale. Modified leaves
-that layer at the default initialization, so step 0 already includes a
-correction. A fine-tune's step 0 is the generator that was loaded. A vae
-has no bilinear base, so that first pass is the untrained reconstruction.
+A fresh run validates once at step 0, before any update. A fine-tune's
+step 0 is the generator that was loaded.
 
 A gan term adds a U-Net discriminator. Each checkpoint is a directory
 checkpoints/<step>/ holding two files. model.pt is the generator and the
@@ -106,22 +100,15 @@ file. train.pt is the step, the optimizers, the discriminator, and the loss
 recipe. latest in the run points at the newest of
 those directories, and latest in the runs directory follows the newest
 checkpoint written. The run directory also gets a TensorBoard event file for the losses.
-The vote model adds train_neighbor/weight and train_neighbor/grad on each
-step, and val_neighbor/image when validation runs. weight and grad cover every kernel
-in the shared vote. A vae adds train_raw/kl and val_raw/kl. The step loss includes
-beta times that KL. The validation loss the plateau reads is the sum of the
-weighted terms, without the KL and without the gan term. It also records train_latent/mu_mean, mu_std, sigma_mean
-and spread for the batch, the same four under val_latent/ for the validation
-set, and the channel summaries active and kl_min. active counts the channels
-whose μ varies with std above 0.1, kl_min is the KL of the weakest channel.
-Each validation also writes the per-channel table (μ std, σ mean, KL) to the
-text tab as val_latent/channels. spread is the square root of
-var(μ) + mean(σ²) and sits near 1 when the code matches the unit Gaussian.
-The validation histogram is val_latent/mu.
+The validation loss the plateau reads is the sum of the weighted terms,
+without the gan term. A vae2 also records train_latent/mu_mean and mu_std for
+the batch, the same under val_latent/ for the validation set, and the channel
+summary active, the channels whose μ varies with std above 0.1. Each
+validation also writes the per-channel table to the text tab as
+val_latent/channels. The validation histogram is val_latent/mu.
 whoodeo-board serves every run.
 
-`arch: latent_up` reads the same low and master pairs as the upscalers and
-predicts the normalized code z = (μ - shift) * scale of a frozen vae2 at 1/4
+`arch: latent_up` reads low and master pairs and predicts the normalized code z = (μ - shift) * scale of a frozen vae2 at 1/4
 of the low frame, which is the vae2 latent of the 2x master. `vae` under
 model: names that vae2, a run directory (its latest checkpoint) or a
 checkpoint; the config stores the checkpoint it resolved to, so a resume
@@ -136,9 +123,7 @@ val_raw/latent are logged in every case. The first validation of a
 process also logs three references on the same frames, val_ref/bicubic_psnr, val_ref/bilinear_psnr, and
 val_ref/vae_psnr, the vae2 roundtrip decode(encode(master)), which is
 the ceiling of this decoder. The live page shows low (bicubic 2x), upscale,
-and master. init_from_vae: true starts the last blocks at 1/4 and the head
-from the vae2 encoder, the head with shift and scale folded in, on a fresh
-run only.
+and master.
 
 A latent_up with `condition: codec` gets the codec of each low frame from
 its variant name (x264-* h264, mpeg4-* mpeg4) as a one-hot vector, all zero
@@ -157,8 +142,7 @@ those of the new vae2, and the optimizer starts over. --resume keeps the vae2
 of the run.
 
 A latent_up with `in_frames: 3` reads the previous, middle, and next low
-frame, one seek and one decode per sample as for the other multi-frame
-archs; the clip's edges repeat the middle frame. scene_cut (training only,
+frame, one seek and one decode per sample; the clip's edges repeat the middle frame. scene_cut (training only,
 on a generator of its own, seed + 2) swaps each neighbor with that chance
 for the middle frame of another frame of the batch, which has the same
 size, so the network learns to ignore a neighbor from another shot. The swap
@@ -183,15 +167,13 @@ the loaded weights. A fine-tune starts it from the loaded model.pt.
 --resume continues a run from its newest checkpoint: the same architecture,
 the same loss weights, and the Adam state. The schedule comes from the
 file. A plateau resume keeps its rate and its miss count when lr
-is unchanged. A vae beta comes from the file too, on resume and fine-tune.
-Resuming an older checkpoint starts a new run, so the later
-checkpoints stay where they are. An older model.pt that still carries the
-optimizer loads the same way, and the next save writes checkpoints/.
+is unchanged. Resuming an older checkpoint starts a new run, so the later
+checkpoints stay where they are.
 
 --model fine-tunes that generator under the loss in the file. The optimizer
 and the discriminator start over, and the result is a new run. The recipe may omit the model: section; the
 architecture then comes from the model file. A model: section that is
-still present has to match the file, beta aside. Keep it to change beta.
+still present has to match the file.
 """
 
 import argparse
@@ -218,7 +200,7 @@ from whoodeo.checkpoint import (
 )
 from whoodeo.ema import WeightAverage
 from whoodeo.config import (
-    IMAGE_TERMS, LATENT_ARCH, VAE_ARCHS, architecture_dict, assert_resume_matches, cosine_learning_rate,
+    IMAGE_TERMS, LATENT_ARCH, architecture_dict, assert_resume_matches, cosine_learning_rate,
     load_config, restore_plateau, shape_text,
 )
 from whoodeo.films import (
@@ -230,7 +212,7 @@ from whoodeo.models import build_model
 from whoodeo.models.common import pad_to
 from whoodeo.models.discriminator import UNetDiscriminatorSN, gan_bce
 from whoodeo.models.latent_up import FACTOR as LATENT_FACTOR
-from whoodeo.models.latent_up import CODECS, codec_of, condition_vector, init_from_vae
+from whoodeo.models.latent_up import CODECS, codec_of, condition_vector
 from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
 from whoodeo.faces import FACE_LEVEL, FaceDetector, detect_batch, face_fraction, weight_map
 from whoodeo.spynet import load_weights as load_spynet_weights
@@ -330,11 +312,6 @@ def batch_from_specs(films, specs, radius):
 
     samples = read_all(read, specs)
     return torch.stack([low for low, _ in samples]), torch.stack([high for _, high in samples])
-
-
-def batch_on_device(films, specs, radius, device):
-    low, high = batch_from_specs(films, specs, radius)
-    return low.to(device), high.to(device)
 
 
 _QUEUE_DEPTH = 3
@@ -538,7 +515,7 @@ def describe_loss(cfg, objective):
         if term.name == "pixel":
             detail = term.kind
         elif term.name == "color":
-            detail = f"{term.space}/{term.pool}"
+            detail = f"oklab/{term.pool}"
         elif term.name == "oklab":
             detail = "L/a/b " + "/".join(f"{value:g}" for value in term.channels)
         elif term.name == "ms_ssim":
@@ -548,7 +525,7 @@ def describe_loss(cfg, objective):
         print(f"  {term.name} {detail}  weight {term.weight:g}", flush=True)
 
 
-def raw_terms(objective, cfg, pred, high, discriminator, box, pixel_weight=None):
+def raw_terms(objective, cfg, pred, high, pixel_weight=None):
     """Unweighted terms, and the vgg L1 of each layer. All still in the graph.
 
     `pixel_weight` (B, 1, H, W), the faces map, weighs oklab, ms_ssim, and vgg.
@@ -562,7 +539,7 @@ def raw_terms(objective, cfg, pred, high, discriminator, box, pixel_weight=None)
         layer_raw = objective.vgg_layers(pred, high, pixel_weight)
     color = cfg.term("color")
     if color is not None:
-        raw["color"] = color_loss(pred, high, color.space, color.pool)
+        raw["color"] = color_loss(pred, high, color.pool)
     lab = cfg.term("oklab")
     structure = cfg.term("ms_ssim")
     if lab is not None or structure is not None:
@@ -573,8 +550,6 @@ def raw_terms(objective, cfg, pred, high, discriminator, box, pixel_weight=None)
             raw["oklab"] = oklab_loss(pred_lab, high_lab, lab.channels, pixel_weight)
         if structure is not None:
             raw["ms_ssim"] = ms_ssim_loss(pred_lab, high_lab, structure.scales, pixel_weight)
-    if "gan" in objective.names:
-        raw["gan"] = gan_bce(discriminator(take(pred, box)), True)
     return raw, layer_raw
 
 
@@ -679,101 +654,6 @@ def save_val_images(directory, step, index, low, pred, high, width):
     save_still(folder, "low", low)
     save_still(folder, "master", high)
     save_step_image(folder, "upscale", step, pred)
-
-
-def neighbor_image_effect(model, low, pred):
-    """Mean absolute change when both neighbors are replaced by the middle frame.
-
-    The bias of the vote is present in both forwards, so this is the part that
-    comes from the frames actually differing. None for a model without a vote.
-    """
-    if not hasattr(model, "neighbor_usage"):
-        return None
-    count = model.in_frames
-    mid = count // 2
-    center = low[:, mid * 3:(mid + 1) * 3]
-    flat = center.repeat(1, count, 1, 1)
-    alt = model(flat)
-    return (pred - alt).abs().mean().item()
-
-
-def evaluate(model, films, specs, radius, batch_size, device, cfg, objective, discriminator, image_dir=None, step=None):
-    """Mean of the weighted objective. The GAN part uses the center crop.
-
-    With image_dir set, each sample is written under image_dir/<index>/.
-    Then the neighbor image effect, or None when the model has no vote, and
-    the raw term means as val_raw/ tags beside val/psnr.
-    """
-    model.eval()
-    disc_training = discriminator is not None and discriminator.training
-    if discriminator is not None:
-        discriminator.eval()
-    loss_acc = 0.0
-    pixel_acc = 0.0
-    vgg_acc = 0.0
-    gan_acc = 0.0
-    d_acc = 0.0
-    image_acc = 0.0
-    raw_acc = {}
-    saw_d = False
-    saw_image = False
-    count = 0
-    saved = 0
-    width = max(2, len(str(max(len(specs) - 1, 0))))
-    center = radius * 3
-    gan = cfg.term("gan")
-    with torch.no_grad():
-        for start in range(0, len(specs), batch_size):
-            chunk = specs[start:start + batch_size]
-            low, high = batch_on_device(films, chunk, radius, device)
-            pred = model(low)
-            effect = neighbor_image_effect(model, low, pred)
-            if effect is not None:
-                image_acc += effect * len(chunk)
-                saw_image = True
-            if image_dir is not None:
-                for offset in range(len(chunk)):
-                    save_val_images(
-                        image_dir, step, saved + offset,
-                        low[offset, center:center + 3],
-                        pred[offset],
-                        high[offset],
-                        width,
-                    )
-                saved += len(chunk)
-            box = None
-            d_here = None
-            if gan is not None:
-                box = sample_box(high, gan.crop, None)
-                fake = discriminator(take(pred, box))
-                real = discriminator(take(high, box))
-                d_here = 0.5 * (gan_bce(real, True).item() + gan_bce(fake, False).item())
-            raw, layer_raw = raw_terms(objective, cfg, pred, high, discriminator, box)
-            total, weighted = objective.combine(raw, layer_raw)
-            frames = len(chunk)
-            loss_acc += total.item() * frames
-            add_raw(raw_acc, "val", raw, layer_raw, frames)
-            raw_acc["val/psnr"] = raw_acc.get("val/psnr", 0.0) + psnr_sum(pred, high)
-            if "pixel" in weighted:
-                pixel_acc += weighted["pixel"].item() * frames
-            if "vgg" in weighted:
-                vgg_acc += weighted["vgg"].item() * frames
-            if "gan" in weighted:
-                gan_acc += weighted["gan"].item() * frames
-            if d_here is not None:
-                d_acc += d_here * frames
-                saw_d = True
-            count += frames
-    model.train()
-    if disc_training:
-        discriminator.train()
-    pixel_mean = pixel_acc / count if cfg.term("pixel") is not None else None
-    vgg_mean = vgg_acc / count if cfg.term("vgg") is not None else None
-    gan_mean = gan_acc / count if gan is not None else None
-    d_mean = d_acc / count if saw_d else None
-    image_mean = image_acc / count if saw_image else None
-    raw_means = {tag: value / count for tag, value in raw_acc.items()}
-    return loss_acc / count, pixel_mean, vgg_mean, gan_mean, d_mean, image_mean, raw_means
 
 
 def apply_learning_rate(optimizer, lr):
@@ -883,7 +763,7 @@ def prior_image(model, image):
 
 
 def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, image_dir=None, step=None, detector=None):
-    """Mean of the weighted objective. The KL is returned beside it.
+    """Mean of the weighted objective.
 
     The extras hold the raw term means and val/psnr of the clamped reconstruction,
     and for a vae2 the noise and scale_eq PSNRs of `robustness`. With faces the
@@ -897,8 +777,6 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
     pixel_acc = 0.0
     vgg_acc = 0.0
     image_acc = {}
-    kl_acc = 0.0
-    saw_kl = False
     raw_acc = {}
     count = 0
     saved = 0
@@ -918,7 +796,7 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
             image = batch.image.to(device)
             pixel_weight = None
             pred = model(image)
-            tally.add(model.mu, model.logvar, sample=True)
+            tally.add(model.mu, None, sample=True)
             if robust:
                 mus.append(model.mu)
                 frames_cpu.append(image.cpu())
@@ -939,7 +817,7 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
                 error, pixels = masked_error(pred, image, ~inside)
                 face_acc[2] += error
                 face_acc[3] += pixels
-            raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None, pixel_weight)
+            raw, layer_raw = raw_terms(objective, cfg, pred, image, pixel_weight)
             total, weighted = objective.combine(raw, layer_raw)
             frames = len(chunk)
             loss_acc += total.item() * frames
@@ -952,9 +830,6 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
             for name in IMAGE_TERMS:
                 if name in weighted:
                     image_acc[name] = image_acc.get(name, 0.0) + weighted[name].item() * frames
-            if model.kl is not None:
-                kl_acc += float(model.kl) * frames
-                saw_kl = True
             count += frames
     report = tally.report()
     extras = {tag: value / count for tag, value in raw_acc.items()}
@@ -979,7 +854,6 @@ def evaluate_vae(model, films, specs, crop, batch_size, device, cfg, objective, 
         loss_acc / count,
         (pixel_mean, vgg_mean, None, None),
         None,
-        kl_acc / count if saw_kl else None,
         report,
         extras,
     )
@@ -1017,17 +891,8 @@ class EvalResult:
     loss: float
     parts: tuple
     neighbor: float | None
-    kl: float | None
     latent: dict | None = None
     extras: dict | None = None
-
-
-def _scalar(value):
-    if value is None:
-        return None
-    if torch.is_tensor(value):
-        return float(value.detach())
-    return float(value)
 
 
 @dataclass
@@ -1129,12 +994,8 @@ def open_run(cfg, resume, finetune, load):
 
     model, label = build_model(
         cfg.arch, cfg.blocks, cfg.channels, cfg.in_frames,
-        radius=cfg.radius, stem=cfg.stem, sharpness=cfg.sharpness, reject=cfg.reject,
-        levels=cfg.levels, bilinear=cfg.bilinear, codes=cfg.codes, patch=cfg.patch,
-        res_scale=cfg.res_scale, vote=cfg.vote,
-        latent=cfg.latent, factor=cfg.factor, beta=cfg.beta,
-        encoder_blocks=cfg.encoder_blocks, decoder_blocks=cfg.decoder_blocks,
-        widths=cfg.widths, decoder_widths=cfg.decoder_widths, posterior=cfg.posterior,
+        latent=cfg.latent, factor=cfg.factor,
+        encoder_blocks=cfg.encoder_blocks, decoder_blocks=cfg.decoder_blocks, widths=cfg.widths,
         activation=cfg.activation, condition=cfg.condition,
     )
     model = model.train().to(device)
@@ -1150,7 +1011,7 @@ def open_run(cfg, resume, finetune, load):
     spynet = getattr(getattr(model, "align", None), "spynet", None)
     if spynet is not None and generator is None:
         if cfg.spynet_weights is None:
-            raise SystemExit(f"{cfg.source}: a fresh latent_up with in_frames {cfg.in_frames} needs spynet_weights")
+            raise SystemExit(f"{cfg.source}: a fresh latent_up needs spynet_weights")
         load_spynet_weights(spynet, cfg.spynet_weights)
         print(f"spynet {cfg.spynet_weights}  frozen", flush=True)
     if len(trainable) != len(list(model.parameters())):
@@ -1234,8 +1095,7 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
     """The live page and the step loop.
 
     Validation specs are drawn before the loader starts. The plateau follows
-    the objective from `evaluate_split`. Commitment and KL are added on the
-    training step and logged beside that objective.
+    the objective from `evaluate_split`.
     """
     cfg = run.cfg
     objective = Objective(cfg, run.device)
@@ -1283,19 +1143,15 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
             if mu is None:
                 return None
             tally = LatentTally()
-            tally.add(mu, run.model.logvar)
+            tally.add(mu, None)
             return tally.report()
 
-        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, train_kl, val_kl, train_latent, val_latent, train_extras=None, val_extras=None):
+        def log(step, train_loss, val_loss, train_parts, val_parts, usage, neighbor_image, lr, train_latent, val_latent, train_extras=None, val_extras=None):
             extras = {}
             if train_extras:
                 extras.update(train_extras)
             if val_extras:
                 extras.update(val_extras)
-            if train_kl is not None:
-                extras["train_raw/kl"] = train_kl
-            if val_kl is not None:
-                extras["val_raw/kl"] = val_kl
             if train_latent is not None:
                 extras.update(latent_scalars(train_latent, "train"))
             if val_latent is not None:
@@ -1349,12 +1205,9 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 )
             if val_extras and "val_noise/scale_eq_psnr" in val_extras:
                 message += f"  pooled {val_extras['val_noise/scale_eq_psnr']:.2f}"
-            if val_kl is not None:
-                message += f"  kl {val_kl:.6f}"
             if val_latent is not None:
                 message += (
                     f"  mu {val_latent['mu_mean']:+.3f} ± {val_latent['mu_std']:.3f}"
-                    f"  sigma {val_latent['sigma_mean']:.3f}"
                     f"  spread {val_latent['spread']:.3f}"
                 )
             print(message, flush=True)
@@ -1434,7 +1287,7 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 result, decision, old_lr = validate()
                 log(
                     step, None, result.loss, None, result.parts, None, result.neighbor,
-                    learning_rate(cfg, step, run.plateau), None, result.kl, None, result.latent,
+                    learning_rate(cfg, step, run.plateau), None, result.latent,
                     None, result.extras,
                 )
                 stopped = note_plateau(decision, old_lr)
@@ -1444,15 +1297,8 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 lr = run.apply_rate(step)
                 started = time.perf_counter()
                 work = one_step(loader, objective, live is not None)
-                train_kl = _scalar(getattr(run.model, "kl", None))
                 train_latent = batch_latent()
                 loss, weighted = objective.combine(work.raw, work.layer_raw)
-                align_loss = getattr(run.model, "align_loss", None)
-                if align_loss is not None:
-                    loss = loss + align_loss
-                kl_loss = getattr(run.model, "kl_loss", None)
-                if kl_loss is not None:
-                    loss = loss + kl_loss
                 if work.loss is not None:
                     loss = loss + work.loss
                 run.optimizer.zero_grad(set_to_none=True)
@@ -1489,8 +1335,6 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                 if "train_codec/batch" in train_extras:
                     # Frames per codec: h264/mpeg4/mpeg2/unknown. Text stays out of TensorBoard.
                     line += f"  codecs {train_extras.pop('train_codec/batch')}"
-                if train_kl is not None:
-                    line += f"  kl {train_kl:.6f}"
                 print(line, flush=True)
 
                 if live is not None:
@@ -1513,8 +1357,7 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                     None if result is None else result.parts,
                     usage,
                     None if result is None else result.neighbor,
-                    lr, train_kl,
-                    None if result is None else result.kl,
+                    lr,
                     train_latent,
                     None if result is None else result.latent,
                     train_extras,
@@ -1535,75 +1378,6 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
             live.close()
     shown = saved_at / "model.pt" if saved_at is not None else run.out_dir / "model.pt"
     print(f"done  {shown}", flush=True)
-
-
-def sr_hooks(run):
-    """Paired low and master batches, and the discriminator step."""
-    cfg = run.cfg
-    films = run.films
-    rng = run.rng
-    radius = cfg.in_frames // 2
-    gan = run.gan
-
-    def make_val_specs():
-        specs = []
-        while len(specs) < cfg.val_count:
-            need = min(cfg.batch, cfg.val_count - len(specs))
-            specs.extend(make_batch_specs(rng, films, "val", need))
-        return specs
-
-    def make_loader():
-        def produce():
-            specs = make_batch_specs(rng, films, "train", cfg.batch)
-            film_index, variant_index, _index = specs[0]
-            variant = films[film_index].variants[variant_index]
-            low, high = batch_from_specs(films, specs, radius)
-            box = None
-            if gan is not None:
-                box = sample_box(high, gan.crop, rng)
-            return PreparedBatch(low, high, variant.low.width, variant.low.height, box)
-
-        return BatchLoader(produce)
-
-    def one_step(loader, objective, show):
-        prepared = loader.get()
-        low = prepared.low.to(run.device)
-        high = prepared.high.to(run.device)
-        pred = run.model(low)
-        box = prepared.box
-        d_value = None
-        if gan is not None:
-            d_loss = 0.5 * (
-                gan_bce(run.discriminator(take(high, box)), True)
-                + gan_bce(run.discriminator(take(pred.detach(), box)), False)
-            )
-            run.disc_optimizer.zero_grad(set_to_none=True)
-            d_loss.backward()
-            run.disc_optimizer.step()
-            d_value = d_loss.item()
-            for parameter in run.discriminator.parameters():
-                parameter.requires_grad_(False)
-        raw, layer_raw = raw_terms(objective, cfg, pred, high, run.discriminator, box)
-        images = None
-        if show:
-            center = radius * 3
-            images = {
-                "low": low[0, center:center + 3],
-                "upscale": pred[0],
-                "master": high[0],
-            }
-        return StepOut(raw, layer_raw, d_value, images, prepared.width, prepared.height)
-
-    def evaluate_split(objective, specs, image_dir, step):
-        loss, pixel, vgg, gan_value, d_value, neighbor, raw_means = evaluate(
-            run.model, films, specs, radius, cfg.batch, run.device, cfg, objective,
-            run.discriminator, image_dir=image_dir, step=step,
-        )
-        return EvalResult(
-            loss, (pixel, vgg, gan_value, d_value), neighbor, None, None, raw_means,
-        )
-
-    return make_val_specs, make_loader, one_step, evaluate_split
 
 
 def adaptive_gan_weight(objective_loss, gan_loss, layer):
@@ -1655,7 +1429,7 @@ def vae_hooks(run):
             k = eq_rng.choice(scale_eq.factors)
             recon, frame = pooled_pair(run.model, image, run.model.code, k)
             if recon is not None:
-                raw, layer_raw = raw_terms(objective, cfg, recon, frame, None, None)
+                raw, layer_raw = raw_terms(objective, cfg, recon, frame)
                 value, _parts = objective.combine(raw, layer_raw)
                 weighted = scale_eq.weight * value
                 added = weighted if added is None else added + weighted
@@ -1716,7 +1490,7 @@ def vae_hooks(run):
             pixel_weight = weight_map(mask, faces.weight)
             face_extras["train_raw/face_fraction"] = face_fraction(mask).item()
         pred = run.model(image)
-        raw, layer_raw = raw_terms(objective, cfg, pred, image, None, None, pixel_weight)
+        raw, layer_raw = raw_terms(objective, cfg, pred, image, pixel_weight)
         d_value = None
         added = None
         gan_value = None
@@ -1806,11 +1580,6 @@ def latent_hooks(run):
     rng = run.rng
     device = run.device
     vae = load_frozen_vae(cfg, device)
-    if cfg.init_from_vae:
-        if run.loaded:
-            print("init_from_vae skipped: the weights come from a checkpoint", flush=True)
-        else:
-            print(init_from_vae(run.model, vae), flush=True)
     shift = vae.latent_shift.view(1, -1, 1, 1)
     scale = vae.latent_scale.view(1, -1, 1, 1)
     need_image = any(cfg.term(name) is not None for name in ("pixel", "vgg", *IMAGE_TERMS))
@@ -1846,8 +1615,7 @@ def latent_hooks(run):
     radius = cfg.in_frames // 2
     # The scene cut draw has its own generator too, so the batches stay those of the seed.
     cut_rng = random.Random(cfg.seed + 2)
-    if cfg.in_frames > 1:
-        print(f"in_frames {cfg.in_frames}  scene_cut {cfg.scene_cut:g}", flush=True)
+    print(f"in_frames {cfg.in_frames}  scene_cut {cfg.scene_cut:g}", flush=True)
 
     def middle(low):
         """The middle low frame of (B, 3 * in_frames, H, W)."""
@@ -1897,7 +1665,7 @@ def latent_hooks(run):
         """(μ - shift) * scale of the master, no gradient."""
         with torch.no_grad():
             padded, _height, _width = pad_to(high, vae.factor)
-            mu, _logvar = vae.encode(padded)
+            mu = vae.encode(padded)
             return (mu - shift) * scale, mu
 
     def decode(code, height, width):
@@ -1923,7 +1691,7 @@ def latent_hooks(run):
             raw = {"latent": ((code - target).abs() * latent_weight).mean()}
         layer_raw = {}
         if need_image:
-            image_raw, layer_raw = raw_terms(objective, cfg, pred, high, None, None, pixel_weight)
+            image_raw, layer_raw = raw_terms(objective, cfg, pred, high, pixel_weight)
             raw.update(image_raw)
         return raw, layer_raw
 
@@ -1940,7 +1708,7 @@ def latent_hooks(run):
             film_index, variant_index, _index = specs[0]
             variant = films[film_index].variants[variant_index]
             low, high = batch_from_specs(films, specs, radius)
-            cuts = scene_cuts(low) if radius else None
+            cuts = scene_cuts(low)
             boxes = None
             mask = None
             if detector is not None:
@@ -2045,11 +1813,10 @@ def latent_hooks(run):
                     condition = condition_of(codecs).to(device)
                 code, target, mu = predict(low, high, condition)
                 pred = decode(code, height, width)
-                if radius:
-                    # Both neighbors replaced by the middle frame: what the neighbors change.
-                    still = middle(low).repeat(1, cfg.in_frames, 1, 1)
-                    alone = run.model(still) if condition is None else run.model(still, condition)
-                    neighbor_acc += float((decode(alone, height, width) - pred).abs().mean()) * len(chunk)
+                # Both neighbors replaced by the middle frame: what the neighbors change.
+                still = middle(low).repeat(1, cfg.in_frames, 1, 1)
+                alone = run.model(still) if condition is None else run.model(still, condition)
+                neighbor_acc += float((decode(alone, height, width) - pred).abs().mean()) * len(chunk)
                 if conditioned:
                     for codec, value in zip(codecs, psnr_each(pred, high)):
                         found = codec_acc.setdefault(codec or "unknown", [0.0, 0])
@@ -2159,8 +1926,8 @@ def latent_hooks(run):
         print(f"step {step:06d}  validation {count} frames  {time.perf_counter() - started:.1f}s", flush=True)
         pixel = weighted_acc["pixel"] / count if "pixel" in weighted_acc else None
         vgg = weighted_acc["vgg"] / count if "vgg" in weighted_acc else None
-        neighbor = neighbor_acc / count if radius else None
-        return EvalResult(loss_acc / count, (pixel, vgg, None, None), neighbor, None, None, extras)
+        neighbor = neighbor_acc / count
+        return EvalResult(loss_acc / count, (pixel, vgg, None, None), neighbor, None, extras)
 
     return make_val_specs, make_loader, one_step, evaluate_split
 
@@ -2186,21 +1953,16 @@ def load_vae(cfg):
 
 
 def train(cfg, preview=True, resume=None, finetune=None):
-    if cfg.arch in VAE_ARCHS:
-        def load():
-            return load_vae(cfg)
-
-        hooks = vae_hooks
-    elif cfg.arch == LATENT_ARCH:
+    if cfg.arch == LATENT_ARCH:
         def load():
             return load_sr(cfg)
 
         hooks = latent_hooks
     else:
         def load():
-            return load_sr(cfg)
+            return load_vae(cfg)
 
-        hooks = sr_hooks
+        hooks = vae_hooks
     run = open_run(cfg, resume, finetune, load)
     if run is None:
         return

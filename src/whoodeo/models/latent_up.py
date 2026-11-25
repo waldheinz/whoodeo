@@ -11,7 +11,7 @@ The layers are the vae2 encoder's: a 3x3 stem, residual blocks of
 conv + activation (`activation`, silu or relu as in vae2) whose last convolution starts at zero, a stride-2 convolution to
 each coarser level, and `blocks` residual blocks at 1/4 with dilations 1, 2,
 4 in turn. A 3x3 head after the activation gives the code. No normalization, no
-attention, so it runs on the Neural Engine at a fixed size. `channels` is the
+attention. `channels` is the
 width at the low resolution, `widths` the multiples per level (low, 1/2, 1/4),
 `encoder_blocks` the residual count at low and at 1/2. A side that 4 does not
 divide is padded on the bottom and the right, as vae2 pads, and the caller
@@ -26,11 +26,11 @@ residual block, and the block's output becomes x * (1 + γ) + β. The last
 layer of the MLP starts at zero, so a fresh FiLM gives γ = β = 0 and the
 network is exactly the one without it: a latent_up checkpoint without
 condition loads into it with the FiLM weights left at their start. The
-encoder keeps its parameter names. For an export the vector is a second input, and
-the FiLM MLP stays in the graph, a multiply and an add per block.
+encoder keeps its parameter names. The MLX export (whoodeo.mlxport) keeps the
+vector as an input and the FiLM MLP in the graph.
 
-`in_frames: 3` reads the previous, middle, and next low frame, stacked on
-the channels as the other multi-frame archs take them (9 channels). Each
+`in_frames: 3` (required, odd, at least 3) reads the previous, middle, and
+next low frame, stacked on the channels (9 channels). Each
 frame runs through the encoder's stem and the residual blocks at the low
 resolution (with FiLM), so every frame has `channels` features at full low
 resolution. `FeatureAlign` then brings the neighbors onto the middle frame:
@@ -45,9 +45,8 @@ for one frame. All of it is inside the model: training, export, and apply
 feed the raw 9 channels. SPyNet's weights are part of the state dict and
 never train (requires_grad false); a fresh run loads the official weights
 (training key spynet_weights). The fusion has PyTorch's default start. The
-clip's edges repeat the middle frame, as for every multi-frame arch; the flow
-there is about zero. A scene cut makes the warp error large, which the
-fusion can learn to read. A one-frame checkpoint does not load into it.
+clip's edges repeat the middle frame; the flow there is about zero. A scene
+cut makes the warp error large, which the fusion can learn to read.
 """
 
 import torch
@@ -55,7 +54,7 @@ import torch.nn as nn
 
 from whoodeo.models.common import pad_to
 from whoodeo.spynet import SPyNet, flow_warp
-from whoodeo.models.vae2 import DILATIONS, Encoder, activation_fn, layout
+from whoodeo.models.vae2 import Encoder, activation_fn, layout
 
 # The network shrinks the low frame by this much: vae2 factor 8 over the 2x scale.
 FACTOR = 4
@@ -81,7 +80,7 @@ def latent_layout(encoder_blocks=None, widths=None, where="latent_up"):
     """Residual blocks per level above 1/4 and width multiples, defaults filled in."""
     blocks = LEVEL_BLOCKS if encoder_blocks is None else encoder_blocks
     multiples = WIDTHS if widths is None else widths
-    chosen, _dec, chosen_widths, _dec_widths = layout(FACTOR, blocks, None, multiples, None, where=where)
+    chosen, _dec, chosen_widths = layout(FACTOR, blocks, None, multiples, where=where)
     return chosen, chosen_widths
 
 
@@ -118,32 +117,29 @@ def _blocks(hidden, sequence, pairs):
     return hidden
 
 
-def run_encoder(encoder, image, modulation=None, align=None, frames=1):
+def run_encoder(encoder, image, modulation, align, frames):
     """Encoder.forward, with x * (1 + γ) + β behind each residual block when modulated.
 
     `modulation` is one (γ, β) pair of shape (B or 1, C, 1, 1) per block, in
-    the order of `block_widths`, or None. With `align` (a FeatureAlign),
-    `image` holds `frames` frames on its channels: stem and the blocks at
-    low resolution run per frame (as one batch of B * frames), the align
-    fuses them onto the middle frame, and the rest runs once.
+    the order of `block_widths`, or None. `image` holds `frames` frames on
+    its channels: stem and the blocks at low resolution run per frame (as one
+    batch of B * frames), `align` (a FeatureAlign) fuses them onto the middle
+    frame, and the rest runs once.
     """
     pairs = None if modulation is None else iter(modulation)
     stages = list(encoder.downs)
     first = stages[0]
-    if align is None:
-        hidden = _blocks(encoder.stem(image), first.blocks, pairs)
-    else:
-        batch, _channels, height, width = image.shape
-        images = [image[:, 3 * index:3 * index + 3] for index in range(frames)]
-        stacked = torch.cat(images, dim=0)
-        front = None
-        if modulation is not None:
-            front = iter([
-                (_per_frame(gamma, frames), _per_frame(beta, frames))
-                for gamma, beta in (next(pairs) for _ in range(len(first.blocks)))
-            ])
-        hidden = _blocks(encoder.stem(stacked), first.blocks, front)
-        hidden = align(images, list(hidden.split(batch, dim=0)))
+    batch = image.shape[0]
+    images = [image[:, 3 * index:3 * index + 3] for index in range(frames)]
+    stacked = torch.cat(images, dim=0)
+    front = None
+    if modulation is not None:
+        front = iter([
+            (_per_frame(gamma, frames), _per_frame(beta, frames))
+            for gamma, beta in (next(pairs) for _ in range(len(first.blocks)))
+        ])
+    hidden = _blocks(encoder.stem(stacked), first.blocks, front)
+    hidden = align(images, list(hidden.split(batch, dim=0)))
     hidden = first.down(hidden)
     for stage in stages[1:]:
         hidden = stage.down(_blocks(hidden, stage.blocks, pairs))
@@ -239,15 +235,15 @@ class LatentUp(nn.Module):
 
     def __init__(
         self, channels, blocks, latent, encoder_blocks=None, widths=None, activation=None, condition=None,
-        in_frames=1,
+        in_frames=3,
     ):
         super().__init__()
         if channels < 1 or blocks < 0 or latent < 1:
             raise SystemExit("channels and latent must be positive, blocks zero or more")
         if condition is not None and condition not in CONDITIONS:
             raise SystemExit(f"condition must be one of {', '.join(CONDITIONS)}, not {condition!r}")
-        if in_frames < 1 or in_frames % 2 != 1:
-            raise SystemExit(f"latent_up in_frames must be odd, not {in_frames}")
+        if in_frames < 3 or in_frames % 2 != 1:
+            raise SystemExit(f"latent_up in_frames must be odd and at least 3, not {in_frames}")
         encoder_blocks, widths = latent_layout(encoder_blocks, widths)
         self.in_frames = in_frames
         self.factor = FACTOR
@@ -257,15 +253,13 @@ class LatentUp(nn.Module):
         self.encoder_blocks = encoder_blocks
         self.widths = tuple(channels * multiple for multiple in widths)
         self.activation = activation or "silu"
-        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats=1, activation=activation)
+        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, activation=activation)
         self.condition = condition
         self.condition_size = 0 if condition is None else CONDITIONS[condition]
         self.film = None
         if condition is not None:
             self.film = FiLM(self.condition_size, block_widths(self.encoder), activation)
-        self.align = None
-        if in_frames > 1:
-            self.align = FeatureAlign(self.widths[0], in_frames, activation)
+        self.align = FeatureAlign(self.widths[0], in_frames, activation)
 
     def condition_batch(self, codecs, device=None):
         """(B, condition_size) for a list of codecs, None meaning unknown."""
@@ -293,22 +287,12 @@ class LatentUp(nn.Module):
             modulation = self.film(condition)
         return run_encoder(self.encoder, padded, modulation, self.align, self.in_frames)
 
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        if any(key.startswith("mix.") for key in state_dict):
-            raise SystemExit(
-                "a 3-frame latent_up with the old FrameMix (mix.*) does not load into the "
-                "feature-aligned one; that code is in git before the feature alignment"
-            )
-        return super().load_state_dict(state_dict, strict=strict, assign=assign)
-
     def neighbor_usage(self):
-        """Weight and gradient ratio of the fusion's last layer, as vote reports its vote.
+        """Weight and gradient ratio of the fusion's last layer.
 
         weight is the mean absolute kernel. grad is its mean absolute
-        gradient over the same on the head. None for one frame.
+        gradient over the same on the head.
         """
-        if self.align is None:
-            return None
         kernel = self.align.outer.weight
         stats = {"weight": float(kernel.detach().abs().mean())}
         head_grad = self.encoder.to_stats.weight.grad
@@ -316,42 +300,6 @@ class LatentUp(nn.Module):
             ratio = kernel.grad.detach().abs().mean() / head_grad.detach().abs().mean().clamp_min(1e-12)
             stats["grad"] = float(ratio)
         return stats
-
-
-@torch.no_grad()
-def init_from_vae(model, vae):
-    """Copy the vae2 encoder's latent blocks and its head into `model`. Returns a note.
-
-    The vae2 blocks at the latent go into the last blocks at 1/4 here, with the
-    same dilations, when the widths agree. The head is the vae2's last
-    convolution with the shift and scale folded in, so it gives
-    (μ - shift) * scale. Anything that does not fit is left as it was.
-    """
-    ours = model.encoder
-    theirs = vae.encoder
-    notes = []
-    width = model.widths[-1]
-    if width != vae.widths[-1]:
-        return f"no warm start: width {width} at 1/4, vae2 latent width {vae.widths[-1]}"
-    count = len(theirs.mid)
-    offset = len(ours.mid) - count
-    if offset >= 0 and offset % len(DILATIONS) == 0:
-        for index in range(count):
-            ours.mid[offset + index].load_state_dict(theirs.mid[index].state_dict())
-        notes.append(f"blocks {offset}..{offset + count - 1} at 1/4 from the vae2 latent blocks")
-    else:
-        notes.append(
-            f"latent blocks left: {len(ours.mid)} here, {count} in the vae2, "
-            "the difference must be a multiple of 3"
-        )
-    head = theirs.to_stats
-    if head.weight.shape == ours.to_stats.weight.shape:
-        scale = vae.latent_scale.to(head.weight)
-        shift = vae.latent_shift.to(head.weight)
-        ours.to_stats.weight.copy_(head.weight * scale.view(-1, 1, 1, 1))
-        ours.to_stats.bias.copy_((head.bias - shift) * scale)
-        notes.append("head from the vae2 head, shift and scale folded in")
-    return "warm start: " + ", ".join(notes)
 
 
 def fixed_condition(model, codec):
@@ -366,56 +314,6 @@ def fixed_condition(model, codec):
             raise SystemExit(f"this latent_up has no condition, so it takes no codec ({codec})")
         return None
     return condition_vector(codec, model.condition_size).unsqueeze(0)
-
-
-class LatentUpExport(nn.Module):
-    """latent_up and the vae2 decoder in one graph, the frame clamped to [0, 1], for tracing.
-
-    The vae2 decoder reads μ = z / scale + shift. Both are per channel and sit
-    right behind the head, the last convolution of latent_up, so they fold
-    into its weight and bias: no extra op, and exact, since the decoder's zero
-    padding sees μ in both cases. The input must already divide by FACTOR;
-    the caller pads the bottom and the right as `pad_to` does and crops the
-    frame back to 2h x 2w.
-
-    With FiLM the condition vector is a second input of shape (B, condition_size):
-    one-hot of CODECS, unknown is all zero, then RESERVE zeros. The FiLM MLP
-    stays in the graph, so one package serves every codec, and later reserve
-    slots can be filled without a new export.
-
-    One frame only: the 3-frame model goes to the app through the MLX port
-    (whoodeo.mlxport.convert).
-    """
-
-    def __init__(self, model, vae):
-        super().__init__()
-        import copy
-
-        self.encoder = copy.deepcopy(model.encoder)
-        self.decoder = copy.deepcopy(vae.decoder)
-        if model.in_frames != 1:
-            raise SystemExit(
-                "the Core ML export takes a one-frame latent_up; a 3-frame one goes to the app "
-                "with python -m whoodeo.mlxport.convert CHECKPOINT --app"
-            )
-        self.film = None if model.film is None else copy.deepcopy(model.film)
-        self.condition_size = 0 if model.film is None else model.condition_size
-        head = self.encoder.to_stats
-        inverse = vae.latent_scale.reciprocal().to(head.weight)
-        shift = vae.latent_shift.to(head.weight)
-        with torch.no_grad():
-            head.weight.copy_(head.weight * inverse.view(-1, 1, 1, 1))
-            head.bias.copy_(head.bias * inverse + shift)
-
-    def forward(self, frames, condition=None):
-        pairs = None
-        if self.film is not None:
-            if condition is None:
-                condition = torch.zeros(
-                    frames.shape[0], self.condition_size, device=frames.device, dtype=frames.dtype,
-                )
-            pairs = self.film(condition)
-        return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
 
 
 class LatentUpReference(nn.Module):

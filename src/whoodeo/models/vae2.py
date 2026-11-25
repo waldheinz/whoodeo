@@ -15,14 +15,12 @@ fresh network is a plain chain and nothing has to be normalized.
 The levels can be set apart, full resolution first. `encoder_blocks` and
 `decoder_blocks` hold one count per level above the latent, log2(factor) of
 them. `widths` holds a multiple of `channels` per level, the latent level
-last, one more entry. `decoder_widths` gives the decoder its own, so it can
-be wider near the picture. Left out, each is the layout above.
+last, one more entry; the decoder mirrors them. Left out, each is the layout above.
 
-The encoder maps the frame to a diagonal Gaussian of `latent` channels at
-1/`factor` of each side. Training draws a sample, evaluation uses the mean.
-`posterior: fixed` gives only the mean: no log-variance, no sample, no KL.
+The encoder maps the frame to the code μ of `latent` channels at 1/`factor`
+of each side: a fixed posterior, no log-variance, no sample, no KL.
 
-`noise_tau` above 0 adds latent noise in training, after any sample: each
+`noise_tau` above 0 adds latent noise in training: each
 frame draws s from |N(0, tau^2)| and gets s * std_c * N(0, 1), where std_c is
 a running std of μ per channel (`latent_ema_std`, EMA 0.99, set from the
 first batch). The decoder learns to read a code that is a little off.
@@ -34,8 +32,7 @@ reconstruction is cut back to the original size.
 `latent_shift` and `latent_scale` are per-channel buffers set at each
 validation from the held-out μ: (μ - shift) * scale has mean 0 and std 1 in
 each channel. A model that works on latents, such as an upscaler, should see
-that scaled code and hand z / scale + shift back to the decoder. A checkpoint
-with one shift and one scale for all channels loads with them repeated.
+that scaled code and hand z / scale + shift back to the decoder.
 """
 
 import math
@@ -52,7 +49,6 @@ WIDTHS = (1, 2, 4, 4, 4)
 LEVEL_BLOCKS = (1, 2, 2, 2)
 # Dilations of the latent blocks, repeated in this order.
 DILATIONS = (1, 2, 4)
-POSTERIORS = ("gaussian", "fixed")
 # Running std of μ per channel, the scale of the training noise.
 EMA_DECAY = 0.99
 # The activations a vae2 or latent_up can use. silu is the default.
@@ -110,10 +106,10 @@ class _Up(nn.Module):
         return self.blocks(self.mix(x))
 
 
-def layout(factor, encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None, where="vae2"):
+def layout(factor, encoder_blocks=None, decoder_blocks=None, widths=None, where="vae2"):
     """Blocks and width multiples per level, full resolution first, defaults filled in.
 
-    Returns (encoder_blocks, decoder_blocks, widths, decoder_widths) as tuples.
+    Returns (encoder_blocks, decoder_blocks, widths) as tuples.
     """
     stages = int(math.log2(factor))
     default_blocks = LEVEL_BLOCKS[:stages]
@@ -135,15 +131,14 @@ def layout(factor, encoder_blocks=None, decoder_blocks=None, widths=None, decode
 
     encoder = pick("encoder_blocks", encoder_blocks, default_blocks, stages, 0)
     decoder = pick("decoder_blocks", decoder_blocks, default_blocks, stages, 0)
-    enc_widths = pick("widths", widths, default_widths, stages + 1, 1)
-    dec_widths = pick("decoder_widths", decoder_widths, enc_widths, stages + 1, 1)
-    return encoder, decoder, enc_widths, dec_widths
+    widths = pick("widths", widths, default_widths, stages + 1, 1)
+    return encoder, decoder, widths
 
 
-def layout_text(factor, encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None):
+def layout_text(factor, encoder_blocks=None, decoder_blocks=None, widths=None):
     """The levels that differ from the default layout, for a log line. Empty for the default."""
-    chosen = layout(factor, encoder_blocks, decoder_blocks, widths, decoder_widths)
-    names = ("encoder_blocks", "decoder_blocks", "widths", "decoder_widths")
+    chosen = layout(factor, encoder_blocks, decoder_blocks, widths)
+    names = ("encoder_blocks", "decoder_blocks", "widths")
     parts = [
         f" {name} {'/'.join(str(item) for item in value)}"
         for name, value, default in zip(names, chosen, layout(factor))
@@ -153,7 +148,7 @@ def layout_text(factor, encoder_blocks=None, decoder_blocks=None, widths=None, d
 
 
 class Encoder(nn.Module):
-    def __init__(self, widths, blocks, latent, level_blocks, stats=2, activation=None):
+    def __init__(self, widths, blocks, latent, level_blocks, activation=None):
         super().__init__()
         stages = len(widths) - 1
         self.act = activation_fn(activation)
@@ -163,7 +158,7 @@ class Encoder(nn.Module):
             for level in range(stages)
         )
         self.mid = _blocks(widths[-1], blocks, DILATIONS, activation)
-        self.to_stats = nn.Conv2d(widths[-1], latent * stats, kernel_size=3, padding=1)
+        self.to_stats = nn.Conv2d(widths[-1], latent, kernel_size=3, padding=1)
 
     def forward(self, image):
         hidden = self.stem(image)
@@ -194,12 +189,11 @@ class Decoder(nn.Module):
 
 
 class VAE2(nn.Module):
-    """Tapered widths, `blocks` dilated blocks at the latent, a Gaussian of `latent` channels."""
+    """Tapered widths, `blocks` dilated blocks at the latent, a code of `latent` channels."""
 
     def __init__(
-        self, channels, blocks, latent, factor, beta,
-        encoder_blocks=None, decoder_blocks=None, widths=None, decoder_widths=None,
-        posterior=None, activation=None,
+        self, channels, blocks, latent, factor,
+        encoder_blocks=None, decoder_blocks=None, widths=None, activation=None,
     ):
         super().__init__()
         activation_fn(activation)
@@ -208,62 +202,28 @@ class VAE2(nn.Module):
             raise SystemExit("channels, blocks, and latent must be positive")
         if factor < 2 or factor > 16 or factor & (factor - 1):
             raise SystemExit("factor must be a power of two from 2 to 16")
-        posterior = posterior or "gaussian"
-        if posterior not in POSTERIORS:
-            raise SystemExit(f"posterior must be gaussian or fixed, not {posterior!r}")
-        if posterior == "fixed":
-            if beta is not None:
-                raise SystemExit("posterior fixed has no KL and takes no beta")
-            beta = 0.0
-        elif isinstance(beta, bool) or not isinstance(beta, (int, float)) or float(beta) <= 0:
-            raise SystemExit("beta must be a positive number")
-        self.posterior = posterior
         self.noise_tau = 0.0
         self.in_frames = 1
         self.channels = channels
         self.latent = latent
         self.factor = factor
-        self.beta = float(beta)
-        self.kl = None
-        self.kl_loss = None
-        encoder_blocks, decoder_blocks, widths, decoder_widths = layout(
-            factor, encoder_blocks, decoder_blocks, widths, decoder_widths,
-        )
+        encoder_blocks, decoder_blocks, widths = layout(factor, encoder_blocks, decoder_blocks, widths)
         self.encoder_blocks = encoder_blocks
         self.decoder_blocks = decoder_blocks
         self.widths = tuple(channels * multiple for multiple in widths)
-        self.decoder_widths = tuple(channels * multiple for multiple in decoder_widths)
-        stats = 2 if posterior == "gaussian" else 1
-        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, stats, activation)
-        self.decoder = Decoder(self.decoder_widths, blocks, latent, decoder_blocks, activation)
+        self.encoder = Encoder(self.widths, blocks, latent, encoder_blocks, activation)
+        self.decoder = Decoder(self.widths, blocks, latent, decoder_blocks, activation)
         self.register_buffer("latent_shift", torch.zeros(latent))
         self.register_buffer("latent_scale", torch.ones(latent))
         # Zero until the first training batch sets it.
         self.register_buffer("latent_ema_std", torch.zeros(latent))
         self.mu = None
-        self.logvar = None
         self.mu_grad = None
         self.code = None
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        # Older checkpoints keep one shift and one scale, and no running std.
-        for name in ("latent_shift", "latent_scale"):
-            key = prefix + name
-            value = state_dict.get(key)
-            if value is not None and value.dim() == 0:
-                state_dict[key] = value.expand(self.latent).clone()
-        key = prefix + "latent_ema_std"
-        if key not in state_dict:
-            state_dict[key] = torch.zeros(self.latent)
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
     def encode(self, image):
-        """μ and the log-variance. The log-variance is None for posterior fixed."""
-        stats = self.encoder(image)
-        if self.posterior == "fixed":
-            return stats, None
-        mu, logvar = stats.chunk(2, dim=1)
-        return mu, logvar.clamp(-30, 20)
+        """The code μ."""
+        return self.encoder(image)
 
     def decode(self, latent, clamp=False):
         image = self.decoder(latent)
@@ -297,25 +257,15 @@ class VAE2(nn.Module):
         return latent + (draw.abs() * tau) * std.view(1, -1, 1, 1).to(latent.dtype) * eps
 
     def forward(self, image):
-        self.kl = None
-        self.kl_loss = None
         padded, height, width = pad_to(image, self.factor)
-        mu, logvar = self.encode(padded)
+        mu = self.encode(padded)
         latent = mu
-        if self.training and logvar is not None:
-            std = torch.exp(0.5 * logvar)
-            latent = mu + std * torch.randn_like(std)
         if self.training:
             self._track_std(mu)
             if self.noise_tau > 0:
                 latent = self.add_noise(latent, self.noise_tau)
         recon = self.decode(latent)[:, :, :height, :width]
-        if logvar is not None:
-            mean = 0.5 * (mu.square() + logvar.exp() - 1.0 - logvar).mean()
-            self.kl = mean.detach()
-            self.kl_loss = self.beta * mean
         self.mu = mu.detach()
-        self.logvar = None if logvar is None else logvar.detach()
         # Still in the graph: mu for its L2, the decoded code for scale_eq.
         self.mu_grad = mu
         self.code = latent

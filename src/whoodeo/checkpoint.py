@@ -18,10 +18,7 @@ train.pt adds the weights the optimizer works on (`weights`) and the
 average's decay and update count (`ema`).
 
 A run directory follows its latest link. A checkpoint directory, model.pt,
-or train.pt names one step exactly. An older run that still keeps model.pt
-directly in the run directory loads too. An older model.pt that still holds
-the optimizer in one file loads too. The next save of that run writes
-checkpoints/.
+or train.pt names one step exactly.
 """
 
 import os
@@ -35,12 +32,6 @@ from whoodeo.catalog import runs_root
 from whoodeo.config import parse_model
 from whoodeo.models import build_model
 
-_ARCH_KEYS = (
-    "arch", "blocks", "channels", "in_frames",
-    "radius", "stem", "sharpness", "reject", "levels", "bilinear", "codes", "patch",
-    "res_scale", "vote", "latent", "factor", "beta",
-)
-
 
 @dataclass(frozen=True)
 class GeneratorCheckpoint:
@@ -48,7 +39,6 @@ class GeneratorCheckpoint:
     architecture: dict
     state_dict: dict
     step: int | None
-    legacy: bool
 
 
 @dataclass(frozen=True)
@@ -139,8 +129,7 @@ def save_run(
 
 def load_generator(path):
     """Generator weights from a model file, a checkpoint, or a run directory."""
-    spec, _payload = _read_model(_model_file(path))
-    return spec
+    return _read_model(_model_file(path))
 
 
 def load_resume(path):
@@ -152,13 +141,11 @@ def load_resume(path):
     model_path, train_path = _run_files(path)
     if not model_path.is_file():
         raise SystemExit(f"no model: {model_path}")
-    spec, payload = _read_model(model_path)
+    spec = _read_model(model_path)
     if train_path.is_file():
         state = _read_train(train_path)
         _same_step(spec, state, model_path, train_path)
         return spec, state
-    if spec.legacy:
-        return spec, _train_from_legacy(payload, model_path)
     raise SystemExit(
         f"no training state: {train_path}. Fine-tune this model with --model."
     )
@@ -190,17 +177,13 @@ def reconstruction_path(model_path, step, video):
 def build_generator(spec, device):
     """The saved generator, eval mode, on `device`."""
     (
-        arch, blocks, channels, in_frames, radius, stem, sharpness, reject, levels,
-        bilinear, codes, patch, res_scale, vote, latent, factor, beta,
-        encoder_blocks, decoder_blocks, widths, decoder_widths, posterior, _vae, activation, condition,
+        arch, blocks, channels, in_frames, latent, factor,
+        encoder_blocks, decoder_blocks, widths, _vae, activation, condition,
     ) = parse_model(spec.architecture, f"{spec.path}: architecture")
     model, label = build_model(
         arch, blocks, channels, in_frames,
-        radius=radius, stem=stem, sharpness=sharpness, reject=reject, levels=levels,
-        bilinear=bilinear, codes=codes, patch=patch, res_scale=res_scale, vote=vote,
-        latent=latent, factor=factor, beta=beta,
-        encoder_blocks=encoder_blocks, decoder_blocks=decoder_blocks,
-        widths=widths, decoder_widths=decoder_widths, posterior=posterior,
+        latent=latent, factor=factor,
+        encoder_blocks=encoder_blocks, decoder_blocks=decoder_blocks, widths=widths,
         activation=activation, condition=condition,
     )
     model.load_state_dict(spec.state_dict)
@@ -263,7 +246,7 @@ def _retarget(link, target):
 
 
 def _latest_checkpoint_dir(run_dir):
-    """Newest checkpoint of one run, or the legacy model.pt in the run itself."""
+    """Newest checkpoint of one run."""
     run_dir = Path(run_dir)
     link = run_dir / "latest"
     if link.is_symlink():
@@ -275,8 +258,6 @@ def _latest_checkpoint_dir(run_dir):
     best = _highest_step(run_dir / "checkpoints")
     if best is not None:
         return best.resolve()
-    if (run_dir / "model.pt").is_file():
-        return run_dir.resolve()
     return None
 
 
@@ -344,41 +325,18 @@ def _run_files(path):
 
 def _read_model(path):
     data = _load(path)
-    if "architecture" in data and "state_dict" in data:
-        architecture = data["architecture"]
-        if not isinstance(architecture, dict):
-            raise SystemExit(f"{path}: architecture must be a mapping")
-        spec = GeneratorCheckpoint(
-            path, architecture, data["state_dict"], _optional_step(data.get("step"), path), False,
-        )
-        return spec, None
-    args = data.get("args")
-    if "model" in data and isinstance(args, dict) and "arch" in args:
-        architecture = {
-            key: args[key]
-            for key in _ARCH_KEYS
-            if key in args and args[key] is not None
-        }
-        spec = GeneratorCheckpoint(
-            path, architecture, data["model"], _optional_step(data.get("step"), path), True,
-        )
-        return spec, data
-    raise SystemExit(f"{path}: not a whoodeo model")
+    if "architecture" not in data or "state_dict" not in data:
+        raise SystemExit(f"{path}: not a whoodeo model")
+    architecture = data["architecture"]
+    if not isinstance(architecture, dict):
+        raise SystemExit(f"{path}: architecture must be a mapping")
+    return GeneratorCheckpoint(
+        path, architecture, data["state_dict"], _optional_step(data.get("step"), path),
+    )
 
 
 def _read_train(path):
     return _train_state(path, _load(path))
-
-
-def _train_from_legacy(data, path):
-    args = data.get("args") or {}
-    return _train_state(path, {
-        "step": data.get("step"),
-        "optimizer": data.get("optimizer"),
-        "loss": args.get("loss"),
-        "discriminator": data.get("discriminator"),
-        "disc_optimizer": data.get("disc_optimizer"),
-    })
 
 
 def _train_state(path, data):

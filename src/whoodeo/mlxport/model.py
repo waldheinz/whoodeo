@@ -33,7 +33,7 @@ def _act(name):
 class AlignModel:
     """`dtype` is the precision of latent_up and the decoder (SPyNet and its flow stay fp32).
 
-    float16 is what the Core ML export computes in (compute_precision FLOAT16).
+    float16 is what the app computes in.
     """
 
     def __init__(self, params, config, dtype=mx.float32):
@@ -170,11 +170,9 @@ class AlignModel:
                         iter(front) if front is not None else None)
             for i in range(frames)
         ]
-        x = feats[0]
-        if frames > 1:
-            source = padded if images is None else images
-            images = [source[..., 3 * i:3 * i + 3].astype(mx.float32) for i in range(frames)]
-            x = self.fuse(images, feats, stages)
+        source = padded if images is None else images
+        images = [source[..., 3 * i:3 * i + 3].astype(mx.float32) for i in range(frames)]
+        x = self.fuse(images, feats, stages)
         x = self.conv("encoder.downs.0.down", x, stride=2)
         for level, count in enumerate(self.c["encoder_blocks"][1:], start=1):
             x = self.blocks(f"encoder.downs.{level}.blocks", count, x, pairs)
