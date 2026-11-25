@@ -45,7 +45,6 @@ spynet_weights: /home/trem/ftvsr/weights/spynet_20210409-c6c1bd09.pth
 codec_unknown: 0.2
 scene_cut: 0.1
 ema: 0.999
-init_from_vae: false
 
 batch: 8
 lr: 1.0e-4

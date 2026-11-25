@@ -1,4 +1,5 @@
-# vae2g on the DGX Spark: vae2f with face-weighted image terms. OpenCV YuNet
+# vae2g on the DGX Spark, the recipe of the vae2 in use (train-20261119-180935;
+# the older configs it names are in git history): vae2f with face-weighted image terms. OpenCV YuNet
 # (face_detection_yunet_2023mar.onnx, in ~/.cache/whoodeo, downloaded on first
 # use) finds faces on each training and validation frame as the batch hands it
 # to the model, on the CPU in the loader thread. Inside a face box, grown 1.2x
@@ -34,7 +35,7 @@
 # scale_eq reuses these weights on the pooled frames; ms_ssim drops the scales
 # a pooled frame is too small for (852x480 / 4 keeps 4 of 5).
 #
-# vae2e: vae2d with relu, see configs/vae2e-spark.yaml.
+# vae2e: vae2d with relu (latent noise tau 0.4).
 #
 # vae2d: vae2c-color with 16 latent channels instead of 8. vae2c-color
 # (runs/train-20261019-224852) reached
@@ -73,7 +74,6 @@ model:
   encoder_blocks: [1, 2, 2]   # full, 1/2, 1/4, as in vae2
   decoder_blocks: [2, 3, 2]   # one more block at full and at 1/2 resolution, as vae2b
   widths: [1, 2, 4, 4]        # multiples of channels, full resolution to the latent
-  posterior: fixed   # the encoder gives μ only: no σ, no KL, no beta
   activation: relu   # vae2d: silu (the default when left out)
 
 # Each frame adds s * std_c * N(0, 1) to the latent, s ~ |N(0, 0.4^2)|, std_c

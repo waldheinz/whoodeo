@@ -34,7 +34,6 @@ variants: "^(x264-crf(18|20|22|24)|mpeg4-q0[46])/"
 codec_unknown: 0.2
 scene_cut: 0.1
 ema: 0.999
-init_from_vae: false
 
 batch: 8
 lr: 1.0e-4
