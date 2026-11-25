@@ -66,8 +66,8 @@ def main(argv=None):
     from whoodeo.mlxport.convert import load_reference
     from whoodeo.mlxport.model import AlignModel
 
-    reference, model, vae, spynet, _step = load_reference(args.checkpoint)
-    reference.inner.condition = torch.zeros(1, model.condition_size)
+    reference, model, vae, _step = load_reference(args.checkpoint)
+    reference.condition = torch.zeros(1, model.condition_size)
     import json, os
 
     compute = os.environ.get("WHOODEO_MLX_PRECISION") or json.loads((Path(args.model) / "config.json").read_text()).get("compute", "float32")

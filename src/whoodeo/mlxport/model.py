@@ -1,9 +1,10 @@
-"""The align model in MLX: SPyNet, warp, latent_up with FiLM, vae2 decoder.
+"""The 3-frame latent_up in MLX: feature alignment (SPyNet, warp, fusion), FiLM, vae2 decoder.
 
 `params` is the flat dict convert.py writes (torch state-dict names, conv
 kernels already in MLX layout), `config` its JSON side. The forward mirrors
-spynet.AlignedReference around latent_up.LatentUpReference: warp both
-neighbors onto the middle low, code, z / scale + shift, decode, clamp, crop.
+latent_up.LatentUpReference: pad, stem and low-resolution blocks per frame,
+SPyNet flow middle -> each neighbor, warp the neighbor features, fuse, the
+rest of the encoder once, z / scale + shift, decode, clamp, crop.
 """
 
 import json
@@ -16,6 +17,8 @@ from whoodeo.mlxport.ops import (
 )
 
 DILATIONS = (1, 2, 4)
+# State-dict prefix of the frozen SPyNet inside latent_up's FeatureAlign.
+SPYNET = "align.spynet."
 FACTOR = 4
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
@@ -28,7 +31,7 @@ def _act(name):
 
 
 class AlignModel:
-    """`dtype` is the precision of latent_up and the decoder (SPyNet and the warp stay fp32).
+    """`dtype` is the precision of latent_up and the decoder (SPyNet and its flow stay fp32).
 
     float16 is what the Core ML export computes in (compute_precision FLOAT16).
     """
@@ -36,7 +39,7 @@ class AlignModel:
     def __init__(self, params, config, dtype=mx.float32):
         self.dtype = dtype
         if dtype != mx.float32:
-            params = {k: (v if k.startswith("spynet.") else v.astype(dtype)) for k, v in params.items()}
+            params = {k: (v if k.startswith(SPYNET) else v.astype(dtype)) for k, v in params.items()}
         self.p = params
         self.c = config
         self.act = _act(config["activation"])
@@ -63,7 +66,7 @@ class AlignModel:
 
     def spynet_block(self, level, x):
         for index in range(5):
-            x = self.conv(f"spynet.basic_module.{level}.basic_module.{index}.conv", x, padding=3)
+            x = self.conv(f"{SPYNET}basic_module.{level}.basic_module.{index}.conv", x, padding=3)
             if index < 4:
                 x = mx.maximum(x, 0)
         return x
@@ -99,22 +102,29 @@ class AlignModel:
         scale = mx.array([width / w_up, height / h_up], dtype=mx.float32)
         return flow * scale
 
-    def align(self, low):
-        """`low` (B, H, W, 3 * F) -> same shape, neighbors warped onto the middle and clamped."""
+    def fuse(self, images, feats, stages=None):
+        """FeatureAlign: neighbor features warped onto the middle one, fused, added to it.
+
+        `images` the padded low frames in fp32, `feats` their features, frame order.
+        """
         frames = self.in_frames
-        if frames < 3:
-            return low, None
-        b = low.shape[0]
-        parts = [low[..., 3 * i:3 * i + 3] for i in range(frames)]
         mid = frames // 2
+        b = feats[mid].shape[0]
         others = [i for i in range(frames) if i != mid]
-        neigh = mx.concatenate([parts[i] for i in others], axis=0)
-        ref = mx.concatenate([parts[mid]] * len(others), axis=0)
-        flow = self.spynet(ref, neigh)
-        warped = mx.clip(flow_warp(neigh, flow), 0, 1)
-        for k, i in enumerate(others):
-            parts[i] = warped[k * b:(k + 1) * b]
-        return mx.concatenate(parts, axis=-1), flow
+        supp = mx.concatenate([images[i] for i in others], axis=0)
+        ref = mx.concatenate([images[mid]] * len(others), axis=0)
+        flow = self.spynet(ref, supp)
+        error = mx.abs(flow_warp(supp, flow) - ref).mean(axis=-1, keepdims=True)
+        warped = flow_warp(mx.concatenate([feats[i] for i in others], axis=0), flow).astype(self.dtype)
+        error = error.astype(self.dtype)
+        parts = [feats[mid]]
+        parts += [warped[k * b:(k + 1) * b] for k in range(len(others))]
+        parts += [error[k * b:(k + 1) * b] for k in range(len(others))]
+        hidden = self.conv("align.inner", mx.concatenate(parts, axis=-1))
+        fused = feats[mid] + self.conv("align.outer", self.act(hidden))
+        if stages is not None:
+            stages.update(flow=flow, warped=warped, error=error, fused=fused)
+        return fused
 
     # latent_up --------------------------------------------------------------
 
@@ -143,39 +153,34 @@ class AlignModel:
                 x = x * (1 + gamma) + beta
         return x
 
-    def front(self, image, pairs):
-        x = self.conv("encoder.stem", image)
-        for level, count in enumerate(self.c["encoder_blocks"]):
+    def code(self, padded, condition, images=None, stages=None):
+        """Normalized code z of `padded` (B, H, W, 3 * F), H and W multiples of 4.
+
+        `images` the same frames in fp32 for SPyNet, `padded` when left out.
+        """
+        pairs = iter(self.film(condition)) if "film.inner.weight" in self.p else None
+        frames = self.in_frames
+        first = self.c["encoder_blocks"][0]
+        front = [next(pairs) for _ in range(first)] if pairs is not None else None
+        # Stem and the low-resolution blocks one frame at a time: as one batch they held
+        # far more memory at 720p, for the same result.
+        feats = [
+            self.blocks("encoder.downs.0.blocks", first,
+                        self.conv("encoder.stem", padded[..., 3 * i:3 * i + 3]),
+                        iter(front) if front is not None else None)
+            for i in range(frames)
+        ]
+        x = feats[0]
+        if frames > 1:
+            source = padded if images is None else images
+            images = [source[..., 3 * i:3 * i + 3].astype(mx.float32) for i in range(frames)]
+            x = self.fuse(images, feats, stages)
+        x = self.conv("encoder.downs.0.down", x, stride=2)
+        for level, count in enumerate(self.c["encoder_blocks"][1:], start=1):
             x = self.blocks(f"encoder.downs.{level}.blocks", count, x, pairs)
             x = self.conv(f"encoder.downs.{level}.down", x, stride=2)
-        return x
-
-    def back(self, x, pairs):
         x = self.blocks("encoder.mid", self.c["blocks"], x, pairs, DILATIONS)
         return self.conv("encoder.to_stats", self.act(x))
-
-    def code(self, padded, condition):
-        """Normalized code z of `padded` (B, H, W, 3 * F), H and W multiples of 4."""
-        pairs = self.film(condition) if "film.inner.weight" in self.p else None
-        count = sum(self.c["encoder_blocks"])
-        front_pairs = None if pairs is None else iter(pairs[:count])
-        back_pairs = None if pairs is None else iter(pairs[count:])
-        frames = self.in_frames
-        b = padded.shape[0]
-        stacked = mx.concatenate([padded[..., 3 * i:3 * i + 3] for i in range(frames)], axis=0)
-        if front_pairs is not None:
-            # (B, ...) modulation repeated per frame for the frame-major batch.
-            front_list = [(mx.concatenate([g] * frames, 0) if g.shape[0] > 1 else g,
-                           mx.concatenate([be] * frames, 0) if be.shape[0] > 1 else be)
-                          for g, be in front_pairs]
-            front_pairs = iter(front_list)
-        hidden = self.front(stacked, front_pairs)
-        if frames == 1:
-            return self.back(hidden, back_pairs)
-        feats = [hidden[i * b:(i + 1) * b] for i in range(frames)]
-        mixed = self.conv("mix.inner", mx.concatenate(feats, axis=-1), padding=0)
-        mixed = self.conv("mix.outer", self.act(mixed), padding=0)
-        return self.back(feats[frames // 2] + mixed, back_pairs)
 
     # vae2 decoder -----------------------------------------------------------
 
@@ -198,12 +203,14 @@ class AlignModel:
         With `stages` also returns a dict of the intermediate results.
         """
         b, height, width, _c = low.shape
-        aligned, flow = self.align(low)
         if condition is None:
             condition = mx.zeros((b, self.condition_size), dtype=mx.float32)
-        z = self.code(pad_reflect_br(aligned, FACTOR).astype(self.dtype), condition.astype(self.dtype))
+        padded = pad_reflect_br(low, FACTOR)
+        found = {} if stages else None
+        z = self.code(padded.astype(self.dtype), condition.astype(self.dtype), padded, found)
         latent = z / self.p["vae.latent_scale"] + self.p["vae.latent_shift"]
         image = mx.clip(self.decode(latent), 0, 1)[:, :2 * height, :2 * width].astype(mx.float32)
         if stages:
-            return image, {"flow": flow, "aligned": aligned, "code": z}
+            found["code"] = z
+            return image, found
         return image

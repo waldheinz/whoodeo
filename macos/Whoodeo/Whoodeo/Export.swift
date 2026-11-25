@@ -77,7 +77,8 @@ nonisolated enum Export {
         let predicted = try predictor.predict(
             stack: window.stack,
             width: window.current.width,
-            height: window.current.height
+            height: window.current.height,
+            frames: window.frames
         )
         let data = try store.put(rgb: predicted.image, width: predicted.width, height: predicted.height, index: index)
         stored(index)

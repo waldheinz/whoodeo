@@ -1,4 +1,4 @@
-"""Compare the MLX align model with the PyTorch reference, stage by stage. No timing.
+"""Compare the MLX 3-frame latent_up with the PyTorch reference, stage by stage. No timing.
 
     python -m whoodeo.mlxport.check RUN/checkpoints/STEP weights/mlx/align-STEP \
         --sizes 128x96 256x192 200x150 --device cpu
@@ -54,52 +54,60 @@ def test_frames(height, width, seed=42, shifts=((3, -2), (-4, 1))):
     return torch.cat([crop(*shifts[0]), crop(0, 0), crop(*shifts[1])], dim=1)
 
 
+def torch_stages(model, padded, condition):
+    """The PyTorch path of LatentUp.forward on an already padded input, with its stages."""
+    from whoodeo.models.latent_up import _blocks, _per_frame
+
+    encoder, align, frames = model.encoder, model.align, model.in_frames
+    batch = padded.shape[0]
+    pairs = iter(model.film(condition))
+    first = encoder.downs[0]
+    images = [padded[:, 3 * i:3 * i + 3] for i in range(frames)]
+    front = iter([(_per_frame(g, frames), _per_frame(b, frames)) for g, b in (next(pairs) for _ in first.blocks)])
+    feats = list(_blocks(encoder.stem(torch.cat(images, 0)), first.blocks, front).split(batch, 0))
+    flow, error = align.flows(images)
+    fused = align(images, feats)
+    from whoodeo.spynet import flow_warp
+
+    others = [feats[i] for i in range(frames) if i != frames // 2]
+    warped = flow_warp(torch.cat(others, 0), flow)
+    return {"feats": feats, "flow": flow, "error": error, "warped": warped, "fused": fused, "images": images}
+
+
 def check_size(reference, ours, height, width, codec_index):
-    from whoodeo.spynet import flow_warp as torch_warp
+    from whoodeo.models.common import pad_to
 
     print(f"{width}x{height}  codec slot {codec_index}")
     low = test_frames(height, width)
-    model = reference.inner.model
-    vae = reference.inner.vae
-    spynet = reference.spynet
+    model = reference.model
+    vae = reference.vae
     condition = torch.zeros(1, model.condition_size)
     if codec_index is not None:
         condition[0, codec_index] = 1.0
     cond_mx = mx.array(condition.numpy())
 
-    # Torch stages, as AlignedReference + LatentUpReference run them.
-    parts = low.reshape(1, 3, 3, height, width)
-    neigh = torch.cat([parts[:, 0], parts[:, 2]], 0)
-    ref = parts[:, 1].repeat(2, 1, 1, 1)
-    t_flow = spynet(ref, neigh)
-    t_warped = torch_warp(neigh, t_flow.permute(0, 2, 3, 1)).clamp(0, 1)
-    t_aligned = torch.cat([t_warped[0:1], parts[:, 1], t_warped[1:2]], 1)
-    from whoodeo.models.common import pad_to
-
-    t_code = model(t_aligned, condition)
-    t_image = vae.decode(t_code / vae.latent_scale.view(1, -1, 1, 1) + vae.latent_shift.view(1, -1, 1, 1), clamp=True)
-    t_image = t_image[:, :, :2 * height, :2 * width]
+    padded, _h, _w = pad_to(low, 4)
+    t = torch_stages(model, padded, condition)
+    t_code = model(low, condition)
+    scale = vae.latent_scale.view(1, -1, 1, 1)
+    shift = vae.latent_shift.view(1, -1, 1, 1)
+    t_image = vae.decode(t_code / scale + shift, clamp=True)[:, :, :2 * height, :2 * width]
     # The reference module end to end, to be sure the stages above are the same path.
-    with torch.no_grad():
-        inner_ref = type(reference.inner)(model, vae, None)
-        inner_ref.condition = condition
-        t_full = type(reference)(inner_ref, spynet, model.in_frames)(low)
-    assert torch.equal(t_full, t_image), "stage-by-stage torch path differs from AlignedReference"
+    reference.condition = condition
+    assert torch.equal(reference(low), t_image), "stage-by-stage torch path differs from LatentUpReference"
 
-    low_mx = _nhwc(low)
-    flow_mx = ours.spynet(_nhwc(ref), _nhwc(neigh))
-    compare("flow (SPyNet)", flow_mx, t_flow)
-    from whoodeo.mlxport.ops import flow_warp, pad_reflect_br
-
-    warped_iso = mx.clip(flow_warp(_nhwc(neigh), _nhwc(t_flow)), 0, 1)
-    compare("warp (torch flow in)", warped_iso, t_warped, peak=1.0)
-    image, stages = ours(low_mx, cond_mx, stages=True)
-    compare("aligned (end to end)", stages["aligned"], t_aligned, peak=1.0)
-    code_iso = ours.code(pad_reflect_br(_nhwc(t_aligned), 4), cond_mx)
-    compare("code z (torch aligned in)", code_iso, t_code)
+    image, stages = ours(_nhwc(low), cond_mx, stages=True)
+    mid = t["images"][1]
+    neigh = torch.cat([t["images"][0], t["images"][2]], 0)
+    flow_iso = ours.spynet(_nhwc(mid.repeat(2, 1, 1, 1)), _nhwc(neigh))
+    compare("flow (SPyNet)", flow_iso, t["flow"].permute(0, 3, 1, 2))
+    compare("flow (end to end)", stages["flow"], t["flow"].permute(0, 3, 1, 2))
+    compare("warp error (end to end)", stages["error"], t["error"], peak=1.0)
+    compare("warped feats (end to end)", stages["warped"], t["warped"])
+    compare("fused feats (end to end)", stages["fused"], t["fused"])
     compare("code z (end to end)", stages["code"], t_code)
-    latent = _nhwc(t_code / vae.latent_scale.view(1, -1, 1, 1) + vae.latent_shift.view(1, -1, 1, 1))
-    decoded_iso = mx.clip(ours.decode(latent), 0, 1)[:, :2 * height, :2 * width]
+    latent = _nhwc(t_code / scale + shift)
+    decoded_iso = mx.clip(ours.decode(latent.astype(ours.dtype)), 0, 1)[:, :2 * height, :2 * width]
     compare("decoder (torch code in)", decoded_iso, t_image, peak=1.0)
     return compare("image (end to end)", image, t_image, peak=1.0)
 
@@ -111,6 +119,7 @@ def main(argv=None):
     parser.add_argument("--sizes", nargs="+", default=["128x96", "256x192", "200x150"])
     parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu")
     parser.add_argument("--codec", type=int, default=0, help="one-hot slot of the condition, -1 for unknown")
+    parser.add_argument("--fp16", action="store_true", help="latent_up and decoder in fp16, as the app")
     args = parser.parse_args(argv)
     mx.set_default_device(mx.cpu if args.device == "cpu" else mx.gpu)
     torch.set_grad_enabled(False)
@@ -120,7 +129,7 @@ def main(argv=None):
     from whoodeo.mlxport.model import AlignModel
 
     reference, *_rest = load_reference(args.checkpoint)
-    ours = AlignModel.load(args.weights)
+    ours = AlignModel.load(args.weights, mx.float16 if args.fp16 else mx.float32)
     print(f"MLX {mx.__version__} on {mx.default_device()}")
     codec = None if args.codec < 0 else args.codec
     for size in args.sizes:

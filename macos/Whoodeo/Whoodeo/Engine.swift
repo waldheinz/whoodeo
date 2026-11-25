@@ -190,7 +190,8 @@ nonisolated final class Engine: @unchecked Sendable {
         let predicted = try predictor.predict(
             stack: window.stack,
             width: window.current.width,
-            height: window.current.height
+            height: window.current.height,
+            frames: window.frames
         )
         var stored = false
         if let store {

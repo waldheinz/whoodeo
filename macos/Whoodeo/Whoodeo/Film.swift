@@ -174,18 +174,21 @@ nonisolated final class Film {
     }
 
     /// Previous, current, next. The same edge repeat as `iter_reconstructions`.
-    func window(at index: Int, frames: Int) async throws -> (stack: [Float], current: Decoded) {
+    /// `frames` names the source frame of each plane (the edge repeats the first or last one).
+    func window(at index: Int, frames: Int) async throws -> (stack: [Float], current: Decoded, frames: FrameKeys) {
         let radius = frames / 2
         var planes: [[Float]] = []
+        var slots: [Int] = []
         var current: Decoded?
         for dt in -radius...radius {
             let slot = min(max(index + dt, 0), max(facts.count - 1, 0))
             let decoded = try await frame(at: slot)
             planes.append(decoded.rgb)
+            slots.append(slot)
             if dt == 0 { current = decoded }
         }
         guard let current else { throw CLIError("Bild \(index) fehlt") }
-        return (Pixels.stack(planes), current)
+        return (Pixels.stack(planes), current, FrameKeys(film: facts.url, slots: slots))
     }
 
     private func remember(_ decoded: Decoded) {

@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 
-/// The align model in MLX: SPyNet, warp, latent_up with FiLM, vae2 decoder, on the GPU.
+/// The 3-frame latent_up in MLX on the GPU: stem and low-resolution blocks per frame,
+/// feature alignment (frozen SPyNet, warp of the neighbor features, fusion), the rest
+/// of the encoder with FiLM, vae2 decoder.
 ///
 /// A `.mlxmodel` folder holds `model.safetensors` and `config.json`, written by
 /// `python -m whoodeo.mlxport.convert … --app`. The math follows
@@ -21,13 +23,15 @@ nonisolated final class MLXAlignModel {
         var vae_blocks: Int
         var decoder_blocks_run: [Int]
         var align: String?
-        /// float16 or float32 for latent_up and the decoder; SPyNet and the warp stay fp32.
+        /// float16 or float32 for latent_up and the decoder; SPyNet and its flow stay fp32.
         var compute: String?
     }
 
     static let fileExtension = "mlxmodel"
     private static let dilations = [1, 2, 4]
     private static let factor = 4
+    /// State-dict prefix of the frozen SPyNet inside latent_up's FeatureAlign.
+    private static let spynetPrefix = "align.spynet."
 
     let config: Config
     /// Precision of latent_up and the decoder. float16 as the Core ML export
@@ -38,6 +42,21 @@ nonisolated final class MLXAlignModel {
     private let mean = MLXArray([Float(0.485), 0.456, 0.406])
     private let std = MLXArray([Float(0.229), 0.224, 0.225])
 
+    /// What the front features of one frame depend on besides the model: its pixels
+    /// (film and source frame), the size, and the condition through FiLM.
+    private struct FrameKey: Hashable {
+        var film: URL
+        var slot: Int
+        var width: Int
+        var height: Int
+        var condition: [Float]
+    }
+    /// Front features (stem and the low-resolution blocks) of the last window's frames.
+    /// The next window of a run shares two of them; a seek, another film, size, or
+    /// condition just misses. The features of a frame do not depend on its neighbors,
+    /// so a scene cut needs nothing.
+    private var held: [FrameKey: MLXArray] = [:]
+
     init(url: URL) throws {
         let data = try Data(contentsOf: url.appendingPathComponent("config.json"))
         config = try JSONDecoder().decode(Config.self, from: data)
@@ -46,14 +65,18 @@ nonisolated final class MLXAlignModel {
         let stored = try loadArrays(url: url.appendingPathComponent("model.safetensors"))
         var cast: [String: MLXArray] = [:]
         for (key, value) in stored {
-            cast[key] = key.hasPrefix("spynet.") || dtype == .float32 ? value : value.asType(dtype)
+            cast[key] = key.hasPrefix(Self.spynetPrefix) || dtype == .float32 ? value : value.asType(dtype)
         }
         p = cast
         relu = config.activation == "relu"
-        guard config.in_frames == 3, p["spynet.basic_module.0.basic_module.0.conv.weight"] != nil else {
-            throw CLIError("das MLX-Modell braucht 3 Bilder und SPyNet")
+        guard config.in_frames == 3, p[Self.spynetPrefix + "basic_module.0.basic_module.0.conv.weight"] != nil,
+              p["align.inner.weight"] != nil else {
+            throw CLIError("das MLX-Modell braucht 3 Bilder mit Feature-Ausrichtung (align.spynet, align.inner)")
         }
         eval(Array(p.values))
+        // MLX keeps freed GPU buffers for reuse, by default up to the memory limit. A 720p
+        // film left about 37 GB there. 12 GB costs a few percent at 720p and nothing below.
+        Memory.cacheLimit = 12 << 30
     }
 
     // MARK: ops, as mlxport/ops.py
@@ -147,8 +170,9 @@ nonisolated final class MLXAlignModel {
         let ix = clip((gx + 1) / 2 * Float(w - 1), min: Float(0), max: Float(w - 1))
         let iy = clip((gy + 1) / 2 * Float(h - 1), min: Float(0), max: Float(h - 1))
         let x0f = floor(ix), y0f = floor(iy)
-        let fx = (ix - x0f).expandedDimensions(axis: -1)
-        let fy = (iy - y0f).expandedDimensions(axis: -1)
+        // Coordinates stay fp32; the weights take the type of x, so fp16 features interpolate in fp16.
+        let fx = (ix - x0f).expandedDimensions(axis: -1).asType(x.dtype)
+        let fy = (iy - y0f).expandedDimensions(axis: -1).asType(x.dtype)
         let x0 = x0f.asType(.int32), y0 = y0f.asType(.int32)
         let x1 = minimum(x0 + 1, Int32(w - 1)), y1 = minimum(y0 + 1, Int32(h - 1))
         let flat = x.reshaped([n * h * w, c])
@@ -168,7 +192,7 @@ nonisolated final class MLXAlignModel {
     private func spynetBlock(_ level: Int, _ input: MLXArray) -> MLXArray {
         var x = input
         for index in 0..<5 {
-            x = conv("spynet.basic_module.\(level).basic_module.\(index).conv", x, padding: 3)
+            x = conv(Self.spynetPrefix + "basic_module.\(level).basic_module.\(index).conv", x, padding: 3)
             if index < 4 { x = maximum(x, Float(0)) }
         }
         return x
@@ -206,14 +230,21 @@ nonisolated final class MLXAlignModel {
         return flow * scale
     }
 
-    /// Previous and next warped onto the middle low and clamped, as align_neighbors.
-    func align(_ low: MLXArray) -> MLXArray {
-        let parts = split(low, parts: 3, axis: -1)
-        let b = low.dim(0)
-        let neigh = concatenated([parts[0], parts[2]], axis: 0)
-        let ref = concatenated([parts[1], parts[1]], axis: 0)
-        let warped = clip(Self.flowWarp(neigh, spynet(ref, neigh)), min: Float(0), max: Float(1))
-        return concatenated([warped[0 ..< b], parts[1], warped[b ..< 2 * b]], axis: -1)
+    /// FeatureAlign: previous and next features warped onto the middle ones along the
+    /// SPyNet flow (middle -> neighbor), fused with the warp error, added to the middle.
+    /// `images` are the padded low frames in fp32, `feats` their features.
+    private func fuse(_ images: [MLXArray], _ feats: [MLXArray]) -> MLXArray {
+        let b = feats[1].dim(0)
+        let supp = concatenated([images[0], images[2]], axis: 0)
+        let ref = concatenated([images[1], images[1]], axis: 0)
+        let flow = spynet(ref, supp)
+        let error = abs(Self.flowWarp(supp, flow) - ref).mean(axis: -1, keepDims: true).asType(dtype)
+        let warped = Self.flowWarp(concatenated([feats[0], feats[2]], axis: 0), flow).asType(dtype)
+        let parts = [
+            feats[1], warped[0 ..< b], warped[b ..< 2 * b], error[0 ..< b], error[b ..< 2 * b],
+        ]
+        let hidden = conv("align.inner", concatenated(parts, axis: -1))
+        return feats[1] + conv("align.outer", act(hidden))
     }
 
     // MARK: latent_up
@@ -253,29 +284,34 @@ nonisolated final class MLXAlignModel {
     }
 
     /// Normalized code z of `padded` (B, H, W, 9), sides multiples of 4.
-    func code(_ padded: MLXArray, _ condition: MLXArray) -> MLXArray {
-        let b = padded.dim(0)
+    /// `images` is the same input in fp32, for SPyNet.
+    /// `front` gets each frame's index in the window and the computation of its features,
+    /// so it can hand back features it already has.
+    func code(
+        _ padded: MLXArray, _ images: MLXArray, _ condition: MLXArray,
+        front frontFor: (Int, () -> MLXArray) -> MLXArray = { $1() }
+    ) -> MLXArray {
         let frames = config.in_frames
-        let all = film(condition)
-        let count = config.encoder_blocks.reduce(0, +)
-        // The front runs on a frame-major batch of B * frames; repeat a per-batch modulation.
-        var front = ArraySlice(all[..<count].map { gamma, beta in
-            b > 1 ? (concatenated(Array(repeating: gamma, count: frames), axis: 0),
-                     concatenated(Array(repeating: beta, count: frames), axis: 0)) : (gamma, beta)
-        })
-        var back = ArraySlice(all[count...])
-        let stacked = concatenated(split(padded, parts: frames, axis: -1), axis: 0)
-        var x = conv("encoder.stem", stacked)
-        for (level, n) in config.encoder_blocks.enumerated() {
-            x = blocks("encoder.downs.\(level).blocks", n, x, &front)
+        var pairs = ArraySlice(film(condition))
+        let first = config.encoder_blocks[0]
+        let front = Array(pairs.prefix(first))
+        pairs = pairs.dropFirst(first)
+        // Stem and the blocks at low resolution one frame at a time: as one batch of three
+        // they held about 13 GB at 720p instead of 8, for the same result and time.
+        let feats = split(padded, parts: frames, axis: -1).enumerated().map { index, frame in
+            frontFor(index) {
+                var own = ArraySlice(front)
+                return blocks("encoder.downs.0.blocks", first, conv("encoder.stem", frame), &own)
+            }
+        }
+        var x = fuse(split(images.asType(.float32), parts: frames, axis: -1), feats)
+        x = conv("encoder.downs.0.down", x, stride: 2)
+        for level in 1 ..< config.encoder_blocks.count {
+            x = blocks("encoder.downs.\(level).blocks", config.encoder_blocks[level], x, &pairs)
             x = conv("encoder.downs.\(level).down", x, stride: 2)
         }
-        let feats = (0..<frames).map { x[($0 * b) ..< (($0 + 1) * b)] }
-        var mixed = conv("mix.inner", concatenated(feats, axis: -1), padding: 0)
-        mixed = conv("mix.outer", act(mixed), padding: 0)
-        var hidden = feats[frames / 2] + mixed
-        hidden = blocks("encoder.mid", config.blocks, hidden, &back, dilations: Self.dilations)
-        return conv("encoder.to_stats", act(hidden))
+        x = blocks("encoder.mid", config.blocks, x, &pairs, dilations: Self.dilations)
+        return conv("encoder.to_stats", act(x))
     }
 
     // MARK: vae2 decoder
@@ -295,21 +331,37 @@ nonisolated final class MLXAlignModel {
     // MARK: whole path
 
     /// `low` (B, H, W, 9) in [0, 1] -> (B, 2H, 2W, 3) in [0, 1].
-    func callAsFunction(_ low: MLXArray, condition: MLXArray) -> MLXArray {
+    func callAsFunction(
+        _ low: MLXArray, condition: MLXArray,
+        front: (Int, () -> MLXArray) -> MLXArray = { $1() }
+    ) -> MLXArray {
         let height = low.dim(1), width = low.dim(2)
-        let aligned = align(low)
-        let z = code(Self.padReflect(aligned, Self.factor).asType(dtype), condition.asType(dtype))
+        let padded = Self.padReflect(low, Self.factor)
+        let z = code(padded.asType(dtype), padded, condition.asType(dtype), front: front)
         let latent = z / weight("vae.latent_scale") + weight("vae.latent_shift")
         let image = clip(decode(latent), min: Float(0), max: Float(1))
         return image[0..., 0 ..< 2 * height, 0 ..< 2 * width].asType(.float32)
     }
 
     /// Planar 9 × H × W in, planar 3 × 2H × 2W out, as Predictor hands frames around.
-    func predict(stack: [Float], width: Int, height: Int, condition: [Float]) -> [Float] {
+    /// With `frames` the front features of frames from the previous window are reused.
+    func predict(stack: [Float], width: Int, height: Int, condition: [Float], frames: FrameKeys? = nil) -> [Float] {
         let channels = 3 * config.in_frames
         let low = MLXArray(stack, [1, channels, height, width]).transposed(0, 2, 3, 1)
         let cond = MLXArray(condition, [1, config.condition_size])
-        let out = self(low, condition: cond).transposed(0, 3, 1, 2)
-        return out.asArray(Float.self)
+        let keys = frames.map { frames in
+            frames.slots.map { FrameKey(film: frames.film, slot: $0, width: width, height: height, condition: condition) }
+        }
+        var next: [FrameKey: MLXArray] = [:]
+        let out = self(low, condition: cond) { index, compute in
+            guard let keys, keys.indices.contains(index) else { return compute() }
+            let key = keys[index]
+            let feats = next[key] ?? held[key] ?? compute()
+            next[key] = feats
+            return feats
+        }.transposed(0, 3, 1, 2)
+        let values = out.asArray(Float.self)
+        held = next
+        return values
     }
 }

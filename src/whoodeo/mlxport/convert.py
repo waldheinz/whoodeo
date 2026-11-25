@@ -1,4 +1,4 @@
-"""Write a latent_up align checkpoint as MLX weights: <out>.safetensors + <out>.json.
+"""Write a 3-frame latent_up checkpoint as MLX weights: <out>.safetensors + <out>.json.
 
     python -m whoodeo.mlxport.convert RUN/checkpoints/STEP weights/mlx/align-STEP
     python -m whoodeo.mlxport.convert RUN/checkpoints/STEP --app
@@ -8,8 +8,8 @@ config.json, the format the Mac app reads. `--app` writes that folder into
 ~/Library/Application Support/Whoodeo/Models under the name an export of
 the same checkpoint gets, with .mlxmodel instead of .mlpackage.
 
-Loads the same model whoodeo-apply builds (latent_up, its vae2, the frozen
-SPyNet from the run's config.yaml) on the CPU. Conv kernels go from torch
+Loads the same model whoodeo-apply builds (latent_up with its frozen SPyNet
+inside, and its vae2) on the CPU. Conv kernels go from torch
 (O, I, kH, kW) to MLX (O, kH, kW, I); everything else keeps its name.
 """
 
@@ -22,17 +22,16 @@ import numpy as np
 
 
 def load_reference(checkpoint, vae=None, codec=None):
-    """(reference module, latent_up, vae2, spynet) as whoodeo-apply loads them, on the CPU."""
+    """(LatentUpReference, latent_up, vae2, step) as whoodeo-apply loads them, on the CPU."""
     import torch
 
     from whoodeo.apply import load_checkpoint
 
     torch.set_grad_enabled(False)
     reference, _label, in_frames, step, path = load_checkpoint(checkpoint, torch.device("cpu"), vae, codec)
-    if not hasattr(reference, "spynet"):
-        raise SystemExit(f"{checkpoint}: not an align run (no spynet in its config.yaml)")
-    inner = reference.inner
-    return reference, inner.model, inner.vae, reference.spynet, step
+    if in_frames != 3 or getattr(reference.model, "align", None) is None:
+        raise SystemExit(f"{checkpoint}: not a 3-frame latent_up with feature alignment")
+    return reference, reference.model, reference.vae, step
 
 
 def _mx(tensor):
@@ -43,7 +42,7 @@ def _mx(tensor):
 
 
 def convert(checkpoint, out, vae=None):
-    _ref, model, vae_model, spynet, step = load_reference(checkpoint, vae)
+    _ref, model, vae_model, step = load_reference(checkpoint, vae)
     params = {}
     for key, value in model.state_dict().items():
         params[key] = _mx(value)
@@ -51,15 +50,11 @@ def convert(checkpoint, out, vae=None):
         params["decoder." + key] = _mx(value)
     params["vae.latent_scale"] = _mx(vae_model.latent_scale)
     params["vae.latent_shift"] = _mx(vae_model.latent_shift)
-    for key, value in spynet.state_dict().items():
-        if key in ("mean", "std"):
-            continue
-        params["spynet." + key] = _mx(value)
     from whoodeo.models.latent_up import block_widths
 
     config = {
         "arch": "latent_up",
-        "align": "spynet",
+        "align": "feature",
         "step": step,
         "checkpoint": str(checkpoint),
         "activation": model.activation,
@@ -74,7 +69,7 @@ def convert(checkpoint, out, vae=None):
         "vae_blocks": len(vae_model.decoder.mid),
         "decoder_blocks_run": [len(stage.blocks) for stage in vae_model.decoder.ups],
         # Precision the app computes latent_up and the decoder in, as the Core ML
-        # export does; SPyNet and the warp stay fp32. The weights are stored fp32.
+        # export did; SPyNet and its flow stay fp32. The weights are stored fp32.
         "compute": "float16",
     }
     if config["vae_activation"] != config["activation"]:

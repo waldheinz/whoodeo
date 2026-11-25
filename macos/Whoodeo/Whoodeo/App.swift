@@ -1,5 +1,6 @@
 import CoreVideo
 import Foundation
+import MLX
 import SwiftUI
 
 @main
@@ -146,17 +147,23 @@ nonisolated enum CLI {
             let predicted = try predictor.predict(
                 stack: window.stack,
                 width: window.current.width,
-                height: window.current.height
+                height: window.current.height,
+                frames: window.frames
             )
             let model = (CFAbsoluteTimeGetCurrent() - modelStart) * 1000
             let drawStart = CFAbsoluteTimeGetCurrent()
             _ = try Pixels.picture(planar: predicted.image, width: predicted.width, height: predicted.height)
             let draw = (CFAbsoluteTimeGetCurrent() - drawStart) * 1000
+            let gib = Double(1 << 30)
+            let active = Double(Memory.activeMemory) / gib
+            let cache = Double(Memory.cacheMemory) / gib
+            let peak = Double(Memory.peakMemory) / gib
+            Memory.peakMemory = 0
             if index < 2 { continue }
             let total = decode + model + draw
             fputs(String(
-                format: "frame %d  decode %.1f  model %.1f  draw %.1f  total %.1f  (%.2f fps)\n",
-                index, decode, model, draw, total, 1000 / total
+                format: "frame %d  decode %.1f  model %.1f  draw %.1f  total %.1f  (%.2f fps)  MLX active %.2f  cache %.2f  peak %.2f GiB\n",
+                index, decode, model, draw, total, 1000 / total, active, cache, peak
             ), stdout)
         }
     }
@@ -255,7 +262,7 @@ nonisolated enum CLI {
                 predictor.setCondition(codec ?? .unknown)
             }
             let window = try wait { try await film.window(at: index, frames: predictor.info.inFrames) }
-            let predicted = try predictor.predict(stack: window.stack, width: window.current.width, height: window.current.height)
+            let predicted = try predictor.predict(stack: window.stack, width: window.current.width, height: window.current.height, frames: window.frames)
             _ = try store.put(rgb: predicted.image, width: predicted.width, height: predicted.height, index: index)
             image = predicted.image
             width = predicted.width

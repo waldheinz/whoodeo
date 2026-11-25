@@ -31,8 +31,6 @@ nonisolated struct PackageInfo {
     var conditionSize: Int = 0
     /// Name of the condition input, nil when the package has none.
     var conditionName: String? = nil
-    /// Neighbor alignment, "spynet" when the previous and next lows are warped first.
-    var align: String? = nil
     /// An MLX `.mlxmodel` folder instead of a Core ML package.
     var mlx: Bool = false
 
@@ -114,13 +112,16 @@ nonisolated struct PackageInfo {
             pad: max(Int(meta["whoodeo.pad"] ?? "") ?? 1, 1),
             inputType: inputType == .float16 ? .float16 : .float32,
             conditionSize: conditionSize,
-            conditionName: conditionName,
-            align: {
-                let value = meta["whoodeo.align"] ?? ""
-                return value.isEmpty ? nil : value
-            }()
+            conditionName: conditionName
         )
     }
+}
+
+/// Which film and source frames a window stack holds, so the MLX model can reuse the
+/// per-frame features of frames it saw in the previous window.
+nonisolated struct FrameKeys {
+    var film: URL
+    var slots: [Int]
 }
 
 nonisolated struct Prediction {
@@ -134,14 +135,12 @@ nonisolated final class Predictor {
     let info: PackageInfo
     /// The Core ML model, nil for an MLX model.
     let model: MLModel?
-    /// The MLX align model (`.mlxmodel`), nil for a Core ML package.
+    /// The MLX 3-frame model (`.mlxmodel`), nil for a Core ML package.
     private let mlx: MLXAlignModel?
     private var inputArray: MLMultiArray?
     private var conditionArray: MLMultiArray?
     /// Condition vector fed to a `-cond` package, nil when the package has no such input.
     private(set) var condition: [Float]?
-    /// Frozen SPyNet, nil when the package has no neighbor alignment.
-    private let aligner: SpyNetAligner?
 
     /// The app runs every package on the GPU.
     init(url: URL) throws {
@@ -150,14 +149,13 @@ nonisolated final class Predictor {
             let c = loaded.config
             mlx = loaded
             model = nil
-            aligner = nil
             info = PackageInfo(
                 arch: "latent_up", blocks: c.blocks, channels: c.block_widths.first ?? 0,
                 stem: nil, vote: nil, resScale: "", step: c.step, inFrames: c.in_frames, scale: 2,
                 widthMin: 4, widthMax: 8192, heightMin: 4, heightMax: 8192,
                 inputName: "frames", outputName: "image",
                 conditionSize: c.condition_size, conditionName: c.condition_size > 0 ? "condition" : nil,
-                align: c.align ?? "spynet", mlx: true
+                mlx: true
             )
             if info.takesCondition {
                 setCondition(.unknown)
@@ -177,11 +175,6 @@ nonisolated final class Predictor {
         let loaded = try MLModel(contentsOf: compiled, configuration: config)
         model = loaded
         info = try PackageInfo.read(loaded)
-        if info.align == "spynet" {
-            aligner = try SpyNetAligner(url: url)
-        } else {
-            aligner = nil
-        }
         if info.takesCondition {
             setCondition(.unknown)
         }
@@ -195,7 +188,7 @@ nonisolated final class Predictor {
         condition = codec.vector(size: info.conditionSize)
     }
 
-    func predict(stack: [Float], width: Int, height: Int) throws -> Prediction {
+    func predict(stack: [Float], width: Int, height: Int, frames: FrameKeys? = nil) throws -> Prediction {
         if let problem = info.shapeError(width: width, height: height) {
             throw CLIError(problem)
         }
@@ -208,17 +201,14 @@ nonisolated final class Predictor {
         if let mlx {
             // Padding, alignment, and the crop happen inside the MLX graph.
             let values = condition ?? [Float](repeating: 0, count: info.conditionSize)
-            let image = mlx.predict(stack: stack, width: width, height: height, condition: values)
+            let image = mlx.predict(stack: stack, width: width, height: height, condition: values, frames: frames)
             return Prediction(
                 image: image, width: 2 * width, height: 2 * height,
                 milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1000
             )
         }
         guard let model else { throw CLIError("kein Modell geladen") }
-        var source = stack
-        if let aligner {
-            source = try aligner.align(stack: source, width: width, height: height)
-        }
+        let source = stack
         let size = info.padded(width: width, height: height)
         let input = size.width == width && size.height == height
             ? source

@@ -90,8 +90,9 @@ def flow_warp(x, flow):
     iy = mx.clip((gy + 1) / 2 * (h - 1), 0, h - 1)
     x0f = mx.floor(ix)
     y0f = mx.floor(iy)
-    fx = (ix - x0f)[..., None]
-    fy = (iy - y0f)[..., None]
+    # Coordinates stay fp32; the weights take the type of x (fp16 features interpolate in fp16).
+    fx = (ix - x0f)[..., None].astype(x.dtype)
+    fy = (iy - y0f)[..., None].astype(x.dtype)
     x0 = x0f.astype(mx.int32)
     y0 = y0f.astype(mx.int32)
     x1 = mx.minimum(x0 + 1, w - 1)

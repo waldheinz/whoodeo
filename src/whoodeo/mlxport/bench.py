@@ -1,4 +1,4 @@
-"""Time the MLX align model on the GPU. Only with the Whoodeo app closed.
+"""Time the MLX 3-frame latent_up on the GPU. Only with the Whoodeo app closed.
 
     python -m whoodeo.mlxport.bench weights/mlx/align-STEP --size 1280x720 --iters 20
 
@@ -34,8 +34,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     mx.set_default_device(mx.gpu if args.device == "gpu" else mx.cpu)
 
-    from whoodeo.mlxport.model import FACTOR, AlignModel
-    from whoodeo.mlxport.ops import pad_reflect_br
+    from whoodeo.mlxport.model import AlignModel
 
     model = AlignModel.load(args.weights, mx.float16 if args.fp16 else mx.float32)
     width, height = (int(v) for v in args.size.lower().split("x"))
@@ -44,25 +43,18 @@ def main(argv=None):
     condition = mx.zeros((1, model.condition_size))
     condition[0, 0] = 1.0
 
-    def align():
-        return model.align(low)[0]
-
-    aligned = align()
-    mx.eval(aligned)
-
-    def generate():
-        z = model.code(pad_reflect_br(aligned, FACTOR).astype(model.dtype), condition.astype(model.dtype))
-        latent = z / model.p["vae.latent_scale"] + model.p["vae.latent_shift"]
-        return mx.clip(model.decode(latent), 0, 1).astype(mx.float32)
+    def flows():
+        frames = [low[..., 3 * i:3 * i + 3] for i in range(model.in_frames)]
+        supp = mx.concatenate([frames[0], frames[2]], axis=0)
+        return model.spynet(mx.concatenate([frames[1]] * 2, axis=0), supp)
 
     def full():
         return model(low, condition)
 
     if args.compile:
-        align, generate, full = mx.compile(align), mx.compile(generate), mx.compile(full)
+        flows, full = mx.compile(flows), mx.compile(full)
     print(f"MLX {mx.__version__} on {mx.default_device()}  {width}x{height}  compile {args.compile}  fp16 {args.fp16}")
-    print(f"  align (SPyNet x2 + warp)  {_time(align, args.iters, args.warmup):8.1f} ms")
-    print(f"  latent_up + decoder       {_time(generate, args.iters, args.warmup):8.1f} ms")
+    print(f"  SPyNet x2                 {_time(flows, args.iters, args.warmup):8.1f} ms")
     print(f"  whole path                {_time(full, args.iters, args.warmup):8.1f} ms")
     print(f"  peak memory               {mx.get_peak_memory() / 2**30:8.2f} GiB")
 
