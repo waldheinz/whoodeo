@@ -8,3 +8,6 @@ runs/
 .DS_Store
 xcuserdata/
 *.xcuserstate
+mlx-check/
+tmp-align-check/
+weights/
