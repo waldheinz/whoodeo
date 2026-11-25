@@ -40,8 +40,6 @@ struct WhoodeoApp: App {
         .defaultSize(width: 1280, height: 800)
         .commands {
             CommandGroup(after: .newItem) {
-                Button("Modell importieren…") { session.importModel() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
                 Button("Film öffnen…") { session.pickFilm() }
                     .keyboardShortcut("o")
                 Divider()
@@ -75,12 +73,12 @@ struct WhoodeoApp: App {
 
 nonisolated enum CLI {
     static let usage = """
-    Whoodeo --check model.mlpackage in.f32 out.f32
+    Whoodeo --check model.mlxmodel in.f32 out.f32
     Whoodeo --decode video index out.f32
-    Whoodeo --export model.mlpackage video out.mov [--frames N] [--codec hevc|prores|prores4444]
-    Whoodeo --pace model.mlpackage video [--frames N]
+    Whoodeo --export model.mlxmodel video out.mov [--frames N] [--codec hevc|prores|prores4444]
+    Whoodeo --pace model.mlxmodel video [--frames N]
     Whoodeo --vae-roundtrip picture-or-video
-    Whoodeo --upscale model.mlpackage video index [out.f32] [--source-codec auto|h264|mpeg4|mpeg2|unknown]
+    Whoodeo --upscale model.mlxmodel video index [out.f32] [--source-codec auto|h264|mpeg4|mpeg2|unknown]
 
     --upscale scales one frame through the frame cache, as the window does: a latent_up with
     FiLM uses the condition of the given codec (auto: the film's codec; MPEG-2 automatic

@@ -101,11 +101,6 @@ struct ContentView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    session.importModel()
-                } label: {
-                    Label("Modell importieren", systemImage: "plus")
-                }
-                Button {
                     session.askDelete()
                 } label: {
                     Label("In den Papierkorb legen", systemImage: "trash")
@@ -322,9 +317,7 @@ struct ContentView: View {
         } description: {
             Text(session.placeholder)
         } actions: {
-            if session.failure == nil && session.library.isEmpty {
-                Button("Modell importieren…") { session.importModel() }
-            } else if session.failure == nil && session.selection != nil && session.frameCount == 0 {
+            if session.failure == nil && session.selection != nil && session.frameCount == 0 {
                 Button("Film öffnen…") { session.pickFilm() }
             }
         }

@@ -34,7 +34,7 @@ nonisolated final class MLXAlignModel {
     private static let spynetPrefix = "align.spynet."
 
     let config: Config
-    /// Precision of latent_up and the decoder. float16 as the Core ML export
+    /// Precision of latent_up and the decoder. float16, what the app
     /// computes; WHOODEO_MLX_PRECISION=float32 overrides it for checks.
     let dtype: DType
     private let p: [String: MLXArray]

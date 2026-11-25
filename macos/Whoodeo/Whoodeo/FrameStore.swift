@@ -866,11 +866,6 @@ nonisolated final class FrameStore: @unchecked Sendable {
             let config = file.appendingPathComponent("config.json")
             return "\(file.path)\n\(stamp(weights))\n\(stamp(config))"
         }
-        if values?.isDirectory == true {
-            let weights = file.appendingPathComponent("Data/com.apple.CoreML/weights/weight.bin")
-            let model = file.appendingPathComponent("Data/com.apple.CoreML/model.mlmodel")
-            return "\(file.path)\n\(stamp(weights))\n\(stamp(model))"
-        }
         return "\(file.path)\n\(values?.fileSize ?? 0)\n\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
     }
 

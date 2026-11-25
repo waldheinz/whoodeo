@@ -525,7 +525,7 @@ final class Session: ObservableObject {
     var placeholder: String {
         if failure != nil { return failure! }
         if modelURL == nil && library.isEmpty {
-            return "whoodeo-coreml legt neue Modelle in diese Sammlung. Vorhandene Pakete kannst du importieren."
+            return "python -m whoodeo.mlxport.convert <Checkpoint> --app legt neue Modelle in diese Sammlung."
         }
         if modelURL == nil { return "Wähle links ein Modell. Die Vorschau startet, sobald ein Film offen ist." }
         if facts == nil { return "Öffne einen Film oder leg ihn hier ab." }
@@ -572,29 +572,6 @@ final class Session: ObservableObject {
                 return event
             }
         }
-    }
-
-    func importModel() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.treatsFilePackagesAsDirectories = false
-        panel.allowedContentTypes = [UTType(filenameExtension: "mlpackage") ?? .package]
-        panel.prompt = "Importieren"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let dest = ModelLibrary.uniqueDestination(for: url)
-        if dest.standardizedFileURL != url.standardizedFileURL {
-            do {
-                try FileManager.default.copyItem(at: url, to: dest)
-            } catch {
-                failure = error.localizedDescription
-                status = failure!
-                return
-            }
-        }
-        reloadLibrary()
-        selection = dest
-        openSelection()
     }
 
     func openSelection() {
