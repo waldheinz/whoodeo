@@ -161,10 +161,14 @@ frame, one seek and one decode per sample as for the other multi-frame
 archs; the clip's edges repeat the middle frame. scene_cut (training only,
 on a generator of its own, seed + 2) swaps each neighbor with that chance
 for the middle frame of another frame of the batch, which has the same
-size, so the network learns to ignore a neighbor from another shot. The step
-line counts the swaps (cuts). The frame mix has PyTorch's default start;
---model refuses a checkpoint with other in_frames.
-train_neighbor/weight and grad are the mean absolute kernel of the mix's
+size, so the network learns to ignore a neighbor from another shot. The swap
+happens on the raw low frames in the loader, before the model's own SPyNet
+alignment sees them. The step line counts the swaps (cuts). The model warps
+the neighbor features itself (see models/latent_up.py); a fresh run loads
+the official SPyNet weights from spynet_weights, which stay frozen, and the
+fusion has PyTorch's default start. --model refuses a checkpoint with other
+in_frames.
+train_neighbor/weight and grad are the mean absolute kernel of the fusion's
 last layer and its gradient over the head's, val_neighbor/image the mean
 absolute change of the validation frames when both neighbors are replaced
 by the middle frame.
@@ -229,6 +233,7 @@ from whoodeo.models.latent_up import FACTOR as LATENT_FACTOR
 from whoodeo.models.latent_up import CODECS, codec_of, condition_vector, init_from_vae
 from whoodeo.models.vae import LatentTally, latent_scalars, latent_table
 from whoodeo.faces import FACE_LEVEL, FaceDetector, detect_batch, face_fraction, weight_map
+from whoodeo.spynet import load_weights as load_spynet_weights
 from whoodeo.objective import (
     Objective, color_loss, ms_ssim_loss, oklab_full, oklab_loss, pixel_loss, raw_scalars,
 )
@@ -1135,13 +1140,22 @@ def open_run(cfg, resume, finetune, load):
     model = model.train().to(device)
     if hasattr(model, "noise_tau"):
         model.noise_tau = cfg.latent_noise_tau
-    trainable = model.parameters()
     if cfg.freeze_encoder:
         for parameter in model.encoder.parameters():
             parameter.requires_grad_(False)
-        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    # Frozen parts (a latent_up's SPyNet) stay out of the optimizer and the average.
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.Adam(trainable, lr=cfg.lr)
     print(label, flush=True)
+    spynet = getattr(getattr(model, "align", None), "spynet", None)
+    if spynet is not None and generator is None:
+        if cfg.spynet_weights is None:
+            raise SystemExit(f"{cfg.source}: a fresh latent_up with in_frames {cfg.in_frames} needs spynet_weights")
+        load_spynet_weights(spynet, cfg.spynet_weights)
+        print(f"spynet {cfg.spynet_weights}  frozen", flush=True)
+    if len(trainable) != len(list(model.parameters())):
+        count = sum(parameter.numel() for parameter in trainable)
+        print(f"trainable parameters {count}", flush=True)
     if cfg.latent_noise_tau > 0:
         print(f"latent noise tau {cfg.latent_noise_tau:g}", flush=True)
     if cfg.freeze_encoder:
@@ -1357,6 +1371,7 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                     run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
                     cfg.loss_recipe(),
                     run.discriminator, run.disc_optimizer, schedule_state,
+                    publish_latest=cfg.publish_latest,
                 )
                 return
             # model.pt gets the average, train.pt the trained weights beside it.
@@ -1366,6 +1381,7 @@ def drive(run, preview, make_val_specs, make_loader, one_step, evaluate_split):
                     run.out_dir, run.model, architecture_dict(cfg), step, run.optimizer,
                     cfg.loss_recipe(),
                     run.discriminator, run.disc_optimizer, schedule_state, extra,
+                    publish_latest=cfg.publish_latest,
                 )
 
         def averaged():

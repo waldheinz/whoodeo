@@ -191,6 +191,13 @@ class TrainConfig:
     # that it is swapped for the middle frame of another frame of the batch,
     # a stand-in for a scene cut. Not part of the loss recipe.
     scene_cut: float = 0.0
+    # latent_up with in_frames > 1: the official SPyNet weights its frozen
+    # FeatureAlign starts from in a fresh run. Required there; a resume or
+    # --model takes SPyNet from the checkpoint.
+    spynet_weights: Path | None = None
+    # When false, a checkpoint does not retarget the global runs/latest.
+    # The run still has its own latest. Default true keeps the old behaviour.
+    publish_latest: bool = True
 
     def arch_key(self):
         return model_key(
@@ -417,6 +424,8 @@ def load_config(path, architecture=None, architecture_from=None):
     codec_unknown = _take_codec_unknown(data, where, condition)
     ema = _take_ema(data, where)
     scene_cut = _take_scene_cut(data, where, arch, in_frames)
+    spynet_weights = _take_spynet_weights(data, where, arch, in_frames)
+    publish_latest = _take_publish_latest(data, where)
     terms = _take_loss(data, where, arch)
     if arch in VAE_ARCHS:
         if variants is not None:
@@ -487,6 +496,8 @@ def load_config(path, architecture=None, architecture_from=None):
         codec_unknown=codec_unknown,
         ema=ema,
         scene_cut=scene_cut,
+        spynet_weights=spynet_weights,
+        publish_latest=publish_latest,
         crop=crop,
         freeze_encoder=freeze_encoder,
         schedule=schedule,
@@ -1227,6 +1238,25 @@ def _pop_value(data, key, where, default):
             return None
         raise SystemExit(f"{where}: {key} is empty")
     return value
+
+
+def _take_spynet_weights(data, where, arch, in_frames):
+    """The SPyNet checkpoint for a multi-frame latent_up, None otherwise."""
+    if "spynet_weights" not in data:
+        return None
+    if arch != LATENT_ARCH or in_frames < 3:
+        raise SystemExit(f"{where}: spynet_weights is for a latent_up with in_frames 3 or more")
+    weights = _take_path(data, "spynet_weights", where)
+    if not weights.is_file():
+        raise SystemExit(f"{where}: spynet_weights is not a file: {weights}")
+    return weights
+
+
+def _take_publish_latest(data, where):
+    """Optional. Missing keeps the old behaviour (true)."""
+    if "publish_latest" not in data:
+        return True
+    return _take_bool(data, "publish_latest", where)
 
 
 def _reject_unknown(data, where):

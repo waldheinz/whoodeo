@@ -30,22 +30,31 @@ encoder keeps its parameter names. For an export the vector is a second input, a
 the FiLM MLP stays in the graph, a multiply and an add per block.
 
 `in_frames: 3` reads the previous, middle, and next low frame, stacked on
-the channels as the other multi-frame archs take them (9 channels). The
-encoder up to 1/4 (stem, the levels at low and 1/2, with FiLM) is shared and
-runs once per frame. At 1/4, the grid of the code, `FrameMix` mixes them: a
-1x1 convolution over the features of all frames, the activation, and a 1x1
-convolution, added onto the middle frame's features. Both convolutions have
-PyTorch's default start, so the neighbors count from the first step. The
-blocks at 1/4 and the head then run once. A one-frame checkpoint does not
-load into it: in_frames must match. The middle frame is in the mix's input, so the network can compare it with
-each neighbor and learn to ignore a neighbor from another shot. The clip's
-edges repeat the middle frame, as for every multi-frame arch.
+the channels as the other multi-frame archs take them (9 channels). Each
+frame runs through the encoder's stem and the residual blocks at the low
+resolution (with FiLM), so every frame has `channels` features at full low
+resolution. `FeatureAlign` then brings the neighbors onto the middle frame:
+a frozen SPyNet computes the flow from the middle low frame to each neighbor
+(two runs, no symmetry assumed), the neighbor features are warped along it
+(bilinear, border), and a fusion reads the middle features, both warped
+neighbor features, and one warp-error channel per neighbor (the mean
+absolute difference of the warped neighbor low frame and the middle one):
+3x3 convolution to `channels`, activation, 3x3 convolution, added onto the
+middle features. From the stride-2 convolution to 1/2 on, one stream runs as
+for one frame. All of it is inside the model: training, export, and apply
+feed the raw 9 channels. SPyNet's weights are part of the state dict and
+never train (requires_grad false); a fresh run loads the official weights
+(training key spynet_weights). The fusion has PyTorch's default start. The
+clip's edges repeat the middle frame, as for every multi-frame arch; the flow
+there is about zero. A scene cut makes the warp error large, which the
+fusion can learn to read. A one-frame checkpoint does not load into it.
 """
 
 import torch
 import torch.nn as nn
 
 from whoodeo.models.common import pad_to
+from whoodeo.spynet import SPyNet, flow_warp
 from whoodeo.models.vae2 import DILATIONS, Encoder, activation_fn, layout
 
 # The network shrinks the low frame by this much: vae2 factor 8 over the 2x scale.
@@ -100,11 +109,6 @@ def block_widths(encoder):
     return widths
 
 
-def front_count(encoder):
-    """Residual blocks above 1/4: the (γ, β) pairs `run_front` takes."""
-    return sum(len(stage.blocks) for stage in encoder.downs)
-
-
 def _blocks(hidden, sequence, pairs):
     for block in sequence:
         hidden = block(hidden)
@@ -114,79 +118,37 @@ def _blocks(hidden, sequence, pairs):
     return hidden
 
 
-def run_front(encoder, image, modulation=None):
-    """The encoder up to 1/4: stem and levels, without the blocks at 1/4.
-
-    `modulation` holds the (γ, β) pairs of these blocks, the first
-    `front_count` of `block_widths`, or None.
-    """
-    pairs = None if modulation is None else iter(modulation)
-    hidden = encoder.stem(image)
-    for stage in encoder.downs:
-        hidden = stage.down(_blocks(hidden, stage.blocks, pairs))
-    return hidden
-
-
-def run_back(encoder, hidden, modulation=None):
-    """The blocks at 1/4 and the head; `modulation` holds their pairs or is None."""
-    pairs = None if modulation is None else iter(modulation)
-    hidden = _blocks(hidden, encoder.mid, pairs)
-    return encoder.to_stats(encoder.act(hidden))
-
-
-def run_encoder(encoder, image, modulation=None):
+def run_encoder(encoder, image, modulation=None, align=None, frames=1):
     """Encoder.forward, with x * (1 + γ) + β behind each residual block when modulated.
 
     `modulation` is one (γ, β) pair of shape (B or 1, C, 1, 1) per block, in
-    the order of `block_widths`. None runs the plain encoder.
+    the order of `block_widths`, or None. With `align` (a FeatureAlign),
+    `image` holds `frames` frames on its channels: stem and the blocks at
+    low resolution run per frame (as one batch of B * frames), the align
+    fuses them onto the middle frame, and the rest runs once.
     """
-    if modulation is None:
-        return encoder(image)
-    count = front_count(encoder)
-    return run_back(encoder, run_front(encoder, image, modulation[:count]), modulation[count:])
-
-
-class FrameMix(nn.Module):
-    """Features of `frames` frames at 1/4 -> a correction of the middle frame's.
-
-    1x1 convolution over all frames' channels, activation, 1x1 convolution,
-    both with PyTorch's default start.
-    """
-
-    def __init__(self, width, frames, activation=None):
-        super().__init__()
-        self.frames = frames
-        self.inner = nn.Conv2d(width * frames, width, kernel_size=1)
-        self.act = activation_fn(activation)
-        self.outer = nn.Conv2d(width, width, kernel_size=1)
-
-    def forward(self, features):
-        """`features` (B, frames * C, h, w) in frame order -> (B, C, h, w)."""
-        return self.outer(self.act(self.inner(features)))
-
-
-def run_frames(encoder, mix, padded, frames, modulation=None):
-    """The multi-frame code of `padded` (B, 3 * frames, H, W): shared front, mix, back.
-
-    The frames run as one batch of B * frames through the front.
-    """
-    batch, _channels, height, width = padded.shape
-    stacked = padded.reshape(batch, frames, 3, height, width).transpose(0, 1).reshape(
-        frames * batch, 3, height, width,
-    )
-    front = back = None
-    if modulation is not None:
-        count = front_count(encoder)
-        front = [
-            (_per_frame(gamma, frames), _per_frame(beta, frames)) for gamma, beta in modulation[:count]
-        ]
-        back = modulation[count:]
-    hidden = run_front(encoder, stacked, front)
-    channels, rows, cols = hidden.shape[1:]
-    hidden = hidden.reshape(frames, batch, channels, rows, cols)
-    middle = hidden[frames // 2]
-    features = hidden.transpose(0, 1).reshape(batch, frames * channels, rows, cols)
-    return run_back(encoder, middle + mix(features), back)
+    pairs = None if modulation is None else iter(modulation)
+    stages = list(encoder.downs)
+    first = stages[0]
+    if align is None:
+        hidden = _blocks(encoder.stem(image), first.blocks, pairs)
+    else:
+        batch, _channels, height, width = image.shape
+        images = [image[:, 3 * index:3 * index + 3] for index in range(frames)]
+        stacked = torch.cat(images, dim=0)
+        front = None
+        if modulation is not None:
+            front = iter([
+                (_per_frame(gamma, frames), _per_frame(beta, frames))
+                for gamma, beta in (next(pairs) for _ in range(len(first.blocks)))
+            ])
+        hidden = _blocks(encoder.stem(stacked), first.blocks, front)
+        hidden = align(images, list(hidden.split(batch, dim=0)))
+    hidden = first.down(hidden)
+    for stage in stages[1:]:
+        hidden = stage.down(_blocks(hidden, stage.blocks, pairs))
+    hidden = _blocks(hidden, encoder.mid, pairs)
+    return encoder.to_stats(encoder.act(hidden))
 
 
 def _per_frame(value, frames):
@@ -194,6 +156,53 @@ def _per_frame(value, frames):
     if value.shape[0] == 1:
         return value
     return value.repeat(frames, 1, 1, 1)
+
+
+class FeatureAlign(nn.Module):
+    """Neighbor features warped onto the middle frame by a frozen SPyNet, then fused.
+
+    `images` are the (padded) low frames, `features` their features at the same
+    size, both lists in frame order. Returns the middle features plus the
+    fusion's correction.
+    """
+
+    def __init__(self, width, frames, activation=None):
+        super().__init__()
+        self.frames = frames
+        self.spynet = SPyNet()
+        for parameter in self.spynet.parameters():
+            parameter.requires_grad_(False)
+        neighbors = frames - 1
+        self.inner = nn.Conv2d(width * frames + neighbors, width, kernel_size=3, padding=1)
+        self.act = activation_fn(activation)
+        self.outer = nn.Conv2d(width, width, kernel_size=3, padding=1)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self.spynet.eval()
+        return self
+
+    def flows(self, images):
+        """Flow (N, H, W, 2) from the middle frame to each neighbor, neighbors batch-major, no gradient."""
+        middle = self.frames // 2
+        center = images[middle]
+        others = [images[index] for index in range(self.frames) if index != middle]
+        with torch.no_grad():
+            supp = torch.cat(others, dim=0).float()
+            ref = center.float().repeat(len(others), 1, 1, 1)
+            flow = self.spynet(ref, supp).permute(0, 2, 3, 1)
+            error = (flow_warp(supp, flow) - ref).abs().mean(dim=1, keepdim=True)
+        return flow, error
+
+    def forward(self, images, features):
+        middle = self.frames // 2
+        batch = features[middle].shape[0]
+        flow, error = self.flows(images)
+        others = [features[index] for index in range(self.frames) if index != middle]
+        warped = flow_warp(torch.cat(others, dim=0), flow.to(features[middle].dtype))
+        error = error.to(features[middle].dtype)
+        parts = [features[middle], *warped.split(batch, dim=0), *error.split(batch, dim=0)]
+        return features[middle] + self.outer(self.act(self.inner(torch.cat(parts, dim=1))))
 
 
 class FiLM(nn.Module):
@@ -254,9 +263,9 @@ class LatentUp(nn.Module):
         self.film = None
         if condition is not None:
             self.film = FiLM(self.condition_size, block_widths(self.encoder), activation)
-        self.mix = None
+        self.align = None
         if in_frames > 1:
-            self.mix = FrameMix(self.widths[-1], in_frames, activation)
+            self.align = FeatureAlign(self.widths[0], in_frames, activation)
 
     def condition_batch(self, codecs, device=None):
         """(B, condition_size) for a list of codecs, None meaning unknown."""
@@ -282,19 +291,25 @@ class LatentUp(nn.Module):
             if condition is None:
                 condition = torch.zeros(low.shape[0], self.condition_size, device=low.device, dtype=low.dtype)
             modulation = self.film(condition)
-        if self.mix is None:
-            return run_encoder(self.encoder, padded, modulation)
-        return run_frames(self.encoder, self.mix, padded, self.in_frames, modulation)
+        return run_encoder(self.encoder, padded, modulation, self.align, self.in_frames)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if any(key.startswith("mix.") for key in state_dict):
+            raise SystemExit(
+                "a 3-frame latent_up with the old FrameMix (mix.*) does not load into the "
+                "feature-aligned one; that code is in git before the feature alignment"
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def neighbor_usage(self):
-        """Weight and gradient ratio of the frame mix's last layer, as vote reports its vote.
+        """Weight and gradient ratio of the fusion's last layer, as vote reports its vote.
 
         weight is the mean absolute kernel. grad is its mean absolute
         gradient over the same on the head. None for one frame.
         """
-        if self.mix is None:
+        if self.align is None:
             return None
-        kernel = self.mix.outer.weight
+        kernel = self.align.outer.weight
         stats = {"weight": float(kernel.detach().abs().mean())}
         head_grad = self.encoder.to_stats.weight.grad
         if kernel.grad is not None and head_grad is not None:
@@ -368,8 +383,8 @@ class LatentUpExport(nn.Module):
     stays in the graph, so one package serves every codec, and later reserve
     slots can be filled without a new export.
 
-    With in_frames 3 the input is the previous, middle, and next frame on 9
-    channels, as training reads them; the front runs once per frame.
+    One frame only: the 3-frame model goes to the app through the MLX port
+    (whoodeo.mlxport.convert).
     """
 
     def __init__(self, model, vae):
@@ -378,8 +393,11 @@ class LatentUpExport(nn.Module):
 
         self.encoder = copy.deepcopy(model.encoder)
         self.decoder = copy.deepcopy(vae.decoder)
-        self.in_frames = model.in_frames
-        self.mix = None if model.mix is None else copy.deepcopy(model.mix)
+        if model.in_frames != 1:
+            raise SystemExit(
+                "the Core ML export takes a one-frame latent_up; a 3-frame one goes to the app "
+                "with python -m whoodeo.mlxport.convert CHECKPOINT --app"
+            )
         self.film = None if model.film is None else copy.deepcopy(model.film)
         self.condition_size = 0 if model.film is None else model.condition_size
         head = self.encoder.to_stats
@@ -397,19 +415,7 @@ class LatentUpExport(nn.Module):
                     frames.shape[0], self.condition_size, device=frames.device, dtype=frames.dtype,
                 )
             pairs = self.film(condition)
-        if self.mix is None:
-            return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
-        # One front per frame on its 3 channels, no batch reshape in the graph.
-        count = front_count(self.encoder)
-        front = None if pairs is None else pairs[:count]
-        back = None if pairs is None else pairs[count:]
-        features = [
-            run_front(self.encoder, frames[:, 3 * index:3 * index + 3], front)
-            for index in range(self.in_frames)
-        ]
-        middle = features[self.in_frames // 2]
-        hidden = middle + self.mix(torch.cat(features, dim=1))
-        return self.decoder(run_back(self.encoder, hidden, back)).clamp(0, 1)
+        return self.decoder(run_encoder(self.encoder, frames, pairs)).clamp(0, 1)
 
 
 class LatentUpReference(nn.Module):

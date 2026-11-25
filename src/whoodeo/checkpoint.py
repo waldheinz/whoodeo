@@ -82,6 +82,7 @@ def run_directory(model_path):
 def save_run(
     directory, model, architecture, step, optimizer, loss,
     discriminator=None, disc_optimizer=None, schedule=None, extra=None,
+    publish_latest=True,
 ):
     """Write checkpoints/<step>/ and point both latest links at it.
 
@@ -131,7 +132,8 @@ def save_run(
             shutil.rmtree(partial, ignore_errors=True)
         raise
     _retarget(directory / "latest", Path("checkpoints") / name)
-    _publish_runs_latest(dest)
+    if publish_latest:
+        _publish_runs_latest(dest)
     return dest
 
 
@@ -214,8 +216,8 @@ def load_weights(model, spec):
     network gives what the loaded one gave. Anything else must match exactly,
     in_frames too.
     """
-    # Only latent_up has `mix` (None for one frame).
-    frames = model.in_frames if hasattr(model, "mix") else None
+    # Only latent_up has condition_size.
+    frames = model.in_frames if hasattr(model, "condition_size") else None
     saved_frames = int(spec.architecture.get("in_frames", 1))
     if frames is not None and frames != saved_frames:
         raise SystemExit(

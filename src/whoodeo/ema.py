@@ -23,7 +23,8 @@ class WeightAverage:
         """Start from `model`'s weights, or from `average` (a state dict) when given."""
         self.decay = float(decay)
         self.updates = int(updates)
-        self.names = [name for name, _param in model.named_parameters()]
+        # Frozen parameters (a latent_up's SPyNet) are not averaged.
+        self.names = [name for name, param in model.named_parameters() if param.requires_grad]
         params = dict(model.named_parameters())
         self.shadow = {}
         for name in self.names:
