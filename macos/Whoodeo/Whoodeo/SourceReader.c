@@ -462,10 +462,22 @@ static int convert(SourceFile *file, const AVFrame *frame, float *rgb, int capac
     return 0;
 }
 
-int source_frame(SourceFile *file, int index, float *rgb, int capacity, int *width, int *height) {
+// Puts the decoder right before `index`. A short step forward decodes through instead of seeking,
+// so a film that skips its repeated frames still reads in order.
+static int arrive(SourceFile *file, int index) {
     if (index < 0 || index >= file->count) {
         snprintf(file->error, sizeof file->error, "Bild %d fehlt", index);
         return -1;
+    }
+    if (file->positioned && index > file->nextIndex && index - file->nextIndex <= 8) {
+        while (file->nextIndex < index) {
+            if (decode_one(file, file->frame) < 0) {
+                file->positioned = 0;
+                break;
+            }
+            av_frame_unref(file->frame);
+            file->nextIndex++;
+        }
     }
     if (!file->positioned || index != file->nextIndex) {
         int status = position(file, index);
@@ -481,8 +493,73 @@ int source_frame(SourceFile *file, int index, float *rgb, int capacity, int *wid
         snprintf(file->error, sizeof file->error, "Bild %d fehlt", index);
         return -1;
     }
-    status = convert(file, file->frame, rgb, capacity, width, height);
+    return 0;
+}
+
+int source_frame(SourceFile *file, int index, float *rgb, int capacity, int *width, int *height) {
+    if (arrive(file, index) != 0) return -1;
+    int status = convert(file, file->frame, rgb, capacity, width, height);
     av_frame_unref(file->frame);
+    if (status != 0) {
+        file->positioned = 0;
+        return -1;
+    }
+    file->nextIndex = index + 1;
+    file->positioned = 1;
+    return 0;
+}
+
+int source_luma(SourceFile *file, int index, uint8_t *luma, int capacity, int step, int *width, int *height) {
+    if (step < 1) step = 1;
+    if (arrive(file, index) != 0) return -1;
+    AVFrame *frame = file->frame;
+    int w = frame->width;
+    int h = frame->height;
+    int gw = (w + step - 1) / step;
+    int gh = (h + step - 1) / step;
+    *width = gw;
+    *height = gh;
+    int status = 0;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get((enum AVPixelFormat)frame->format);
+    if (w <= 0 || h <= 0 || capacity < gw * gh) {
+        snprintf(file->error, sizeof file->error, "Bildpuffer ist zu klein");
+        status = -1;
+    } else if (desc != NULL && !(desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BE))
+               && desc->comp[0].plane == 0 && desc->comp[0].step == (desc->comp[0].depth > 8 ? 2 : 1)) {
+        // Planar or semi-planar YUV: the first plane is luma.
+        int depth = desc->comp[0].depth;
+        int shift = depth > 8 ? depth - 8 : 0;
+        int stride = frame->linesize[0];
+        for (int y = 0; y < gh; y++) {
+            const uint8_t *row = frame->data[0] + (size_t)(y * step) * stride;
+            uint8_t *out = luma + y * gw;
+            if (depth > 8) {
+                const uint16_t *wide = (const uint16_t *)row;
+                for (int x = 0; x < gw; x++) out[x] = (uint8_t)(wide[x * step] >> shift);
+            } else {
+                for (int x = 0; x < gw; x++) out[x] = row[x * step];
+            }
+        }
+    } else {
+        // Anything else through the RGB conversion, luma from Rec. 709 weights.
+        float *rgb = av_malloc(sizeof(float) * (size_t)w * h * 3);
+        int cw = 0, ch = 0;
+        if (rgb == NULL || convert(file, frame, rgb, w * h * 3, &cw, &ch) != 0) {
+            snprintf(file->error, sizeof file->error, "Bild %d fehlt", index);
+            status = -1;
+        } else {
+            int plane = w * h;
+            for (int y = 0; y < gh; y++) {
+                for (int x = 0; x < gw; x++) {
+                    int i = y * step * w + x * step;
+                    float v = 0.2126f * rgb[i] + 0.7152f * rgb[plane + i] + 0.0722f * rgb[2 * plane + i];
+                    luma[y * gw + x] = (uint8_t)lrintf(fminf(fmaxf(v, 0), 1) * 255);
+                }
+            }
+        }
+        av_free(rgb);
+    }
+    av_frame_unref(frame);
     if (status != 0) {
         file->positioned = 0;
         return -1;

@@ -25,6 +25,10 @@ int source_time(const SourceFile *file, int index, int64_t *value, int32_t *time
 // 8-bit sources use the 0..255 steps. Wider sources use the 0..65535 steps.
 int source_frame(SourceFile *file, int index, float *rgb, int capacity, int *width, int *height);
 
+// Writes 8-bit luma of every `step`-th sample in both directions, row by row, for cheap frame
+// comparisons. width and height are those of the written grid. Reading in order does not seek.
+int source_luma(SourceFile *file, int index, uint8_t *luma, int capacity, int step, int *width, int *height);
+
 int source_audio_count(const SourceFile *file);
 int source_audio_info(const SourceFile *file, int ordinal, int *channels, double *sampleRate, double *bitRate);
 

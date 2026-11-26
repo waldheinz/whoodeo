@@ -49,13 +49,16 @@ nonisolated struct Reel: Sendable {
 }
 
 /// The low-res film at its own size. It has its own reader, so it never waits for the model queue.
+/// With a frame map it shows the same kept frames as the upscale.
 nonisolated final class Originals: @unchecked Sendable {
     private let url: URL
+    private let map: FrameMap?
     private let lock = NSLock()
     private var film: Film?
 
-    init(url: URL) {
+    init(url: URL, map: FrameMap? = nil) {
         self.url = url
+        self.map = map
     }
 
     /// One original frame as 16-bit RGB, tagged BT.709 like the cache. The layer scales it.
@@ -64,7 +67,7 @@ nonisolated final class Originals: @unchecked Sendable {
     func sample(at index: Int, time: CMTime, duration: CMTime) throws -> CMSampleBuffer {
         lock.lock()
         defer { lock.unlock() }
-        if film == nil { film = try Film.open(url) }
+        if film == nil { film = try Film.open(url, map: map) }
         let decoded = try film!.decode(at: index)
         let buffer = try Pixels.rgba16(decoded.rgb, width: decoded.width, height: decoded.height)
         CVBufferRemoveAllAttachments(buffer)
@@ -137,6 +140,7 @@ final class FrameScreen {
     private var startIndex = 0
     private var enqueued = 0
     private var lastShown = 0
+    private var grade = ColorGrade.neutral
 
     func attach(to view: PictureView) {
         self.view = view
@@ -165,12 +169,31 @@ final class FrameScreen {
         layout(in: view.bounds)
         updateScale()
         setSharp(view.sharp)
+        applyGrade()
+    }
+
+    /// Light and color over whatever the screen shows, stills and playback alike. Core Animation
+    /// renders the filters, so moving a slider never touches the frames or the cache.
+    func setGrade(_ next: ColorGrade) {
+        guard next != grade else { return }
+        grade = next
+        applyGrade()
+    }
+
+    private func applyGrade() {
+        host.layerUsesCoreImageFilters = true
+        host.layer?.filters = grade.isNeutral ? nil : grade.filters()
     }
 
     func layout(in bounds: CGRect) {
         guard host.frame != bounds || display.frame != host.bounds else { return }
+        // The video layer is a plain sublayer: without this every frame change starts its own
+        // implicit animation, which lags behind and fights a window or panel animation.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         host.frame = bounds
         display.frame = host.bounds
+        CATransaction.commit()
         updateScale()
     }
 

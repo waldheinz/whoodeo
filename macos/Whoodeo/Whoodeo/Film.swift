@@ -10,6 +10,11 @@ nonisolated struct FilmFacts: Sendable {
     var bits: Int
     /// FFmpeg's name of the picture codec, empty when unknown.
     var codecName: String = ""
+    /// Frames and rate of the file itself. `count` and `fps` are what the app sees after preprocessing.
+    var sourceCount: Int = 0
+    var sourceFps: Double = 0
+    /// Decimate cycle in force, nil when every source frame is used.
+    var cycle: Int?
 
     /// What the codec condition of a latent_up with FiLM calls this film.
     var codec: SourceCodec { SourceCodec.detect(ffmpegName: codecName) }
@@ -31,21 +36,28 @@ nonisolated struct Decoded {
     var rgb: [Float]
 }
 
+/// One film as the rest of the app sees it: indexes, times and pictures after preprocessing.
+/// Without a frame map that is the file itself. With one, index `i` is source frame `map.raw[i]`,
+/// timed evenly at the reduced rate over the same total length, so the sound stays in place.
 nonisolated final class Film {
-    let facts: FilmFacts
+    private(set) var facts: FilmFacts
+    /// The file as it is.
+    let source: FilmFacts
     let audio: [AudioFacts]
-    let frameDuration: CMTime
+    /// Length of one source frame.
+    let sourceDuration: CMTime
+    private(set) var map: FrameMap?
     private let reader: OpaquePointer
     private var held: [Int: Decoded] = [:]
     private var heldOrder: [Int] = []
 
     @concurrent
-    static func load(_ url: URL) async throws -> Film {
-        try open(url)
+    static func load(_ url: URL, map: FrameMap? = nil) async throws -> Film {
+        try open(url, map: map)
     }
 
-    /// Opens the file on the calling thread.
-    static func open(_ url: URL) throws -> Film {
+    /// Opens the file on the calling thread. A map made for another frame count is ignored.
+    static func open(_ url: URL, map: FrameMap? = nil) throws -> Film {
         var message = [CChar](repeating: 0, count: 512)
         let opened = message.withUnsafeMutableBufferPointer { buffer in
             url.path.withCString { source_open($0, buffer.baseAddress, Int32(buffer.count)) }
@@ -84,9 +96,13 @@ nonisolated final class Film {
             count: count,
             fps: fps > 0 ? fps : 25,
             bits: Int(source_bits(opened)),
-            codecName: String(cString: source_codec(opened))
+            codecName: String(cString: source_codec(opened)),
+            sourceCount: count,
+            sourceFps: fps > 0 ? fps : 25
         )
-        return Film(facts: facts, audio: audio, frameDuration: duration, reader: opened)
+        let film = Film(facts: facts, audio: audio, frameDuration: duration, reader: opened)
+        film.apply(map)
+        return film
     }
 
     private static func interval(_ file: OpaquePointer, count: Int, fps: Double) -> CMTime {
@@ -114,9 +130,38 @@ nonisolated final class Film {
         reader: OpaquePointer
     ) {
         self.facts = facts
+        self.source = facts
         self.audio = audio
-        self.frameDuration = frameDuration
+        self.sourceDuration = frameDuration
         self.reader = reader
+    }
+
+    /// Switch the preprocessing. Nil shows every source frame again.
+    func apply(_ next: FrameMap?) {
+        guard let next, next.rawCount == source.count, next.count > 0 else {
+            map = nil
+            facts = source
+            return
+        }
+        map = next
+        var logical = source
+        logical.count = next.count
+        logical.fps = next.fps(source: source.fps)
+        logical.cycle = next.cycle
+        facts = logical
+    }
+
+    /// Length of one frame as the app sees it.
+    var frameDuration: CMTime {
+        guard let map else { return sourceDuration }
+        return CMTimeMultiplyByRatio(sourceDuration, multiplier: Int32(map.cycle), divisor: Int32(map.cycle - 1))
+    }
+
+    /// The source frame behind a frame of the app, clamped to the film.
+    func sourceIndex(_ index: Int) -> Int {
+        let clamped = min(max(index, 0), max(facts.count - 1, 0))
+        guard let map else { return clamped }
+        return map.raw[clamped]
     }
 
     deinit {
@@ -125,6 +170,14 @@ nonisolated final class Film {
 
     func time(for index: Int) -> CMTime {
         guard facts.count > 0 else { return .zero }
+        if let map {
+            // Even steps from the first source stamp: `cycle` source frames become `cycle - 1`.
+            let start = Film.stamp(0, reader)
+            let ticks = Int64(max(index, 0)) * Int64(map.cycle)
+            guard ticks <= Int64(Int32.max) else { return start }
+            let offset = CMTimeMultiplyByRatio(sourceDuration, multiplier: Int32(ticks), divisor: Int32(map.cycle - 1))
+            return CMTimeAdd(start, offset)
+        }
         if index < facts.count { return Film.stamp(max(index, 0), reader) }
         let last = Film.stamp(facts.count - 1, reader)
         let extra = index - (facts.count - 1)
@@ -133,6 +186,7 @@ nonisolated final class Film {
     }
 
     func duration(at index: Int) -> CMTime {
+        if map != nil { return frameDuration }
         guard index + 1 < facts.count else { return frameDuration }
         let delta = CMTimeSubtract(time(for: index + 1), time(for: index))
         return delta.seconds > 0 ? delta : frameDuration
@@ -145,6 +199,30 @@ nonisolated final class Film {
     /// Decodes on the calling thread. One film is not safe to share between threads.
     func decode(at index: Int) throws -> Decoded {
         let clamped = min(max(index, 0), max(facts.count - 1, 0))
+        var decoded = try decodeSource(sourceIndex(clamped))
+        decoded.index = clamped
+        decoded.time = time(for: clamped)
+        return decoded
+    }
+
+    /// 8-bit luma of a source frame on a grid of every `step`-th pixel, for frame comparisons.
+    /// Reading the frames in order never seeks.
+    func luma(source index: Int, step: Int, into buffer: inout [UInt8]) throws -> (width: Int, height: Int) {
+        let needed = ((facts.width + step - 1) / step) * ((facts.height + step - 1) / step)
+        if buffer.count < needed { buffer = [UInt8](repeating: 0, count: needed) }
+        var width: Int32 = 0
+        var height: Int32 = 0
+        let status = buffer.withUnsafeMutableBufferPointer { out -> Int32 in
+            guard let base = out.baseAddress else { return -1 }
+            return source_luma(reader, Int32(index), base, Int32(out.count), Int32(step), &width, &height)
+        }
+        guard status == 0 else { throw CLIError(String(cString: source_error(reader))) }
+        return (Int(width), Int(height))
+    }
+
+    /// One frame of the file, by its own index. Held by that index, so a map change keeps the hold.
+    private func decodeSource(_ index: Int) throws -> Decoded {
+        let clamped = min(max(index, 0), max(source.count - 1, 0))
         if let hit = held[clamped] { return hit }
         let plane = facts.width * facts.height
         var rgb = [Float](repeating: 0, count: plane * 3)
@@ -164,7 +242,7 @@ nonisolated final class Film {
         }
         let decoded = Decoded(
             index: clamped,
-            time: time(for: clamped),
+            time: Film.stamp(clamped, reader),
             width: pictureWidth,
             height: pictureHeight,
             rgb: rgb
@@ -175,6 +253,7 @@ nonisolated final class Film {
 
     /// Previous, current, next. The same edge repeat as `iter_reconstructions`.
     /// `frames` names the source frame of each plane (the edge repeats the first or last one).
+    /// With a frame map the neighbors are the kept frames, so a repeat never stands in for one.
     func window(at index: Int, frames: Int) async throws -> (stack: [Float], current: Decoded, frames: FrameKeys) {
         let radius = frames / 2
         var planes: [[Float]] = []
@@ -184,7 +263,7 @@ nonisolated final class Film {
             let slot = min(max(index + dt, 0), max(facts.count - 1, 0))
             let decoded = try await frame(at: slot)
             planes.append(decoded.rgb)
-            slots.append(slot)
+            slots.append(sourceIndex(slot))
             if dt == 0 { current = decoded }
         }
         guard let current else { throw CLIError("Bild \(index) fehlt") }

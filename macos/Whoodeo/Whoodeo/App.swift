@@ -1,3 +1,4 @@
+import CoreMedia
 import CoreVideo
 import Foundation
 import MLX
@@ -79,11 +80,13 @@ nonisolated enum CLI {
     Whoodeo --pace model.mlxmodel video [--frames N]
     Whoodeo --vae-roundtrip picture-or-video
     Whoodeo --upscale model.mlxmodel video index [out.f32] [--source-codec auto|h264|mpeg4|mpeg2|unknown]
+    Whoodeo --decimate video [auto|cycle6|cycle5]
 
     --upscale scales one frame through the frame cache, as the window does: a latent_up with
     FiLM uses the condition of the given codec (auto: the film's codec; MPEG-2 automatic
     falls back to unknown). The frame comes from that cache when it is there. --export takes
-    --source-codec too.
+    --source-codec too. --decimate scans a film for repeated frames (or reuses the app's scan),
+    prints the cycle it finds and the frames left, and keeps the scan for the app.
 
     The f32 file is little-endian int32 n,c,h,w followed by float32 NCHW.
     """
@@ -96,6 +99,7 @@ nonisolated enum CLI {
         case "--pace": try pace(args)
         case "--vae-roundtrip": try vaeRoundtrip(args)
         case "--upscale": try upscale(args)
+        case "--decimate": try decimate(args)
         default: throw CLIError(usage)
         }
     }
@@ -199,6 +203,41 @@ nonisolated enum CLI {
                 data.width, data.height, data.psnr ?? 0, mean, std, decodeMs
             ), stdout)
         }
+    }
+
+    /// Scan or reuse the frame differences, then report what the pipeline panel would show.
+    private static func decimate(_ args: [String]) throws {
+        guard args.count == 1 || args.count == 2 else { throw CLIError(usage) }
+        let mode = args.count == 2 ? DecimateMode.parse(args[1]) : .auto
+        guard let mode, mode != .off else { throw CLIError(usage) }
+        let (url, id) = try filmID(for: args[0])
+        let film = try Film.open(url)
+        let started = CFAbsoluteTimeGetCurrent()
+        let diffs: [Float]
+        if let cached = Decimate.cached(filmID: id, count: film.source.count) {
+            diffs = cached
+            fputs("Scan aus dem Cache\n", stdout)
+        } else {
+            diffs = try Decimate.scan(url: url, progress: { _ in }, cancelled: { false })
+            try Decimate.store(diffs, filmID: id)
+            let seconds = CFAbsoluteTimeGetCurrent() - started
+            fputs(String(format: "Scan %d Bilder in %.1f s (%.0f Bilder/s)\n", diffs.count, seconds, Double(diffs.count) / seconds), stdout)
+        }
+        let resolved = Decimate.resolve(mode, diffs: diffs)
+        guard let map = resolved.map else {
+            fputs("\(mode.rawValue): \(resolved.note.isEmpty ? "nichts weggelassen" : resolved.note)\n", stdout)
+            return
+        }
+        film.apply(map)
+        let dropped = Set(0..<map.rawCount).subtracting(map.raw).sorted()
+        var phases: [(from: Int, phase: Int)] = []
+        for frame in dropped where phases.last?.phase != frame % map.cycle {
+            phases.append((frame, frame % map.cycle))
+        }
+        let shown = phases.prefix(12).map { "ab \($0.from) Phase \($0.phase)" }.joined(separator: ", ")
+        fputs("\(mode.rawValue) \(resolved.note): Zyklus \(map.cycle), \(film.source.count) → \(film.facts.count) Bilder, \(film.source.fps) → \(film.facts.fps) fps\n", stdout)
+        fputs("Dauer \(film.time(for: film.facts.count).seconds) s (Quelle \(CMTimeAdd(film.time(for: 0), CMTimeMultiply(film.sourceDuration, multiplier: Int32(film.source.count))).seconds) s)\n", stdout)
+        fputs("Phasenwechsel \(phases.count): \(shown)\n", stdout)
     }
 
     /// `--source-codec X` taken out of the arguments. Nil when it is not there.

@@ -23,16 +23,31 @@ nonisolated final class Engine: @unchecked Sendable {
     private var film: Film?
     private var predictor: Predictor?
     private var cancelExport = false
+    /// Set when the app quits: no new model work starts, so MLX is idle before `exit` tears down Metal.
+    private var closing = false
 
-    func openFilm(_ url: URL, filmID: String, done: @escaping (Result<FilmFacts, Error>) -> Void) {
+    /// `map` is the preprocessing of the film; one made for another frame count is ignored.
+    func openFilm(_ url: URL, filmID: String, map: FrameMap? = nil, done: @escaping (Result<FilmFacts, Error>) -> Void) {
         queue.async {
             do {
-                let film = try Self.wait { try await Film.load(url) }
+                let film = try Self.wait { try await Film.load(url, map: map) }
                 self.film = film
                 done(.success(film.facts))
             } catch {
                 done(.failure(error))
             }
+        }
+    }
+
+    /// Switch the preprocessing of the open film. Runs after the requests already queued.
+    func applyMap(_ map: FrameMap?, done: @escaping (Result<FilmFacts, Error>) -> Void) {
+        queue.async {
+            guard let film = self.film else {
+                done(.failure(CLIError("kein Film")))
+                return
+            }
+            film.apply(map)
+            done(.success(film.facts))
         }
     }
 
@@ -58,6 +73,10 @@ nonisolated final class Engine: @unchecked Sendable {
 
     func request(_ index: Int, store: FrameStore?, done: @escaping (Result<Shown, Error>) -> Void) {
         lock.lock()
+        if closing {
+            lock.unlock()
+            return
+        }
         // A request that has not started yet is replaced. Tell its caller, or the
         // session keeps believing that fill is still running and never asks again.
         let displaced = handler
@@ -79,6 +98,7 @@ nonisolated final class Engine: @unchecked Sendable {
         url: URL,
         codec: Codec,
         range: Range<Int>,
+        grade: ColorGrade = .neutral,
         store: FrameStore,
         progress: @escaping (Int, Int) -> Void,
         stored: @escaping (Int) -> Void,
@@ -109,6 +129,7 @@ nonisolated final class Engine: @unchecked Sendable {
                     url: url,
                     codec: codec,
                     range: range,
+                    grade: grade,
                     progress: progress,
                     stored: stored,
                     cancelled: {
@@ -123,6 +144,23 @@ nonisolated final class Engine: @unchecked Sendable {
                 done(.failure(error))
             }
         }
+    }
+
+    /// Stop for quitting: drop the waiting request, cancel an export, and refuse new work.
+    /// Returns once the model queue has finished what it was running, or after `timeout` seconds.
+    /// Call it off the main thread; work on the queue may still report to the main actor.
+    @discardableResult
+    func shutdown(timeout: TimeInterval) -> Bool {
+        lock.lock()
+        closing = true
+        cancelExport = true
+        wanted = nil
+        handler = nil
+        store = nil
+        lock.unlock()
+        let idle = DispatchSemaphore(value: 0)
+        queue.async { idle.signal() }
+        return idle.wait(timeout: .now() + timeout) == .success
     }
 
     func cancelExportNow() {
@@ -156,6 +194,10 @@ nonisolated final class Engine: @unchecked Sendable {
     private func drain() {
         while true {
             lock.lock()
+            if closing {
+                wanted = nil
+                handler = nil
+            }
             let index = wanted
             let done = handler
             let store = store

@@ -1,16 +1,38 @@
 import SwiftUI
 
+/// One line of the sidebar. Models and films share one list; each kind keeps its own selection.
+private enum SidebarItem: Hashable {
+    case model(URL)
+    case film(String)
+}
+
 struct ContentView: View {
     @EnvironmentObject private var session: Session
     @State private var swiftDrop = false
     @State private var viewDrop = false
     @State private var transportInset: CGFloat = 0
+    @AppStorage("showPipeline") private var showPipeline = true
+    @AppStorage("modelsExpanded") private var modelsExpanded = true
+    @AppStorage("filmsExpanded") private var filmsExpanded = true
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
             detail
+        }
+        .inspector(isPresented: $showPipeline) {
+            // With its own toolbar item the inspector reaches up through the title bar like the
+            // sidebar, and the toggle sits over it as a button of its own. The toolbar keeps the
+            // item while the panel is closed, so it is the only toggle in both states.
+            PipelinePanel()
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 400)
+                .toolbar {
+                    ToolbarSpacer(.flexible)
+                    ToolbarItem {
+                        pipelineToggle
+                    }
+                }
         }
         .navigationSplitViewStyle(.balanced)
         .toolbarBackgroundVisibility(.automatic, for: .windowToolbar)
@@ -54,41 +76,26 @@ struct ContentView: View {
 
     private var sidebar: some View {
         VStack(spacing: 0) {
-            List(selection: modelSelection) {
-                ForEach(session.library) { model in
-                    Label {
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(model.title)
-                                Text(model.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            if session.comparison == model.url {
-                                Spacer()
-                                Image(systemName: "rectangle.split.2x1")
-                                    .foregroundStyle(.secondary)
-                                    .help("Vergleichsmodell: Ein Klick ins Bild zeigt dieses Modell.")
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: model.symbol)
-                            .foregroundStyle(model.tint)
+            List(selection: sidebarSelection) {
+                Section(isExpanded: $modelsExpanded) {
+                    ForEach(session.library) { model in
+                        modelRow(model)
                     }
-                    .tag(model.url)
-                    .contextMenu {
-                        Button(session.comparison == model.url ? "Vergleich aufheben" : "Zum Vergleich") {
-                            session.toggleComparison(model.url)
-                        }
-                        .disabled(model.url == session.selection)
-                        Button("In den Papierkorb legen", role: .destructive) {
-                            session.askDelete(model.url)
-                        }
+                } header: {
+                    Text("Modelle")
+                }
+                Section(isExpanded: $filmsExpanded) {
+                    ForEach(session.films) { film in
+                        filmRow(film)
                     }
+                } header: {
+                    Text("Filme")
                 }
             }
             .listStyle(.sidebar)
-            filmsList
+            .onDeleteCommand {
+                session.askRemoveFilm()
+            }
             ScaleMeter(
                 rate: session.scaleRate,
                 realtime: session.realtimeRate,
@@ -97,80 +104,97 @@ struct ContentView: View {
             )
         }
         .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
-        .navigationTitle("Whoodeo")
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    session.askDelete()
-                } label: {
-                    Label("In den Papierkorb legen", systemImage: "trash")
+    }
+
+    /// Shows and hides the pipeline panel. Over the panel while it is open, at the right end otherwise.
+    private var pipelineToggle: some View {
+        Button {
+            showPipeline.toggle()
+        } label: {
+            Label("Pipeline", systemImage: "sidebar.right")
+        }
+        .help("Pipeline ein- oder ausblenden: Quelle, Upscaler, Farbe & Licht")
+    }
+
+    private func modelRow(_ model: LibraryModel) -> some View {
+        Label {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.title)
+                    Text(model.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .disabled(session.selection == nil)
+                if session.comparison == model.url {
+                    Spacer()
+                    Image(systemName: "rectangle.split.2x1")
+                        .foregroundStyle(.secondary)
+                        .help("Vergleichsmodell: Ein Klick ins Bild zeigt dieses Modell.")
+                }
+            }
+        } icon: {
+            Image(systemName: model.symbol)
+                .foregroundStyle(model.tint)
+        }
+        .tag(SidebarItem.model(model.url))
+        .contextMenu {
+            Button(session.comparison == model.url ? "Vergleich aufheben" : "Zum Vergleich") {
+                session.toggleComparison(model.url)
+            }
+            .disabled(model.url == session.selection)
+            Button("In den Papierkorb legen", role: .destructive) {
+                session.askDelete(model.url)
             }
         }
     }
 
-    /// A click picks the main model. An option-click marks a comparison model, and a second one clears it.
-    private var modelSelection: Binding<URL?> {
+    private func filmRow(_ film: OpenFilm) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(film.name)
+                .lineLimit(1)
+            Text(film.subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .tag(SidebarItem.film(film.id))
+        .contextMenu {
+            Button("Aus der Liste entfernen", role: .destructive) {
+                session.askRemoveFilm(film.id)
+            }
+        }
+    }
+
+    /// One list, two selections: the main model and the film both stay highlighted.
+    /// A click replaces one of them. An option-click on a model marks it for comparison instead,
+    /// and a second one clears it.
+    private var sidebarSelection: Binding<Set<SidebarItem>> {
         Binding(
-            get: { session.selection },
+            get: {
+                var items: Set<SidebarItem> = []
+                if let model = session.selection { items.insert(.model(model)) }
+                if let film = session.filmSelection { items.insert(.film(film)) }
+                return items
+            },
             set: { next in
-                if NSEvent.modifierFlags.contains(.option), let next {
-                    if next != session.selection { session.toggleComparison(next) }
-                } else {
-                    session.selection = next
+                var current: Set<SidebarItem> = []
+                if let model = session.selection { current.insert(.model(model)) }
+                if let film = session.filmSelection { current.insert(.film(film)) }
+                let added = next.subtracting(current)
+                guard let picked = added.first ?? (next.count == 1 ? next.first : nil) else { return }
+                switch picked {
+                case .model(let url):
+                    if NSEvent.modifierFlags.contains(.option) {
+                        if url != session.selection { session.toggleComparison(url) }
+                    } else if url != session.selection {
+                        session.selection = url
+                    }
+                case .film(let id):
+                    session.filmSelection = id
+                    _ = session.showFilm(id: id)
                 }
             }
         )
-    }
-
-    private var filmsList: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Filme")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    session.askRemoveFilm()
-                } label: {
-                    Image(systemName: "minus")
-                }
-                .buttonStyle(.borderless)
-                .disabled(session.filmSelection == nil)
-                .help("Aus der Liste entfernen")
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 2)
-            List(selection: $session.filmSelection) {
-                ForEach(session.films) { film in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(film.name)
-                            .lineLimit(1)
-                        Text(film.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .tag(film.id as String?)
-                    .contextMenu {
-                        Button("Aus der Liste entfernen", role: .destructive) {
-                            session.askRemoveFilm(film.id)
-                        }
-                    }
-                }
-            }
-            .listStyle(.sidebar)
-            .frame(minHeight: 72)
-            .onChange(of: session.filmSelection) { _, id in
-                guard let id else { return }
-                _ = session.showFilm(id: id)
-            }
-            .onDeleteCommand {
-                session.askRemoveFilm()
-            }
-        }
     }
 
     /// While the comparison is asked for: which model, or what keeps it from the screen.
@@ -222,7 +246,8 @@ struct ContentView: View {
                 dropHint
             }
         }
-        .navigationTitle(session.modelLabel.isEmpty ? "Whoodeo" : session.modelLabel)
+        .navigationTitle(session.filmTitle ?? "Whoodeo")
+        .navigationSubtitle(session.modelLabel)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -244,21 +269,11 @@ struct ContentView: View {
                     }
                 }
             }
+            // Film and export are one pill, the zoom another.
+            ToolbarSpacer(.fixed)
             ToolbarItemGroup {
                 ZoomSlider()
                     .disabled(session.frameCount == 0)
-                Picker("Codec", selection: Binding(
-                    get: { session.codecChoice },
-                    set: { session.changeCodec($0) }
-                )) {
-                    ForEach(CodecChoice.allCases) { choice in
-                        Text(codecTitle(choice)).tag(choice)
-                    }
-                }
-                .pickerStyle(.menu)
-                .fixedSize()
-                .disabled(!session.codecSelectable)
-                .help(codecHelp)
             }
         }
         .safeAreaBar(edge: .bottom) {
@@ -275,21 +290,6 @@ struct ContentView: View {
                 }
         }
         .onPreferenceChange(TransportInsetKey.self) { transportInset = $0 }
-    }
-
-    /// "Automatisch (h264)" names what automatic picks for the open film.
-    private func codecTitle(_ choice: CodecChoice) -> String {
-        guard choice == .auto else { return choice.title }
-        return "Automatisch (\(session.automaticCodec.title))"
-    }
-
-    private var codecHelp: String {
-        guard session.selectedModel?.hasCodecs == true else {
-            return "Dieses Modell hat keine Codec-Bedingung."
-        }
-        let film = session.filmCodec.map { "Film: \($0.title)" } ?? "kein Film"
-        let active = session.activeCodec.map { "aktiv: \($0.title)" } ?? "kein Codec"
-        return "Codec, auf den der Upscaler eingestellt ist. \(film) · \(active)"
     }
 
     private var showsPicture: Bool {

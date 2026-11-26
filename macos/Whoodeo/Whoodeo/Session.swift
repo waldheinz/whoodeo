@@ -82,6 +82,22 @@ final class Session: ObservableObject {
     /// Newly scaled frames per second. Zero when nothing is computing.
     /// Slow film stays visible: the pace follows the gap between frames, not a two-second window.
     @Published private(set) var scaleRate: Double = 0
+    /// Preprocessing of the open film, as chosen in the pipeline panel.
+    @Published private(set) var preprocess = PreprocessConfig.none
+    /// The scan for repeated frames: 0…1 while it runs, nil otherwise.
+    @Published private(set) var decimateProgress: Double?
+    /// What automatic found, or why the scan stopped. Empty when there is nothing to say.
+    @Published private(set) var decimateNote = ""
+    /// Light and color after the upscaler, per film. The screen shows it at once; an export renders it in.
+    @Published var grade = ColorGrade.neutral {
+        didSet {
+            guard grade != oldValue else { return }
+            stage?.screenIfCreated()?.setGrade(grade)
+            saveGradeSoon()
+        }
+    }
+    /// The auto button is sampling the film.
+    @Published private(set) var estimatingGrade = false
     /// Idle fill of missing frames. Playback and export still store what they compute.
     @Published var fillCache: Bool {
         didSet {
@@ -103,7 +119,15 @@ final class Session: ObservableObject {
     private var conditionSize = 0
     private var deleteTarget: URL?
     private var librarySource: DispatchSourceFileSystemObject?
-    private var facts: FilmFacts?
+    /// The open film after preprocessing: `count` and `fps` as shown, `sourceCount` and `sourceFps` of the file.
+    @Published private(set) var facts: FilmFacts?
+    /// Which source frames the open film keeps. Nil when it keeps all of them.
+    private var frameMap: FrameMap?
+    private var decimateToken = 0
+    private var decimateCancel: OSAllocatedUnfairLock<Bool>?
+    private var gradeSave: Task<Void, Never>?
+    /// The app is quitting; nothing new goes to the engines.
+    private var quitting = false
     private var store: FrameStore?
     /// The open film's originals for the screen. Nil without a film.
     private var originals: Originals?
@@ -236,6 +260,12 @@ final class Session: ObservableObject {
 
     /// ID of the film on screen. Empty when none is shown.
     var scriptCurrentFilmID: String { shownFilmID ?? "" }
+
+    /// Name of the film on screen without its extension, for the window title. Nil when none is shown.
+    var filmTitle: String? {
+        guard let shownFilmID, let film = films.first(where: { $0.id == shownFilmID }) else { return nil }
+        return URL(fileURLWithPath: film.path).deletingPathExtension().lastPathComponent
+    }
 
     func scriptFilmRecords() -> [OpenFilm] { films }
 
@@ -537,6 +567,7 @@ final class Session: ObservableObject {
     func attachStage(_ stage: PictureStage) {
         guard self.stage !== stage else { return }
         self.stage = stage
+        stage.screen().setGrade(grade)
         if !playing { showStill() }
     }
 
@@ -620,10 +651,16 @@ final class Session: ObservableObject {
         return (model.url, wanted)
     }
 
-    /// Suffix of the frame cache of a `-cond` package, nil without a condition input.
+    /// Suffix of the frame cache: the condition of a `-cond` package, then the preprocessing.
+    /// Nil for a package without FiLM on an unprocessed film, so older caches keep their names.
     private func conditionTag() -> String? {
-        guard conditionSize > 0 else { return nil }
-        return (activeCodec ?? wantedCodec()).cacheTag
+        let condition = conditionSize > 0 ? (activeCodec ?? wantedCodec()).cacheTag : nil
+        return Self.archiveTag(condition, frameMap)
+    }
+
+    private static func archiveTag(_ condition: String?, _ map: FrameMap?) -> String? {
+        let parts = [condition, map?.cacheTag].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: "-")
     }
 
     /// Menu: automatic or a fixed codec. Swaps the package or the vector; the frame cache follows.
@@ -909,7 +946,7 @@ final class Session: ObservableObject {
         let package = model.url
         guard package != modelURL else { return }
         do {
-            let tag = model.conditionInput ? wantedCodec().cacheTag : nil
+            let tag = Self.archiveTag(model.conditionInput ? wantedCodec().cacheTag : nil, frameMap)
             comparisonStore = try FrameStore.open(filmID: shownFilmID, model: package, count: facts.count, condition: tag)
             comparisonPackage = package
         } catch {
@@ -932,7 +969,7 @@ final class Session: ObservableObject {
             comparisonEngine = engine
             comparisonLoading = true
             Log.model.info("Vergleich lädt \(package.lastPathComponent, privacy: .public)")
-            engine.openFilm(facts.url, filmID: shownFilmID) { _ in }
+            engine.openFilm(facts.url, filmID: shownFilmID, map: frameMap) { _ in }
             let codec = activeCodec ?? wantedCodec()
             engine.openModel(package, condition: codec) { [weak self] result in
                 Task { @MainActor in
@@ -1028,6 +1065,7 @@ final class Session: ObservableObject {
 
     private func loadFilm(_ url: URL, id: String) {
         if shownFilmID == id, busy { return }
+        cancelDecimateScan()
         facts = nil
         frameCount = 0
         shownFilmID = id
@@ -1035,16 +1073,28 @@ final class Session: ObservableObject {
         busy = true
         failure = nil
         originals = nil
+        let entry = films.first { $0.id == id }
+        preprocess = entry?.preprocess ?? .none
+        grade = entry?.grade ?? .neutral
+        // A scan from before resolves at once. The film checks that it was made for this file.
+        let scan = preprocess.decimate == .off ? nil : Decimate.cached(filmID: id)
+        let resolved = scan.map { Decimate.resolve(preprocess.decimate, diffs: $0) }
+        frameMap = resolved?.map
+        decimateNote = resolved?.note ?? ""
         releaseArchive()
         status = "öffnet \(url.lastPathComponent)"
-        engine.openFilm(url, filmID: id) { [weak self] result in
+        engine.openFilm(url, filmID: id, map: frameMap) { [weak self] result in
             Task { @MainActor in
                 guard let self, self.loadingFilmID == id else { return }
                 switch result {
                 case .success(let facts):
                     self.loadingFilmID = nil
+                    if facts.cycle == nil { self.frameMap = nil }
+                    if self.preprocess.decimate != .off, scan?.count != facts.sourceCount {
+                        self.startDecimateScan(url: url, id: id)
+                    }
                     self.facts = facts
-                    self.originals = Originals(url: facts.url)
+                    self.originals = Originals(url: facts.url, map: self.frameMap)
                     self.frameCount = facts.count
                     self.index = 0
                     self.inPoint = 0
@@ -1087,6 +1137,10 @@ final class Session: ObservableObject {
 
     /// Drop the picture. The list entry and the cache stay.
     private func closeShownFilm() {
+        cancelDecimateScan()
+        frameMap = nil
+        preprocess = .none
+        decimateNote = ""
         shownFilmID = nil
         filmCodec = nil
         loadingFilmID = nil
@@ -1156,6 +1210,28 @@ final class Session: ObservableObject {
         releaseArchive()
         failure = nil
         status = facts == nil ? "Modell in der Seitenleiste wählen" : status
+    }
+
+    /// Quit: stop playback, fill and scans, then wait off the main thread until both engines
+    /// have finished their current frame. `done` runs on the main actor.
+    func prepareToQuit(done: @escaping @MainActor () -> Void) {
+        guard !quitting else { return }
+        quitting = true
+        epoch += 1
+        stopPlay()
+        scrubTask?.cancel()
+        cancelDecimateScan()
+        let engines = [engine] + (comparisonEngine.map { [$0] } ?? [])
+        Log.fill.info("Beenden: warte auf das Modell")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let started = CFAbsoluteTimeGetCurrent()
+            let idle = engines.map { $0.shutdown(timeout: 20) }.allSatisfy { $0 }
+            let waited = String(format: "%.1f s", CFAbsoluteTimeGetCurrent() - started)
+            Log.fill.info("Beenden: Modell \(idle ? "frei" : "noch beschäftigt", privacy: .public) nach \(waited, privacy: .public)")
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { done() }
+            }
+        }
     }
 
     /// Publish the open index before the process exits. Dropping the archive publishes as well.
@@ -1397,7 +1473,7 @@ final class Session: ObservableObject {
     }
 
     private func scheduleFill(allowWhilePlaying: Bool = false) {
-        guard fillCache else { return }
+        guard fillCache, !quitting else { return }
         guard !fillHalted else { return }
         if filling != nil || playFetching || exporting || scrubbing || busy { return }
         if playing && !allowWhilePlaying { return }
@@ -1479,7 +1555,7 @@ final class Session: ObservableObject {
         let range = inPoint..<(outPoint + 1)
         let token = epoch
         status = "exportiert 0 / \(range.count)"
-        engine.export(url: url, codec: codec, range: range, store: store, progress: { [weak self] done, total in
+        engine.export(url: url, codec: codec, range: range, grade: grade, store: store, progress: { [weak self] done, total in
             Task { @MainActor in
                 self?.status = "exportiert \(done) / \(total)"
             }
@@ -1508,6 +1584,237 @@ final class Session: ObservableObject {
 
     func cancelExport() {
         engine.cancelExportNow()
+    }
+
+    // MARK: Pipeline
+
+    /// Pipeline panel and scripts: which repeated frames to drop. Scans the film once, then
+    /// switches the film the app sees. The frame cache of the other choice stays on disk.
+    func setDecimate(_ mode: DecimateMode) {
+        guard mode != preprocess.decimate else { return }
+        guard !exporting else {
+            failure = "Während des Exports bleibt die Vorverarbeitung."
+            status = failure!
+            return
+        }
+        preprocess.decimate = mode
+        Log.model.info("Decimate \(mode.rawValue, privacy: .public)")
+        if let id = shownFilmID {
+            let config = preprocess
+            do {
+                try FilmLibrary.mutate { FilmLibrary.remember(id, preprocess: config, in: &$0) }
+            } catch {
+                Log.fill.error("Filmliste nicht geschrieben: \(error.localizedDescription, privacy: .public)")
+            }
+            reloadFilms()
+        }
+        cancelDecimateScan()
+        decimateNote = ""
+        guard let facts, let id = shownFilmID else { return }
+        if mode == .off {
+            switchMap(nil)
+            return
+        }
+        guard let scan = Decimate.cached(filmID: id, count: facts.sourceCount) else {
+            startDecimateScan(url: facts.url, id: id)
+            return
+        }
+        let resolved = Decimate.resolve(mode, diffs: scan)
+        decimateNote = resolved.note
+        switchMap(resolved.map)
+    }
+
+    /// `off`, `auto`, `cycle6` or `cycle5`. Returns a message when the name is unknown.
+    func setDecimate(named name: String) -> String? {
+        guard let mode = DecimateMode.parse(name) else {
+            return "Decimate ist off, auto, cycle6 oder cycle5."
+        }
+        setDecimate(mode)
+        return nil
+    }
+
+    /// One line for the panel and for scripts, for example "30 → 25 fps · 44847 Bilder".
+    var pipelineSummary: String {
+        guard let facts else { return "" }
+        if let decimateProgress {
+            return "sucht doppelte Bilder … \(Int((decimateProgress * 100).rounded())) %"
+        }
+        let rate = { (fps: Double) in fps.formatted(.number.precision(.fractionLength(0...3))) }
+        var text = facts.cycle == nil
+            ? "\(rate(facts.fps)) fps · \(facts.count) Bilder"
+            : "\(rate(facts.sourceFps)) → \(rate(facts.fps)) fps · \(facts.count) Bilder"
+        if !decimateNote.isEmpty { text += " · \(decimateNote)" }
+        return text
+    }
+
+    private func cancelDecimateScan() {
+        decimateToken += 1
+        decimateCancel?.withLock { $0 = true }
+        decimateCancel = nil
+        decimateProgress = nil
+    }
+
+    /// Measure the frame differences on a background thread. The film stays as it is until the scan is done.
+    private func startDecimateScan(url: URL, id: String) {
+        cancelDecimateScan()
+        let token = decimateToken
+        let cancel = OSAllocatedUnfairLock(initialState: false)
+        decimateCancel = cancel
+        decimateProgress = 0
+        decimateNote = ""
+        Log.model.info("Decimate-Scan startet \(url.lastPathComponent, privacy: .public)")
+        let report: @Sendable (Double) -> Void = { fraction in
+            Task { @MainActor in self.noteDecimateProgress(fraction, token: token) }
+        }
+        Task.detached(priority: .utility) { [weak self] in
+            let started = CFAbsoluteTimeGetCurrent()
+            let result = Result {
+                try Decimate.scan(url: url, progress: report, cancelled: { cancel.withLock { $0 } })
+            }
+            if case .success(let diffs) = result {
+                try? Decimate.store(diffs, filmID: id)
+                let seconds = String(format: "%.1f s", CFAbsoluteTimeGetCurrent() - started)
+                Log.model.info("Decimate-Scan \(diffs.count, privacy: .public) Bilder in \(seconds, privacy: .public)")
+            }
+            await self?.finishDecimateScan(result, token: token, id: id)
+        }
+    }
+
+    private func noteDecimateProgress(_ fraction: Double, token: Int) {
+        guard token == decimateToken, decimateProgress != nil else { return }
+        decimateProgress = fraction
+    }
+
+    private func finishDecimateScan(_ result: Result<[Float], Error>, token: Int, id: String) {
+        guard token == decimateToken, shownFilmID == id else { return }
+        decimateCancel = nil
+        decimateProgress = nil
+        switch result {
+        case .success(let diffs):
+            let resolved = Decimate.resolve(preprocess.decimate, diffs: diffs)
+            decimateNote = resolved.note
+            switchMap(resolved.map)
+        case .failure(let error):
+            if error is CancellationError { return }
+            decimateNote = "Suche fehlgeschlagen: \(error.localizedDescription)"
+            Log.model.error("Decimate-Scan: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Show the film through another frame map. The playhead stays on the same source frame,
+    /// the in and out points span the film again, and the caches of the new map take over.
+    private func switchMap(_ map: FrameMap?) {
+        guard map != frameMap, facts != nil, let id = shownFilmID else { return }
+        let sourceFrame = frameMap.map { $0.raw[min(max(index, 0), $0.count - 1)] } ?? index
+        releaseArchive()
+        frameMap = map
+        busy = true
+        engine.applyMap(map) { [weak self] result in
+            Task { @MainActor in
+                guard let self, self.shownFilmID == id else { return }
+                self.busy = false
+                switch result {
+                case .success(let facts):
+                    if facts.cycle == nil { self.frameMap = nil }
+                    self.facts = facts
+                    self.originals = Originals(url: facts.url, map: self.frameMap)
+                    self.frameCount = facts.count
+                    self.index = min(self.frameMap?.index(forSource: sourceFrame) ?? sourceFrame, max(facts.count - 1, 0))
+                    self.inPoint = 0
+                    self.outPoint = max(facts.count - 1, 0)
+                    self.coverage = Coverage(count: facts.count)
+                    self.status = "\(facts.width)×\(facts.height) · \(facts.count) Bilder"
+                    self.rememberShownFacts(facts, id: id)
+                    Log.model.info("Film \(facts.count, privacy: .public) Bilder · \(facts.fps, privacy: .public) fps")
+                    self.showCurrent()
+                case .failure(let error):
+                    self.failure = error.localizedDescription
+                    self.status = self.failure!
+                }
+            }
+        }
+    }
+
+    /// Fill the sliders with values sampled from the film. They stay editable.
+    func autoGrade() {
+        guard let facts, !estimatingGrade else { return }
+        estimatingGrade = true
+        let url = facts.url
+        let map = frameMap
+        let id = shownFilmID
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Result { try ColorGrade.estimate(url: url, map: map) }
+            await self?.finishAutoGrade(result, id: id)
+        }
+    }
+
+    private func finishAutoGrade(_ result: Result<ColorGrade, Error>, id: String?) {
+        estimatingGrade = false
+        guard shownFilmID == id else { return }
+        switch result {
+        case .success(let proposed):
+            grade = proposed
+            Log.model.info("Auto-Farbe h \(proposed.brightness) k \(proposed.contrast) g \(proposed.gamma) s \(proposed.saturation)")
+        case .failure(let error):
+            failure = error.localizedDescription
+            status = failure!
+        }
+    }
+
+    func resetGrade() {
+        grade = .neutral
+    }
+
+    /// Brightness, contrast, gamma and saturation for scripts, "0 1 1 1" when neutral.
+    var scriptGrade: String {
+        [grade.brightness, grade.contrast, grade.gamma, grade.saturation]
+            .map { String(format: "%g", $0) }
+            .joined(separator: " ")
+    }
+
+    /// Four numbers as in `scriptGrade`, `neutral`, or `auto`. Returns a message when the text does not parse.
+    func setGrade(text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces).lowercased()
+        switch trimmed {
+        case "neutral", "":
+            resetGrade()
+            return nil
+        case "auto":
+            autoGrade()
+            return nil
+        default:
+            let values = trimmed.split(separator: " ").compactMap { Double($0) }
+            guard values.count == 4 else {
+                return "Farbe ist „Helligkeit Kontrast Gamma Sättigung“, neutral oder auto."
+            }
+            func clamp(_ value: Double, _ range: ClosedRange<Double>) -> Double {
+                min(max(value, range.lowerBound), range.upperBound)
+            }
+            grade = ColorGrade(
+                brightness: clamp(values[0], ColorGrade.brightnessRange),
+                contrast: clamp(values[1], ColorGrade.contrastRange),
+                gamma: clamp(values[2], ColorGrade.gammaRange),
+                saturation: clamp(values[3], ColorGrade.saturationRange)
+            )
+            return nil
+        }
+    }
+
+    /// Slider drags change the grade many times a second; the film list is written once they rest.
+    private func saveGradeSoon() {
+        gradeSave?.cancel()
+        guard let id = shownFilmID else { return }
+        let value = grade
+        gradeSave = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled, let self else { return }
+            do {
+                try FilmLibrary.mutate { FilmLibrary.remember(id, grade: value, in: &$0) }
+            } catch {
+                Log.fill.error("Filmliste nicht geschrieben: \(error.localizedDescription, privacy: .public)")
+            }
+            self.reloadFilms()
+        }
     }
 }
 

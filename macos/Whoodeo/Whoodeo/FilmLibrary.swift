@@ -8,6 +8,9 @@ nonisolated struct OpenFilm: Codable, Identifiable, Hashable, Sendable {
     var width: Int
     var height: Int
     var frames: Int
+    /// Preprocessing and color of this film. Nil in lists from before the pipeline panel, which means off and neutral.
+    var preprocess: PreprocessConfig?
+    var grade: ColorGrade?
 
     var name: String { URL(fileURLWithPath: path).lastPathComponent }
 
@@ -74,6 +77,16 @@ nonisolated enum FilmLibrary {
         list.films[index].width = width
         list.films[index].height = height
         list.films[index].frames = frames
+    }
+
+    static func remember(_ id: String, preprocess: PreprocessConfig, in list: inout FilmList) {
+        guard let index = list.films.firstIndex(where: { $0.id == id }) else { return }
+        list.films[index].preprocess = preprocess == .none ? nil : preprocess
+    }
+
+    static func remember(_ id: String, grade: ColorGrade, in list: inout FilmList) {
+        guard let index = list.films.firstIndex(where: { $0.id == id }) else { return }
+        list.films[index].grade = grade.isNeutral ? nil : grade
     }
 
     private static func read() -> FilmList {

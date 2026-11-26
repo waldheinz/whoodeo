@@ -7,6 +7,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Self.keys.contains(key)
     }
 
+    /// The model queue may be inside an MLX evaluation. `exit` runs the C++ destructors of MLX and
+    /// Metal while that thread still uses them, which crashed on quit. So the app waits until the
+    /// engines are idle, a few seconds at most, before it goes.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        MainActor.assumeIsolated {
+            guard let session = Session.current else { return .terminateNow }
+            session.prepareToQuit {
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated { Session.current?.flushStore() }
     }
@@ -140,6 +153,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated { Session.current?.activeCodec?.rawValue ?? "" }
     }
 
+    @objc var scriptDecimate: String {
+        get { MainActor.assumeIsolated { Session.current?.preprocess.decimate.rawValue ?? "off" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let problem = Session.current?.setDecimate(named: newValue) else { return }
+                NSScriptCommand.current()?.scriptErrorNumber = errAECoercionFail
+                NSScriptCommand.current()?.scriptErrorString = problem
+            }
+        }
+    }
+
+    @objc var scriptColorGrade: String {
+        get { MainActor.assumeIsolated { Session.current?.scriptGrade ?? "" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let problem = Session.current?.setGrade(text: newValue) else { return }
+                NSScriptCommand.current()?.scriptErrorNumber = errAECoercionFail
+                NSScriptCommand.current()?.scriptErrorString = problem
+            }
+        }
+    }
+
+    /// The pipeline panel on the right. The window follows the stored choice.
+    @objc var scriptPipelineShown: Bool {
+        get { UserDefaults.standard.object(forKey: "showPipeline") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "showPipeline") }
+    }
+
+    @objc var scriptPipeline: String {
+        MainActor.assumeIsolated { Session.current?.pipelineSummary ?? "" }
+    }
+
     @objc var scriptInPoint: Int {
         get {
             MainActor.assumeIsolated {
@@ -198,7 +243,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "scriptShowingComparison", "scriptComparisonComputing", "scriptComparisonCached", "scriptComparisonModel",
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
-        "scriptCodec", "scriptSourceCodec", "scriptActiveCodec", "scriptInPoint", "scriptOutPoint", "scriptExporting",
+        "scriptCodec", "scriptSourceCodec", "scriptActiveCodec", "scriptDecimate", "scriptPipeline", "scriptPipelineShown", "scriptColorGrade", "scriptInPoint", "scriptOutPoint", "scriptExporting",
         "scriptCurrentFilm", "scriptFilms",
     ]
 }

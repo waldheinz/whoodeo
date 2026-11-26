@@ -27,6 +27,7 @@ nonisolated enum Export {
         url: URL,
         codec: Codec,
         range: Range<Int>,
+        grade: ColorGrade = .neutral,
         progress: @escaping (Int, Int) -> Void,
         stored: @escaping (Int) -> Void,
         cancelled: @escaping () -> Bool
@@ -37,7 +38,8 @@ nonisolated enum Export {
             throw CLIError("Ausgabe \(size.width)×\(size.height) ist ungerade")
         }
         if url.exists { try FileManager.default.removeItem(at: url) }
-        if codec == .prores4444 {
+        // The cache is ProRes 4444: copied as it is unless a color grade has to be rendered in.
+        if codec == .prores4444, grade.isNeutral {
             try writePassthrough(
                 film: film, predictor: predictor, store: store, url: url, range: range,
                 progress: progress, stored: stored, cancelled: cancelled
@@ -46,7 +48,7 @@ nonisolated enum Export {
         }
         try writeEncoded(
             film: film, predictor: predictor, store: store, url: url, codec: codec,
-            width: size.width, height: size.height, range: range,
+            width: size.width, height: size.height, range: range, grade: grade,
             progress: progress, stored: stored, cancelled: cancelled
         )
     }
@@ -136,6 +138,7 @@ nonisolated enum Export {
         width: Int,
         height: Int,
         range: Range<Int>,
+        grade: ColorGrade,
         progress: @escaping (Int, Int) -> Void,
         stored: @escaping (Int) -> Void,
         cancelled: @escaping () -> Bool
@@ -154,13 +157,14 @@ nonisolated enum Export {
         try writer.start()
         writer.startSession(atSourceTime: film.time(for: range.lowerBound))
         let transfer = try ColorTransfer()
+        let renderer = grade.isNeutral ? nil : GradeRenderer(grade)
         let pulse = Pulse()
         try commit(writer: writer, url: url, pulse: pulse, cancelled: cancelled) {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {
                     try await writeEncodedPictures(
                         film: film, predictor: predictor, store: store, range: range,
-                        width: width, height: height, format: format, transfer: transfer,
+                        width: width, height: height, format: format, transfer: transfer, renderer: renderer,
                         receiver: pictures, progress: progress, stored: stored,
                         pulse: pulse, cancelled: cancelled
                     )
@@ -273,6 +277,7 @@ nonisolated enum Export {
         height: Int,
         format: OSType,
         transfer: ColorTransfer,
+        renderer: GradeRenderer?,
         receiver: AVAssetWriterInput.PixelBufferReceiver,
         progress: (Int, Int) -> Void,
         stored: (Int) -> Void,
@@ -288,6 +293,11 @@ nonisolated enum Export {
             let prepared = try await materialize(index, film: film, predictor: predictor, store: store, stored: stored)
             // The cache decode and the color transfer autorelease per frame; drain them before the await.
             let buffer: CVPixelBuffer = try autoreleasepool {
+                if let renderer {
+                    let source = try prepared.rgb.map { try ColorTransfer.tagged($0, width: width, height: height) }
+                        ?? store.image(at: index)
+                    return try transfer.convert(renderer.render(source), format: format, pool: nil)
+                }
                 if let rgb = prepared.rgb {
                     return try transfer.convert(rgb, width: width, height: height, format: format, pool: nil)
                 }
@@ -595,14 +605,20 @@ nonisolated final class ColorTransfer {
 
     func convert(_ rgb: [Float], width: Int, height: Int, format: OSType, pool: CVPixelBufferPool?) throws -> CVPixelBuffer {
         guard let session else { throw CLIError("Farbwandlung ist beendet") }
-        let source = try Pixels.rgba16(rgb, width: width, height: height)
-        CVBufferRemoveAttachment(source, kCVImageBufferCGColorSpaceKey)
-        CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
-        CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        let source = try Self.tagged(rgb, width: width, height: height)
         let destination = try Self.destination(width: width, height: height, format: format, pool: pool)
         let status = VTPixelTransferSessionTransferImage(session, from: source, to: destination)
         guard status == noErr else { throw CLIError("Farbwandlung (\(status))") }
         return destination
+    }
+
+    /// 16-bit RGBA of planar floats, tagged BT.709 like the cache.
+    static func tagged(_ rgb: [Float], width: Int, height: Int) throws -> CVPixelBuffer {
+        let source = try Pixels.rgba16(rgb, width: width, height: height)
+        CVBufferRemoveAttachment(source, kCVImageBufferCGColorSpaceKey)
+        CVBufferSetAttachment(source, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
+        CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
+        return source
     }
 
     private func set(_ key: CFString, _ value: CFString) throws {

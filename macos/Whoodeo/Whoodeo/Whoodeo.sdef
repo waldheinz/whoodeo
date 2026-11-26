@@ -82,6 +82,18 @@
             <property name="active codec" code="Wacd" type="text" access="r" description="Codec des geladenen Pakets: h264, mpeg4, mpeg2 oder unknown. Leer bei einem Modell ohne Codec-Bedingung.">
                 <cocoa key="scriptActiveCodec"/>
             </property>
+            <property name="decimate" code="Wdcm" type="text" access="rw" description="Doppelte Bilder des offenen Films weglassen: off, auto, cycle6 (30 → 25 fps) oder cycle5 (30 → 24 fps). Gilt pro Film.">
+                <cocoa key="scriptDecimate"/>
+            </property>
+            <property name="pipeline" code="Wppl" type="text" access="r" description="Bildrate und Bildzahl nach der Vorverarbeitung, zum Beispiel „30 → 25 fps · 44847 Bilder“, oder der Fortschritt der Suche nach doppelten Bildern.">
+                <cocoa key="scriptPipeline"/>
+            </property>
+            <property name="pipeline shown" code="Wpsh" type="boolean" access="rw" description="Das Pipeline-Panel rechts ist offen.">
+                <cocoa key="scriptPipelineShown"/>
+            </property>
+            <property name="color grade" code="Wgrd" type="text" access="rw" description="Farbe und Licht nach dem Upscale: Helligkeit, Kontrast, Gamma und Sättigung, durch Leerzeichen getrennt, zum Beispiel „0.05 1.1 1 1“. „neutral“ setzt zurück, „auto“ schätzt Werte aus dem Film. Gilt pro Film.">
+                <cocoa key="scriptColorGrade"/>
+            </property>
             <property name="in point" code="Winp" type="integer" access="rw" description="Erstes Bild des Exports, beginnend bei 1.">
                 <cocoa key="scriptInPoint"/>
             </property>

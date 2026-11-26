@@ -99,6 +99,7 @@ final class PictureStage: NSView {
     private var applying = false
     private var lastReportedFit = false
     private var lastReported: CGFloat = -1
+    private var fitReport: DispatchWorkItem?
     private var lastPixelWidth = 0
     private var lastPixelHeight = 0
 
@@ -137,7 +138,11 @@ final class PictureStage: NSView {
         layoutPicture(recenter: false)
     }
 
+    private var inLayout = false
+
     override func layout() {
+        inLayout = true
+        defer { inLayout = false }
         super.layout()
         liftSidebar()
         layoutPicture(recenter: false)
@@ -423,11 +428,16 @@ final class PictureStage: NSView {
         if lastReportedFit, abs(factor - lastReported) < 0.001 { return }
         lastReportedFit = true
         lastReported = factor
-        let callback = onZoom
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.zoomToFit else { return }
-            callback?(true, factor)
+        // The fit factor only feeds the zoom slider and label. Reporting it sets published
+        // session state, which renders the whole window again; doing that on every step of a
+        // panel or window animation made the animation stutter. So only the settled value goes out.
+        fitReport?.cancel()
+        let report = DispatchWorkItem { [weak self] in
+            guard let self, self.zoomToFit, self.lastReportedFit else { return }
+            self.onZoom?(true, self.lastReported)
         }
+        fitReport = report
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: report)
     }
 
     private func delta(of event: NSEvent) -> CGPoint {
@@ -457,6 +467,45 @@ final class PictureStage: NSView {
             for child in controller.children { walk(child) }
         }
         walk(root)
+        watchSplits()
+    }
+
+    /// The stage spans the whole window, under the sidebar and the inspector. Opening or closing
+    /// a panel only moves the safe area, which does not lay the stage out again by itself, so
+    /// "Passend" kept the old size. Every resize of an enclosing split view, the animation steps
+    /// included, lays it out again.
+    private var watchedSplits: [ObjectIdentifier] = []
+    private var splitObservers: [NSObjectProtocol] = []
+
+    private func watchSplits() {
+        var splits: [NSSplitView] = []
+        var view = superview
+        while let current = view {
+            if let split = current as? NSSplitView { splits.append(split) }
+            view = current.superview
+        }
+        let ids = splits.map(ObjectIdentifier.init)
+        guard ids != watchedSplits else { return }
+        splitObservers.forEach(NotificationCenter.default.removeObserver)
+        watchedSplits = ids
+        splitObservers = splits.map { split in
+            NotificationCenter.default.addObserver(
+                forName: NSSplitView.didResizeSubviewsNotification,
+                object: split,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.inLayout else { return }
+                    self.needsLayout = true
+                    // The safe area follows the split a moment later; catch the final value too.
+                    DispatchQueue.main.async { self.needsLayout = true }
+                }
+            }
+        }
+    }
+
+    deinit {
+        splitObservers.forEach(NotificationCenter.default.removeObserver)
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
