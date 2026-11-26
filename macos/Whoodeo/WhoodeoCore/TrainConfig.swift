@@ -136,6 +136,9 @@ nonisolated struct TrainConfig: Equatable, Sendable {
                 throw CLIError("crop muss 0 (Vollbild) oder durch 32 teilbar sein, nicht \(crop)")
             }
         }
+        if copy.cropSize == nil && copy.batch > 1 {
+            throw CLIError("crop = 0 (Vollbild) funktioniert nur mit batch = 1, weil die Filme unterschiedliche Auflösungen haben; für eine größere effektive Batchgröße grad_accum erhöhen")
+        }
         switch copy.dtype.lowercased() {
         case "fp32", "float32": copy.dtype = "fp32"
         case "bf16", "bfloat16": copy.dtype = "bf16"

@@ -908,6 +908,7 @@ final class TrainingBrowser: ObservableObject {
                 guard let db = WhoodeoDB.shared else {
                     throw WhoodeoDBError("Datenbank nicht geöffnet")
                 }
+                _ = try db.reapDeadRuns()
                 let tree = try db.runTree()
                 var headlines: [Int: (step: Int, loss: Double)] = [:]
                 for id in tree.flatMap(\.allRunIDs) {

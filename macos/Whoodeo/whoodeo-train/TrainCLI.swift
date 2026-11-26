@@ -119,6 +119,7 @@ enum TrainCLI {
         let name = flags.string("name") ?? TrainConfig.automaticName()
         let parent = flags.string("from")
         let db = try WhoodeoDB.openDefault()
+        try db.reapDeadRuns()
         var config: TrainConfig
         if let parent {
             guard let id = Int(parent) else { throw CLIError("--from braucht eine Checkpoint-ID, nicht „\(parent)“") }
@@ -155,6 +156,7 @@ enum TrainCLI {
         }
         var flags = FlagParser(Array(args.dropFirst()))
         let db = try WhoodeoDB.openDefault()
+        try db.reapDeadRuns()
         guard let run = try db.run(idOrName: name) else {
             throw CLIError("Lauf nicht gefunden: \(name)")
         }
@@ -282,6 +284,7 @@ enum TrainCLI {
             throw CLIError("run delete braucht --yes (löscht Checkpoints und Dateien)")
         }
         let db = try WhoodeoDB.openDefault()
+        try db.reapDeadRuns()
         guard let run = try db.run(idOrName: args[1]) else {
             throw CLIError("Lauf nicht gefunden: \(args[1])")
         }
@@ -291,6 +294,7 @@ enum TrainCLI {
 
     static func printTree() throws {
         let db = try WhoodeoDB.openDefault()
+        try db.reapDeadRuns()
         let counts = try db.counts()
         let tree = try db.runTree()
         fputs("Datenbank \(WhoodeoPaths.databaseURL.path)\n", stdout)

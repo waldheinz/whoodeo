@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import GRDB
 import os
@@ -148,6 +149,57 @@ nonisolated final class WhoodeoDB: Sendable {
     private func flag(_ key: String) throws -> Bool {
         guard let value = try setting(key) else { return false }
         return !value.isEmpty && value != "0"
+    }
+
+    static func runPidKey(_ runID: Int) -> String { "run_pid.\(runID)" }
+
+    func setRunPid(_ pid: pid_t, runID: Int) throws {
+        try setSetting(String(Int(pid)), forKey: Self.runPidKey(runID))
+    }
+
+    func runPid(runID: Int) throws -> pid_t? {
+        guard let text = try setting(Self.runPidKey(runID)), let pid = pid_t(text), pid > 0 else {
+            return nil
+        }
+        return pid
+    }
+
+    func clearRunPid(runID: Int) throws {
+        try deleteSetting(Self.runPidKey(runID))
+    }
+
+    /// `true` if a process with this PID exists. `EPERM` means it lives but we may not signal it.
+    static func processExists(_ pid: pid_t) -> Bool {
+        if pid <= 0 { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno != ESRCH
+    }
+
+    /// Marks `running` runs whose stored trainer PID is gone as `failed`.
+    /// A run without a stored PID is left alone (legacy binaries, including a still-running older trainer).
+    /// Writes only when at least one dead run is found.
+    @discardableResult
+    func reapDeadRuns() throws -> [RunRecord] {
+        let running = try runningRuns()
+        var dead: [RunRecord] = []
+        for run in running {
+            guard let pid = try runPid(runID: run.id) else { continue }
+            if !Self.processExists(pid) {
+                dead.append(run)
+            }
+        }
+        guard !dead.isEmpty else { return [] }
+        try pool.write { db in
+            let finishedAt = Self.timestamp()
+            for run in dead {
+                try db.execute(
+                    sql: "UPDATE runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'",
+                    arguments: ["failed", finishedAt, run.id]
+                )
+                try db.execute(sql: "DELETE FROM settings WHERE key = ?", arguments: [Self.runPidKey(run.id)])
+            }
+        }
+        return dead
     }
 
     // MARK: Reads
@@ -374,8 +426,11 @@ nonisolated final class WhoodeoDB: Sendable {
 
     func updateRunStatus(_ id: Int, status: String, finished: Bool) throws {
         let finishedAt = finished ? Self.timestamp() : nil
-        try pool.write {
-            try $0.execute(sql: "UPDATE runs SET status = ?, finished_at = ? WHERE id = ?", arguments: [status, finishedAt, id])
+        try pool.write { db in
+            try db.execute(sql: "UPDATE runs SET status = ?, finished_at = ? WHERE id = ?", arguments: [status, finishedAt, id])
+            if status != "running" {
+                try db.execute(sql: "DELETE FROM settings WHERE key = ?", arguments: [Self.runPidKey(id)])
+            }
         }
     }
 
@@ -507,6 +562,7 @@ nonisolated final class WhoodeoDB: Sendable {
 
     /// Deletes a stopped run without child runs, its checkpoints, and (when `removeFiles`) their files and `train.log`.
     func deleteRun(id: Int, removeFiles: Bool) throws {
+        try reapDeadRuns()
         guard let run = try run(id: id) else {
             throw WhoodeoDBError("Lauf \(id) nicht gefunden")
         }
@@ -535,7 +591,12 @@ nonisolated final class WhoodeoDB: Sendable {
                 }
             }
         }
-        try pool.write { try $0.execute(sql: "DELETE FROM runs WHERE id = ?", arguments: [id]) }
+        try pool.write { db in
+            try db.execute(sql: "DELETE FROM runs WHERE id = ?", arguments: [id])
+            for key in [Self.runPidKey(id), Self.stopRequestKey(id), Self.checkpointRequestKey(id)] {
+                try db.execute(sql: "DELETE FROM settings WHERE key = ?", arguments: [key])
+            }
+        }
     }
 
     static func timestamp(_ date: Date = Date()) -> String {

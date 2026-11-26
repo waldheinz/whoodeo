@@ -84,6 +84,7 @@ enum TrainLoop {
             fputs("from scratch \(config.name)  \(config.channels) Kanäle  crop \(config.cropSize.map(String.init) ?? "voll")\n", stderr)
         }
 
+        try db.setRunPid(getpid(), runID: runID)
         model.trainSpynet = config.trainSpynet
         try db.clearStopRequest(runID: runID)
         stepDecodes = 0
