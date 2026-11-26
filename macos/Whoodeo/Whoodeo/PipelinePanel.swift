@@ -75,10 +75,18 @@ struct PipelinePanel: View {
     private var color: some View {
         VStack(alignment: .leading, spacing: 10) {
             header("Farbe & Licht")
-            GradeSlider(title: "Helligkeit", value: $session.grade.brightness, range: ColorGrade.brightnessRange, neutral: 0, signed: true)
-            GradeSlider(title: "Kontrast", value: $session.grade.contrast, range: ColorGrade.contrastRange, neutral: 1)
-            GradeSlider(title: "Gamma", value: $session.grade.gamma, range: ColorGrade.gammaRange, neutral: 1, logarithmic: true)
-            GradeSlider(title: "Sättigung", value: $session.grade.saturation, range: ColorGrade.saturationRange, neutral: 1)
+            ToneCurveView(grade: $session.grade)
+                .frame(maxWidth: .infinity)
+            GradeSlider(title: "Schatten", value: $session.grade.shadows, range: ColorGrade.shadowRange,
+                        help: "Hellt dunkle Bereiche auf (+) oder vertieft sie (−).")
+            GradeSlider(title: "Lichter", value: $session.grade.highlightCorrection, range: ColorGrade.highlightRange,
+                        help: "Holt Zeichnung in hellen Bereichen zurück. 0 lässt sie, wie sie sind.")
+            GradeSlider(title: "Dynamik", value: $session.grade.vibrance, range: ColorGrade.vibranceRange,
+                        help: "Natürliche Sättigung: hebt blasse Farben an und schont Hauttöne.")
+            GradeSlider(title: "Wärme", value: $session.grade.warmth, range: ColorGrade.warmthRange, digits: 3,
+                        help: "Weißabgleich über Hauttöne: + wärmer (orange), − kühler (blau).")
+            GradeSlider(title: "Tönung", value: $session.grade.tint, range: ColorGrade.tintRange, digits: 3,
+                        help: "Weißabgleich über Hauttöne: + Richtung Magenta, − Richtung Grün.")
             HStack {
                 Button {
                     session.autoGrade()
@@ -90,7 +98,7 @@ struct PipelinePanel: View {
                     }
                 }
                 .disabled(session.facts == nil || session.estimatingGrade)
-                .help("Schätzt ruhige Startwerte aus 16 Bildern des Films. Danach lässt sich alles weiter verstellen.")
+                .help("Apples automatische Bildverbesserung (wie in Fotos) für das gezeigte Bild, mit Gesichtserkennung. Die Werte landen exakt in Kurve und Reglern und lassen sich weiter verstellen.")
                 Spacer()
                 Button("Zurücksetzen") {
                     session.resetGrade()
@@ -139,15 +147,13 @@ struct PipelinePanel: View {
     }
 }
 
-/// One grade control: title, value, and a slider. A double-click on the value sets it back.
+/// One grade control: title, value, and a slider. A double-click on the value sets it back to 0.
 private struct GradeSlider: View {
     var title: String
     @Binding var value: Double
     var range: ClosedRange<Double>
-    var neutral: Double
-    var signed = false
-    /// The track runs in powers of two, so 1 sits in the middle of 0.5…2.
-    var logarithmic = false
+    var digits = 2
+    var help: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -156,25 +162,25 @@ private struct GradeSlider: View {
                 Spacer()
                 Text(label)
                     .monospacedDigit()
-                    .foregroundStyle(abs(value - neutral) < 0.001 ? .secondary : .primary)
-                    .onTapGesture(count: 2) { value = neutral }
+                    .foregroundStyle(isNeutral ? .secondary : .primary)
+                    .onTapGesture(count: 2) { value = 0 }
                     .help("Doppelklick setzt den Wert zurück.")
             }
-            Group {
-                if logarithmic {
-                    Slider(value: Binding(get: { log2(value) }, set: { value = pow(2, $0) }),
-                           in: log2(range.lowerBound)...log2(range.upperBound))
-                } else {
-                    Slider(value: $value, in: range)
-                }
-            }
+            Slider(value: Binding(
+                get: { min(max(value, range.lowerBound), range.upperBound) },
+                set: { value = $0 }
+            ), in: range)
             .controlSize(.small)
             .labelsHidden()
         }
+        .help(help)
     }
 
+    private var isNeutral: Bool { abs(value) < 0.0005 }
+
     private var label: String {
-        let text = value.formatted(.number.precision(.fractionLength(2)))
-        return signed && value > 0.0005 ? "+" + text : text
+        let text = value.formatted(.number.precision(.fractionLength(digits)))
+        if isNeutral { return 0.0.formatted(.number.precision(.fractionLength(digits))) }
+        return value > 0 ? "+" + text : text
     }
 }

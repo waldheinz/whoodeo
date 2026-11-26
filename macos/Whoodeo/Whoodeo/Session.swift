@@ -96,7 +96,7 @@ final class Session: ObservableObject {
             saveGradeSoon()
         }
     }
-    /// The auto button is sampling the film.
+    /// The auto button is analyzing the frame on screen.
     @Published private(set) var estimatingGrade = false
     /// Why the background fill waits for the cache: limit reached or folder not reachable. Nil otherwise.
     @Published private(set) var cacheNote: String?
@@ -1834,26 +1834,38 @@ final class Session: ObservableObject {
         }
     }
 
-    /// Fill the sliders with values sampled from the film. They stay editable.
+    /// Apple's auto-enhance on the frame on screen: the upscale from the cache, or the original
+    /// frame when the upscale is not stored yet. The values land in the panel and stay editable.
     func autoGrade() {
-        guard let facts, !estimatingGrade else { return }
+        guard let facts, frameCount > 0, !estimatingGrade else { return }
         estimatingGrade = true
         let url = facts.url
         let map = frameMap
         let id = shownFilmID
+        let frame = min(max(index, 0), frameCount - 1)
+        let cached = store?.contains(frame) == true ? store : nil
         Task.detached(priority: .userInitiated) { [weak self] in
-            let result = Result { try ColorGrade.estimate(url: url, map: map) }
-            await self?.finishAutoGrade(result, id: id)
+            let result = Result { () throws -> ColorGrade in
+                let buffer: CVPixelBuffer
+                if let cached {
+                    buffer = try cached.image(at: frame)
+                } else {
+                    let decoded = try Film.open(url, map: map).decode(at: frame)
+                    buffer = try ColorTransfer.tagged(decoded.rgb, width: decoded.width, height: decoded.height)
+                }
+                return ColorGrade.auto(for: ColorGrade.image(buffer))
+            }
+            await self?.finishAutoGrade(result, id: id, frame: frame, cached: cached != nil)
         }
     }
 
-    private func finishAutoGrade(_ result: Result<ColorGrade, Error>, id: String?) {
+    private func finishAutoGrade(_ result: Result<ColorGrade, Error>, id: String?, frame: Int, cached: Bool) {
         estimatingGrade = false
         guard shownFilmID == id else { return }
         switch result {
         case .success(let proposed):
             grade = proposed
-            Log.model.info("Auto-Farbe h \(proposed.brightness) k \(proposed.contrast) g \(proposed.gamma) s \(proposed.saturation)")
+            Log.model.info("Auto-Farbe Bild \(frame + 1, privacy: .public) (\(cached ? "Cache" : "Original", privacy: .public)): \(Self.describe(proposed), privacy: .public)")
         case .failure(let error):
             failure = error.localizedDescription
             status = failure!
@@ -1864,16 +1876,34 @@ final class Session: ObservableObject {
         grade = .neutral
     }
 
-    /// Brightness, contrast, gamma and saturation for scripts, "0 1 1 1" when neutral.
+    /// The grade for scripts, for example
+    /// "curve 0,0 0.25,0.25 0.5,0.5 0.75,0.75 1,1 shadows 0 highlights 0 vibrance 0 warmth 0 tint 0".
     var scriptGrade: String {
-        [grade.brightness, grade.contrast, grade.gamma, grade.saturation]
-            .map { String(format: "%g", $0) }
-            .joined(separator: " ")
+        Self.describe(grade)
     }
 
-    /// Four numbers as in `scriptGrade`, `neutral`, or `auto`. Returns a message when the text does not parse.
+    nonisolated static func describe(_ grade: ColorGrade) -> String {
+        func number(_ value: Double) -> String {
+            let text = String(format: "%.9g", value)
+            return text == "-0" ? "0" : text
+        }
+        var parts = ["curve " + grade.curve.map { "\(number($0.x)),\(number($0.y))" }.joined(separator: " ")]
+        parts.append("shadows \(number(grade.shadows))")
+        parts.append("highlights \(number(grade.highlightCorrection))")
+        parts.append("vibrance \(number(grade.vibrance))")
+        parts.append("warmth \(number(grade.warmth))")
+        parts.append("tint \(number(grade.tint))")
+        if abs(grade.faceStrength - 1) > 1e-9 { parts.append("strength \(number(grade.faceStrength))") }
+        if abs(grade.faceWarmth - 0.5) > 1e-9 { parts.append("facewarmth \(number(grade.faceWarmth))") }
+        if abs(grade.radius) > 1e-9 { parts.append("radius \(number(grade.radius))") }
+        if !grade.extrapolate { parts.append("extrapolate 0") }
+        return parts.joined(separator: " ")
+    }
+
+    /// Text as in `scriptGrade`, `neutral`, or `auto`. Names left out stay neutral.
+    /// Returns a message when the text does not parse.
     func setGrade(text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespaces).lowercased()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch trimmed {
         case "neutral", "":
             resetGrade()
@@ -1882,21 +1912,53 @@ final class Session: ObservableObject {
             autoGrade()
             return nil
         default:
-            let values = trimmed.split(separator: " ").compactMap { Double($0) }
-            guard values.count == 4 else {
-                return "Farbe ist „Helligkeit Kontrast Gamma Sättigung“, neutral oder auto."
+            guard let parsed = Self.parseGrade(trimmed) else {
+                return "Farbe ist „curve x,y ×5 shadows … highlights … vibrance … warmth … tint …“, neutral oder auto."
             }
-            func clamp(_ value: Double, _ range: ClosedRange<Double>) -> Double {
-                min(max(value, range.lowerBound), range.upperBound)
-            }
-            grade = ColorGrade(
-                brightness: clamp(values[0], ColorGrade.brightnessRange),
-                contrast: clamp(values[1], ColorGrade.contrastRange),
-                gamma: clamp(values[2], ColorGrade.gammaRange),
-                saturation: clamp(values[3], ColorGrade.saturationRange)
-            )
+            grade = parsed
             return nil
         }
+    }
+
+    nonisolated static func parseGrade(_ text: String) -> ColorGrade? {
+        func clamp(_ value: Double, _ range: ClosedRange<Double>) -> Double {
+            min(max(value, range.lowerBound), range.upperBound)
+        }
+        let words = text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).map(String.init)
+        var grade = ColorGrade.neutral
+        var at = 0
+        func value() -> Double? {
+            guard at < words.count, let number = Double(words[at]), number.isFinite else { return nil }
+            at += 1
+            return number
+        }
+        while at < words.count {
+            let name = words[at]
+            at += 1
+            switch name {
+            case "curve":
+                var points: [CurvePoint] = []
+                while points.count < 5, at < words.count {
+                    let pair = words[at].split(separator: ",").compactMap { Double($0) }
+                    guard pair.count == 2, pair.allSatisfy(\.isFinite) else { return nil }
+                    points.append(CurvePoint(x: clamp(pair[0], 0...1), y: clamp(pair[1], 0...1)))
+                    at += 1
+                }
+                guard points.count == 5, zip(points, points.dropFirst()).allSatisfy({ $0.x < $1.x }) else { return nil }
+                grade.curve = points
+            case "shadows": guard let v = value() else { return nil }; grade.shadows = clamp(v, ColorGrade.shadowRange)
+            case "highlights": guard let v = value() else { return nil }; grade.highlightCorrection = clamp(v, ColorGrade.highlightRange)
+            case "vibrance": guard let v = value() else { return nil }; grade.vibrance = clamp(v, ColorGrade.vibranceRange)
+            case "warmth": guard let v = value() else { return nil }; grade.faceI = clamp(ColorGrade.neutralI - v, -0.5...0.5)
+            case "tint": guard let v = value() else { return nil }; grade.faceQ = clamp(ColorGrade.neutralQ - v, -0.5...0.5)
+            case "strength": guard let v = value() else { return nil }; grade.faceStrength = clamp(v, 0...2)
+            case "facewarmth": guard let v = value() else { return nil }; grade.faceWarmth = clamp(v, 0...1)
+            case "radius": guard let v = value() else { return nil }; grade.radius = clamp(v, 0...10)
+            case "extrapolate": guard let v = value() else { return nil }; grade.extrapolate = v != 0
+            default: return nil
+            }
+        }
+        return grade
     }
 
     /// Slider drags change the grade many times a second; the film list is written once they rest.

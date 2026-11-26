@@ -91,7 +91,7 @@
             <property name="pipeline shown" code="Wpsh" type="boolean" access="rw" description="Das Pipeline-Panel rechts ist offen.">
                 <cocoa key="scriptPipelineShown"/>
             </property>
-            <property name="color grade" code="Wgrd" type="text" access="rw" description="Farbe und Licht nach dem Upscale: Helligkeit, Kontrast, Gamma und Sättigung, durch Leerzeichen getrennt, zum Beispiel „0.05 1.1 1 1“. „neutral“ setzt zurück, „auto“ schätzt Werte aus dem Film. Gilt pro Film.">
+            <property name="color grade" code="Wgrd" type="text" access="rw" description="Farbe und Licht nach dem Upscale, wie Apples Auto-Verbesserung: „curve x,y x,y x,y x,y x,y shadows … highlights … vibrance … warmth … tint …“, zum Beispiel „curve 0.023,0 0.28,0.25 0.52,0.51 0.74,0.75 1,1 shadows 0.11 highlights 0 vibrance 0.12 warmth -0.022 tint 0“. Weggelassene Namen bleiben neutral; „strength“, „facewarmth“ und „radius“ stehen nur da, wenn sie vom Standard abweichen. „neutral“ setzt zurück, „auto“ rechnet Apples Werte für das gezeigte Bild. Gilt pro Film.">
                 <cocoa key="scriptColorGrade"/>
             </property>
             <property name="in point" code="Winp" type="integer" access="rw" description="Erstes Bild des Exports, beginnend bei 1.">
