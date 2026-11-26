@@ -64,6 +64,10 @@ struct WhoodeoApp: App {
                 PlaygroundMenuButton()
             }
         }
+        Settings {
+            SettingsView()
+                .environmentObject(session)
+        }
         Window("VAE-Playground", id: PlaygroundView.windowID) {
             PlaygroundView()
                 .environmentObject(session)
@@ -81,12 +85,16 @@ nonisolated enum CLI {
     Whoodeo --vae-roundtrip picture-or-video
     Whoodeo --upscale model.mlxmodel video index [out.f32] [--source-codec auto|h264|mpeg4|mpeg2|unknown]
     Whoodeo --decimate video [auto|cycle6|cycle5]
+    Whoodeo --move-cache folder|default
 
     --upscale scales one frame through the frame cache, as the window does: a latent_up with
     FiLM uses the condition of the given codec (auto: the film's codec; MPEG-2 automatic
     falls back to unknown). The frame comes from that cache when it is there. --export takes
     --source-codec too. --decimate scans a film for repeated frames (or reuses the app's scan),
     prints the cycle it finds and the frames left, and keeps the scan for the app.
+    --move-cache moves the frame cache as Einstellungen › Speicherort › Verschieben does
+    (copy, check every file, then delete the old files) and makes the app use the folder;
+    quit the app first. A folder with other files gets a "Whoodeo Cache" folder inside.
 
     The f32 file is little-endian int32 n,c,h,w followed by float32 NCHW.
     """
@@ -100,8 +108,38 @@ nonisolated enum CLI {
         case "--vae-roundtrip": try vaeRoundtrip(args)
         case "--upscale": try upscale(args)
         case "--decimate": try decimate(args)
+        case "--move-cache": try moveCache(args)
         default: throw CLIError(usage)
         }
+    }
+
+    private static func moveCache(_ args: [String]) throws {
+        guard args.count == 1 else { throw CLIError(usage) }
+        let target: URL? = args[0] == "default"
+            ? nil
+            : CacheSettings.cacheFolder(for: URL(fileURLWithPath: (args[0] as NSString).expandingTildeInPath, isDirectory: true))
+        let source = CacheSettings.root
+        let destination = target ?? CacheSettings.defaultRoot
+        guard source.standardizedFileURL.path != destination.standardizedFileURL.path else {
+            fputs("Der Cache liegt schon in \(destination.path)\n", stdout)
+            return
+        }
+        if CacheSettings.isAvailable {
+            var last = -1
+            try CacheMover.move(from: source, to: destination) { fraction in
+                let percent = Int(fraction * 100)
+                if percent / 10 != last / 10 {
+                    last = percent
+                    fputs("\(percent) %\n", stdout)
+                }
+            }
+        }
+        if target != nil {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            CacheSettings.writeMarker(in: destination)
+        }
+        CacheSettings.setRoot(target)
+        fputs("Cache-Ordner: \(CacheSettings.root.path)\n", stdout)
     }
 
     private static func check(_ args: [String]) throws {

@@ -272,6 +272,7 @@ nonisolated enum Decimate {
     }
 
     static func store(_ diffs: [Float], filmID: String) throws {
+        _ = try CacheSettings.availableRoot()
         let url = file(filmID: filmID)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var data = Data(capacity: 8 + diffs.count * 4)

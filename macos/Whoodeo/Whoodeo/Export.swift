@@ -17,6 +17,15 @@ nonisolated enum Codec: String, CaseIterable, Identifiable {
         case .prores4444: "ProRes 4444"
         }
     }
+
+    /// The cache flavor whose frames this export can copy without encoding again.
+    var cacheCodec: CacheCodec? {
+        switch self {
+        case .hevc: nil
+        case .prores: .proRes422HQ
+        case .prores4444: .proRes4444
+        }
+    }
 }
 
 nonisolated enum Export {
@@ -38,8 +47,9 @@ nonisolated enum Export {
             throw CLIError("Ausgabe \(size.width)×\(size.height) ist ungerade")
         }
         if url.exists { try FileManager.default.removeItem(at: url) }
-        // The cache is ProRes 4444: copied as it is unless a color grade has to be rendered in.
-        if codec == .prores4444, grade.isNeutral {
+        // Cached frames are copied as they are when the archive's ProRes flavor is the export's
+        // and no color grade has to be rendered in. Any other pair is decoded and encoded again.
+        if codec.cacheCodec == store.codec, grade.isNeutral {
             try writePassthrough(
                 film: film, predictor: predictor, store: store, url: url, range: range,
                 progress: progress, stored: stored, cancelled: cancelled

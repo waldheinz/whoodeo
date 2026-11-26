@@ -94,7 +94,7 @@ nonisolated struct Coverage: Equatable {
     }
 }
 
-/// Append-only ProRes 4444 frames. A slot table points at each frame, so a seek can fill one hole.
+/// Append-only ProRes frames, in the flavor recorded in `meta.json` (4444 for archives from before the setting). A slot table points at each frame, so a seek can fill one hole.
 /// The table in RAM follows every stored frame. `slots` on disk is updated from a patch of the
 /// runs that changed, about once a minute and again when the archive closes. `frames` is synchronized
 /// before that patch is renamed into place, so a published slot never points at bytes still in the cache.
@@ -129,14 +129,14 @@ nonisolated final class FrameStore: @unchecked Sendable {
     private var decoder: VTDecompressionSession?
     private var transfer: ColorTransfer?
     private var stamp: CMTimeValue = 0
+    /// The ProRes flavor of this archive. Fixed once the archive exists.
+    private(set) var codec: CacheCodec
 
     /// Cache gate, taken after the film-list lock. Held only around directory claims, not while a large folder is deleted.
     private static let gate = NSLock()
 
-    static var cacheRoot: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Whoodeo/Cache", isDirectory: true)
-    }
+    /// The configured cache folder (Einstellungen), the default under Application Support otherwise.
+    static var cacheRoot: URL { CacheSettings.root }
 
     /// Digest of the file as it is now. Call this once, when the film is added, and store the result.
     static func filmDigest(of url: URL) -> String {
@@ -161,7 +161,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
 
     static func open(filmID: String, model: URL, count: Int, condition: String? = nil) throws -> FrameStore {
         guard count > 0 else { throw CLIError("der Film hat keine Bilder") }
-        let root = cacheRoot
+        let root = try CacheSettings.availableRoot()
             .appendingPathComponent(filmID, isDirectory: true)
             .appendingPathComponent(folderName(model: model, condition: condition), isDirectory: true)
         gate.lock()
@@ -172,6 +172,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
 
     /// Deletes one film directory and every model archive in it.
     static func removeCache(id: String) throws {
+        guard CacheSettings.isAvailable else { return }
         let directory = cacheRoot.appendingPathComponent(id, isDirectory: true)
         gate.lock()
         defer { gate.unlock() }
@@ -184,8 +185,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
     /// Folders whose name is not a film id are renamed aside and then deleted.
     /// The rename is the claim. The delete happens without the gate, so opening another film does not wait on it.
     static func pruneCaches(isKept: @Sendable (String) -> Bool) {
+        guard CacheSettings.isAvailable else { return }
         let root = cacheRoot
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         guard let children = try? FileManager.default.contentsOfDirectory(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
@@ -195,6 +196,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
             guard values?.isDirectory != false else { continue }
             let name = url.lastPathComponent
+            // A chosen folder may hold other files. Only folders named like a film digest are caches.
+            guard CacheSettings.isFilmFolderName(name) else { continue }
             if name.hasSuffix(".deleting") {
                 try? FileManager.default.removeItem(at: url)
                 continue
@@ -223,6 +226,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
     /// Deletes the model archives in every film folder whose model is gone or has changed.
     /// `keep` holds the `modelKey` of every package in the library.
     static func pruneModelCaches(keep: Set<String>) {
+        guard CacheSettings.isAvailable else { return }
         let root = cacheRoot
         guard let films = try? FileManager.default.contentsOfDirectory(
             at: root,
@@ -230,7 +234,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
             options: [.skipsHiddenFiles]
         ) else { return }
         var removed = 0
-        for film in films where !film.lastPathComponent.hasSuffix(".deleting") {
+        for film in films where !film.lastPathComponent.hasSuffix(".deleting") && CacheSettings.isFilmFolderName(film.lastPathComponent) {
             guard (try? film.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
                   let archives = try? FileManager.default.contentsOfDirectory(
                       at: film,
@@ -403,15 +407,18 @@ nonisolated final class FrameStore: @unchecked Sendable {
         if let stored = try Self.meta(at: metaURL), stored.version == 1, stored.count == count {
             width = stored.width
             height = stored.height
+            // No frame yet: the archive takes the flavor chosen now.
+            codec = stored.width == 0 ? CacheSettings.codec : stored.codec.flatMap(CacheCodec.init(rawValue:)) ?? CacheCodec.legacy
         } else {
             width = 0
             height = 0
+            codec = CacheSettings.codec
             try? FileManager.default.removeItem(at: slotURL)
             try? FileManager.default.removeItem(at: dataURL)
             try? FileManager.default.removeItem(at: directory.appendingPathComponent("format.plist"))
             try? FileManager.default.removeItem(at: directory.appendingPathComponent("slots.patch"))
             try? FileManager.default.removeItem(at: directory.appendingPathComponent("slots.patch.tmp"))
-            try Self.write(Meta(version: 1, count: count, width: 0, height: 0), to: metaURL)
+            try Self.write(Meta(version: 1, count: count, width: 0, height: 0, codec: codec.rawValue), to: metaURL)
         }
         if !FileManager.default.fileExists(atPath: slotURL.path) {
             FileManager.default.createFile(atPath: slotURL.path, contents: Data(count: count * Slot.size))
@@ -446,7 +453,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
     }
 
     private func writeMeta() throws {
-        try Self.write(Meta(version: 1, count: count, width: width, height: height), to: directory.appendingPathComponent("meta.json"))
+        try Self.write(Meta(version: 1, count: count, width: width, height: height, codec: codec.rawValue), to: directory.appendingPathComponent("meta.json"))
     }
 
     /// The write handle. Callers already hold `lock`, so this stays off the playback reader.
@@ -485,6 +492,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
         try dataHandle.seekToEnd()
         let offset = try dataHandle.offset()
         try dataHandle.write(contentsOf: data)
+        CacheBudget.add(data.count)
         let slot = Slot(offset: offset, length: UInt32(data.count), flags: 1)
         slots[index] = slot
         dirty.insert(index)
@@ -727,7 +735,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
             rgb,
             width: width,
             height: height,
-            format: kCVPixelFormatType_4444AYpCbCr16,
+            format: codec.pixelFormat,
             pool: nil
         )
         stamp += 1
@@ -768,7 +776,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
     private func encoderSession(width: Int, height: Int) throws -> VTCompressionSession {
         if let encoder { return encoder }
         let attributes: [CFString: Any] = [
-            kCVPixelBufferPixelFormatTypeKey: NSNumber(value: kCVPixelFormatType_4444AYpCbCr16),
+            kCVPixelBufferPixelFormatTypeKey: NSNumber(value: codec.pixelFormat),
             kCVPixelBufferWidthKey: width,
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:] as [String: Any],
@@ -778,7 +786,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
-            codecType: kCMVideoCodecType_AppleProRes4444,
+            codecType: codec.codecType,
             encoderSpecification: nil,
             imageBufferAttributes: attributes as CFDictionary,
             compressedDataAllocator: nil,
@@ -829,7 +837,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
         var created: CMVideoFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
             allocator: kCFAllocatorDefault,
-            codecType: kCMVideoCodecType_AppleProRes4444,
+            codecType: codec.codecType,
             width: Int32(width),
             height: Int32(height),
             extensions: extensions,
@@ -883,6 +891,8 @@ nonisolated final class FrameStore: @unchecked Sendable {
         var count: Int
         var width: Int
         var height: Int
+        /// `CacheCodec` raw value. Missing in archives from before the setting, which are ProRes 4444.
+        var codec: String?
     }
 
     private static func meta(at url: URL) throws -> Meta? {

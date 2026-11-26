@@ -8,6 +8,8 @@ struct ScaleMeter: View {
     var remaining: Int = 0
     /// "Cache" while filling, "Export" while writing the movie.
     var work: String = "Cache"
+    /// Why the fill waits, for example at the cache limit. Shown in orange under the caption.
+    var note: String? = nil
     /// How many times realtime the right end of the dial stands for. Grows so the needle stays on the scale.
     @State private var span: Double = 2
 
@@ -31,7 +33,14 @@ struct ScaleMeter: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
-            if let eta {
+            if let note {
+                Label(note, systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .help("Das Hintergrundfüllen wartet. Platz schaffen oder das Limit ändern: Whoodeo › Einstellungen… (⌘,)")
+            } else if let eta {
                 Text(eta)
                     .font(.caption)
                     .foregroundStyle(.secondary)

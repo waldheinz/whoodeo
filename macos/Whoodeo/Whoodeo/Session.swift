@@ -98,6 +98,8 @@ final class Session: ObservableObject {
     }
     /// The auto button is sampling the film.
     @Published private(set) var estimatingGrade = false
+    /// Why the background fill waits for the cache: limit reached or folder not reachable. Nil otherwise.
+    @Published private(set) var cacheNote: String?
     /// Idle fill of missing frames. Playback and export still store what they compute.
     @Published var fillCache: Bool {
         didSet {
@@ -128,6 +130,9 @@ final class Session: ObservableObject {
     private var gradeSave: Task<Void, Never>?
     /// The app is quitting; nothing new goes to the engines.
     private var quitting = false
+    /// The cache folder is being moved or switched; no archive opens until it is done.
+    private var cacheSuspended = false
+    private var cacheObserver: NSObjectProtocol?
     private var store: FrameStore?
     /// The open film's originals for the screen. Nil without a film.
     private var originals: Originals?
@@ -176,6 +181,14 @@ final class Session: ObservableObject {
         let stored = UserDefaults.standard.object(forKey: Self.fillCacheKey) as? Bool
         fillCache = stored ?? true
         Session.current = self
+        cacheObserver = NotificationCenter.default.addObserver(forName: CacheSettings.changed, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.cacheSettingsChanged() }
+        }
+        CacheUsage.shared.refresh()
+        if !CacheSettings.isAvailable {
+            cacheNote = "Cache-Ordner nicht erreichbar"
+            Log.fill.error("Cache-Ordner nicht erreichbar: \(CacheSettings.root.path, privacy: .public)")
+        }
         reloadFilms()
         DispatchQueue.global(qos: .utility).async {
             FrameStore.pruneCaches { id in
@@ -251,7 +264,7 @@ final class Session: ObservableObject {
         if scaleRate != 0 { scaleRate = 0 }
     }
 
-    var backgroundFillError: String { fillError ?? "" }
+    var backgroundFillError: String { fillError ?? cacheNote ?? "" }
 
     var scriptModelName: String {
         guard let selection, let model = library.first(where: { $0.url == selection }) else { return "" }
@@ -1257,7 +1270,7 @@ final class Session: ObservableObject {
     }
 
     private func adoptStore() {
-        guard store == nil, let facts, let modelURL, let shownFilmID, facts.count > 0 else { return }
+        guard store == nil, !cacheSuspended, let facts, let modelURL, let shownFilmID, facts.count > 0 else { return }
         do {
             let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, count: facts.count, condition: conditionTag())
             store = opened
@@ -1473,8 +1486,16 @@ final class Session: ObservableObject {
     }
 
     private func scheduleFill(allowWhilePlaying: Bool = false) {
-        guard fillCache, !quitting else { return }
+        guard fillCache, !quitting, !cacheSuspended else { return }
         guard !fillHalted else { return }
+        // At the limit the walk waits. Nothing is deleted; frames looked at on purpose are still stored.
+        if CacheBudget.isFull {
+            if cacheNote != Self.limitNote {
+                cacheNote = Self.limitNote
+                Log.fill.info("fill pausiert: Cache-Limit erreicht")
+            }
+            return
+        }
         if filling != nil || playFetching || exporting || scrubbing || busy { return }
         if playing && !allowWhilePlaying { return }
         guard modelURL != nil, let next = nextFillIndex() else {
@@ -1535,6 +1556,84 @@ final class Session: ObservableObject {
                     self.continuePlaybackWork()
                 }
             }
+        }
+    }
+
+    private static let limitNote = "Cache-Limit erreicht – pausiert"
+
+    /// Location, limit, or contents changed in the settings window. A fill that waited for room goes on.
+    private func cacheSettingsChanged() {
+        let note: String? = !CacheSettings.isAvailable
+            ? "Cache-Ordner nicht erreichbar"
+            : (CacheBudget.isFull && fillCache ? Self.limitNote : nil)
+        let resumed = cacheNote == Self.limitNote && note == nil
+        if note == Self.limitNote, cacheNote != note { Log.fill.info("fill pausiert: Cache-Limit erreicht") }
+        if cacheNote != note { cacheNote = note }
+        if resumed {
+            Log.fill.info("fill geht weiter: Platz im Cache")
+            resetFillHolds()
+            if !playing { scheduleFill() }
+        }
+    }
+
+    /// Why the cache folder cannot change right now. Nil when it can.
+    var cacheBusyReason: String? {
+        if exporting { return "Während eines Exports bleibt der Cache-Ordner, wie er ist." }
+        if decimateProgress != nil { return "Bitte warten, bis der Scan nach doppelten Bildern fertig ist." }
+        return nil
+    }
+
+    /// Close every archive and wait until both engines let go of them. The film and model stay loaded.
+    func suspendCache(done: @escaping @MainActor () -> Void) {
+        cacheSuspended = true
+        store?.flush()
+        comparisonStore?.flush()
+        let engines = [engine] + (comparisonEngine.map { [$0] } ?? [])
+        releaseArchive()
+        status = "Cache wird umgestellt…"
+        let group = DispatchGroup()
+        for engine in engines {
+            group.enter()
+            engine.settle { group.leave() }
+        }
+        group.notify(queue: .main) {
+            MainActor.assumeIsolated { done() }
+        }
+    }
+
+    /// Open the archive of the frame on screen again, from the folder now configured.
+    func resumeCache() {
+        cacheSuspended = false
+        cacheSettingsChanged()
+        if shownFilmID != nil, modelURL != nil, facts != nil {
+            showCurrent()
+        } else if status == "Cache wird umgestellt…" {
+            status = ""
+        }
+    }
+
+    /// Delete one film's frame caches; the film stays in the list. A message means nothing was deleted.
+    func clearCache(filmID: String) -> String? {
+        let shown = shownFilmID == filmID
+        if shown, exporting { return "Ein Export läuft gerade." }
+        if shown {
+            store?.flush()
+            let engines = [engine] + (comparisonEngine.map { [$0] } ?? [])
+            cancelDecimateScan()
+            releaseArchive()
+            for engine in engines {
+                let gate = DispatchSemaphore(value: 0)
+                engine.settle { gate.signal() }
+                gate.wait()
+            }
+        }
+        defer { if shown { showCurrent() } }
+        do {
+            try FrameStore.removeCache(id: filmID)
+            Log.fill.info("Cache eines Films geleert")
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 

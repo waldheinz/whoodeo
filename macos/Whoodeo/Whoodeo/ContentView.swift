@@ -100,7 +100,8 @@ struct ContentView: View {
                 rate: session.scaleRate,
                 realtime: session.realtimeRate,
                 remaining: session.scaleRemaining,
-                work: session.exporting ? "Export" : "Cache"
+                work: session.exporting ? "Export" : "Cache",
+                note: session.exporting ? nil : session.cacheNote
             )
         }
         .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
