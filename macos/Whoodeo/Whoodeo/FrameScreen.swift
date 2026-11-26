@@ -147,6 +147,9 @@ final class FrameScreen {
         if host.superview !== view {
             view.addSubview(host)
         }
+        // A pinch scales the video layer past the edges of its views until the fingers lift.
+        view.clipsToBounds = false
+        host.clipsToBounds = false
         if display.superlayer == nil {
             host.wantsLayer = true
             host.layer?.backgroundColor = nil
@@ -156,6 +159,7 @@ final class FrameScreen {
                 "bounds": NSNull(),
                 "position": NSNull(),
                 "frame": NSNull(),
+                "transform": NSNull(),
                 "hidden": NSNull(),
                 "contents": NSNull(),
                 "opacity": NSNull(),
@@ -186,15 +190,36 @@ final class FrameScreen {
     }
 
     func layout(in bounds: CGRect) {
-        guard host.frame != bounds || display.frame != host.bounds else { return }
+        guard host.frame != bounds || display.bounds.size != bounds.size else { return }
         // The video layer is a plain sublayer: without this every frame change starts its own
         // implicit animation, which lags behind and fights a window or panel animation.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         host.frame = bounds
-        display.frame = host.bounds
+        // Bounds and position, not frame: they stay valid while a pinch transform is on the layer.
+        display.bounds = CGRect(origin: .zero, size: bounds.size)
+        display.position = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
         CATransaction.commit()
         updateScale()
+    }
+
+    /// During a pinch the stage moves and scales the picture as one GPU transform instead of
+    /// laying out views on every step. `target` is where the picture goes, in `stage` coordinates.
+    /// Nil drops the transform; the caller sets the real frame in the same transaction.
+    func setLiveFrame(_ target: CGRect?, from stage: NSView) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let box = host.bounds
+        if let target, box.width > 0, box.height > 0 {
+            let shown = host.convert(target, from: stage)
+            display.setAffineTransform(
+                CGAffineTransform(translationX: shown.midX - box.midX, y: shown.midY - box.midY)
+                    .scaledBy(x: shown.width / box.width, y: shown.height / box.height)
+            )
+        } else {
+            display.setAffineTransform(.identity)
+        }
+        CATransaction.commit()
     }
 
     func updateScale() {

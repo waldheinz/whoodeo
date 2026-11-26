@@ -52,8 +52,9 @@ struct ScaleMeter: View {
         .padding(.horizontal, 8)
         .padding(.top, 2)
         .padding(.bottom, 12)
-        .animation(.smooth(duration: 0.45), value: fraction)
-        .animation(.smooth(duration: 0.45), value: span)
+        // Short, so one move is over long before the next value arrives (about every 0.7 s).
+        .animation(.smooth(duration: 0.2), value: fraction)
+        .animation(.smooth(duration: 0.2), value: span)
         .onChange(of: rate, initial: true) { _, _ in refit() }
         .onChange(of: realtime) { _, _ in refit() }
         .accessibilityElement(children: .ignore)

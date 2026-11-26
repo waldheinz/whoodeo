@@ -78,7 +78,14 @@ final class Session: ObservableObject {
     @Published private(set) var films: [OpenFilm] = []
     @Published var filmSelection: String?
     @Published var loadingModel = false
+    /// What the cache bar shows. It follows `known` at most twice a second while fill stores frame
+    /// after frame; every publish renders the window again and made zooming and panning stutter.
     @Published private(set) var coverage = Coverage(count: 0)
+    /// Which frames the archive holds, always current. Scheduling reads this one.
+    private var known = Coverage(count: 0) {
+        didSet { scheduleCoverage() }
+    }
+    private var coverageFlush: Task<Void, Never>?
     /// Newly scaled frames per second. Zero when nothing is computing.
     /// Slow film stays visible: the pace follows the gap between frames, not a two-second window.
     @Published private(set) var scaleRate: Double = 0
@@ -216,7 +223,24 @@ final class Session: ObservableObject {
         return filling + 1
     }
 
-    var cachedCount: Int { coverage.filled }
+    var cachedCount: Int { known.filled }
+
+    private func scheduleCoverage() {
+        guard coverageFlush == nil else { return }
+        coverageFlush = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard let self, !Task.isCancelled else { return }
+            self.coverageFlush = nil
+            if self.coverage != self.known { self.coverage = self.known }
+        }
+    }
+
+    /// A new film, model or archive, or fill is done: show the cache as it is right now.
+    private func flushCoverage() {
+        coverageFlush?.cancel()
+        coverageFlush = nil
+        if coverage != known { coverage = known }
+    }
 
     /// The open film's frame rate. Zero when no film is open. The gauge calls this realtime.
     var realtimeRate: Double { facts?.fps ?? 0 }
@@ -225,10 +249,10 @@ final class Session: ObservableObject {
     var scaleRemaining: Int {
         guard scaleRate > 0 else { return 0 }
         if exporting {
-            return coverage.missing(from: inPoint, until: outPoint + 1)
+            return known.missing(from: inPoint, until: outPoint + 1)
         }
         guard fillCache, !fillHalted else { return 0 }
-        return max(0, frameCount - coverage.filled - fillSkipped.count)
+        return max(0, frameCount - known.filled - fillSkipped.count)
     }
 
     /// Count frames the model just produced. Cache hits are not scaling.
@@ -237,11 +261,14 @@ final class Session: ObservableObject {
         let now = ContinuousClock.now
         if scaleOrigin == nil { scaleOrigin = now }
         scalePace.add(count, at: Self.seconds(now - scaleOrigin!))
-        if scaleRate != scalePace.shown { scaleRate = scalePace.shown }
+        // The gauge moves on the watch's beat, not on every frame. Only the first rate goes out at once.
+        if scaleRate == 0, scalePace.shown != 0 { scaleRate = scalePace.shown }
         guard scaleWatch == nil else { return }
+        // A beat of 0.7 s with a 0.2 s needle animation leaves the main thread idle in between;
+        // the old 0.4 s beat with 0.45 s animations kept SwiftUI animating without pause.
         scaleWatch = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(400))
+                try? await Task.sleep(for: .milliseconds(700))
                 guard let self else { return }
                 self.publishScale(.now)
                 if self.scalePace.isIdle { break }
@@ -735,7 +762,8 @@ final class Session: ObservableObject {
         comparisonComputing = nil
         hasPicture = false
         milliseconds = nil
-        coverage = Coverage(count: frameCount)
+        known = Coverage(count: frameCount)
+        flushCoverage()
         resetScale()
         if let codec = activeCodec {
             comparisonEngine?.setCondition(codec)
@@ -1265,7 +1293,8 @@ final class Session: ObservableObject {
         dropComparison()
         hasPicture = false
         milliseconds = nil
-        coverage = Coverage(count: frameCount)
+        known = Coverage(count: frameCount)
+        flushCoverage()
         resetScale()
     }
 
@@ -1274,7 +1303,8 @@ final class Session: ObservableObject {
         do {
             let opened = try FrameStore.open(filmID: shownFilmID, model: modelURL, count: facts.count, condition: conditionTag())
             store = opened
-            coverage = opened.coverage()
+            known = opened.coverage()
+            flushCoverage()
         } catch {
             failure = error.localizedDescription
             status = failure!
@@ -1338,7 +1368,7 @@ final class Session: ObservableObject {
             playing = false
             return
         }
-        if coverage.contains(index) {
+        if known.contains(index) {
             if status != "Wiedergabe · Cache" { status = "Wiedergabe · Cache" }
         } else if status != "rechnet…" {
             status = "rechnet…"
@@ -1357,7 +1387,7 @@ final class Session: ObservableObject {
             if status != "Wiedergabe · Cache" { status = "Wiedergabe · Cache" }
         case .needs(let frame):
             guard playing else { return }
-            if frame <= index + 1, !coverage.contains(frame), status != "rechnet…" {
+            if frame <= index + 1, !known.contains(frame), status != "rechnet…" {
                 status = "rechnet…"
             }
             ensureFrame(frame)
@@ -1376,7 +1406,7 @@ final class Session: ObservableObject {
     /// The frame under or just ahead of the playhead is missing. Store it, and let the video layer show the ProRes sample.
     private func ensureFrame(_ frame: Int) {
         guard playing, frame >= 0, frame < frameCount else { return }
-        if coverage.contains(frame) || playFetching || filling == frame { return }
+        if known.contains(frame) || playFetching || filling == frame { return }
         playFetching = true
         let generation = playGeneration
         let token = epoch
@@ -1387,7 +1417,7 @@ final class Session: ObservableObject {
                 guard token == self.epoch else { return }
                 switch result {
                 case .success(let shown):
-                    if shown.stored { self.coverage.insert(shown.index) }
+                    if shown.stored { self.known.insert(shown.index) }
                     if !shown.fromCache { self.noteScaled(1) }
                     guard self.playing else { return }
                     self.scheduleFill(allowWhilePlaying: true)
@@ -1418,7 +1448,7 @@ final class Session: ObservableObject {
         busy = false
         switch result {
         case .success(let shown):
-            if shown.stored { coverage.insert(shown.index) }
+            if shown.stored { known.insert(shown.index) }
             if !shown.fromCache { noteScaled(1) }
             if shown.index == index, shown.stored, !playing {
                 display(milliseconds: shown.fromCache ? nil : shown.milliseconds)
@@ -1474,12 +1504,12 @@ final class Session: ObservableObject {
     /// The next hole to the right of the slider, then holes in front of it.
     /// A frame that already failed is left out until the next seek.
     private func nextFillIndex() -> Int? {
-        guard var hole = coverage.nextMissing(after: index) else { return nil }
+        guard var hole = known.nextMissing(after: index) else { return nil }
         var steps = 0
         while fillSkipped.contains(hole) {
             steps += 1
             if steps > fillSkipped.count { return nil }
-            guard let later = coverage.nextMissing(after: hole), later != hole else { return nil }
+            guard let later = known.nextMissing(after: hole), later != hole else { return nil }
             hole = later
         }
         return hole
@@ -1501,6 +1531,7 @@ final class Session: ObservableObject {
         guard modelURL != nil, let next = nextFillIndex() else {
             if !fillReportedDone {
                 fillReportedDone = true
+                flushCoverage()
                 if fillSkipped.isEmpty {
                     Log.fill.info("fill fertig")
                 } else {
@@ -1518,7 +1549,7 @@ final class Session: ObservableObject {
             fillAnnounced = true
             Log.fill.info("fill startet Bild \(next + 1, privacy: .public)")
         }
-        engine.request(next, store: store) { [weak self] result in
+        engine.request(next, store: store, qos: .utility) { [weak self] result in
             Task { @MainActor in
                 guard let self else { return }
                 if self.filling == next { self.filling = nil }
@@ -1527,7 +1558,7 @@ final class Session: ObservableObject {
                 case .success(let shown):
                     self.fillStrikes = 0
                     self.fillError = nil
-                    if shown.stored { self.coverage.insert(shown.index) }
+                    if shown.stored { self.known.insert(shown.index) }
                     if !shown.fromCache { self.noteScaled(1) }
                     Log.fill.debug("fill speichert Bild \(shown.index + 1, privacy: .public)")
                     if self.playing {
@@ -1661,7 +1692,7 @@ final class Session: ObservableObject {
         }, stored: { [weak self] index in
             Task { @MainActor in
                 guard let self, token == self.epoch else { return }
-                self.coverage.insert(index)
+                self.known.insert(index)
                 self.noteScaled(1)
             }
         }, done: { [weak self] result in
@@ -1821,7 +1852,8 @@ final class Session: ObservableObject {
                     self.index = min(self.frameMap?.index(forSource: sourceFrame) ?? sourceFrame, max(facts.count - 1, 0))
                     self.inPoint = 0
                     self.outPoint = max(facts.count - 1, 0)
-                    self.coverage = Coverage(count: facts.count)
+                    self.known = Coverage(count: facts.count)
+                    self.flushCoverage()
                     self.status = "\(facts.width)×\(facts.height) · \(facts.count) Bilder"
                     self.rememberShownFacts(facts, id: id)
                     Log.model.info("Film \(facts.count, privacy: .public) Bilder · \(facts.fps, privacy: .public) fps")

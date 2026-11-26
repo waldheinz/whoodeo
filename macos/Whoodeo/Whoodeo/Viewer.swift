@@ -102,12 +102,24 @@ final class PictureStage: NSView {
     private var fitReport: DispatchWorkItem?
     private var lastPixelWidth = 0
     private var lastPixelHeight = 0
+    /// Where a pinch in progress shows the picture, as a GPU transform. Nil when the views are the truth.
+    private var liveFrame: CGRect?
+    /// Unsnapped zoom during a pinch; nil when no pinch is in progress.
+    /// The detent at 100 % follows this raw value, not the last displayed zoom, so the picture does not jitter.
+    private var rawMagnification: CGFloat?
+    private var snappedToHundred = false
+    /// The stage zoomed on its own and the session has not heard of it yet.
+    private var zoomDirty = false
+    private var zoomReport: DispatchWorkItem?
+    private var lastCanPan: Bool?
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        wantsLayer = true
         addSubview(picture)
         addSubview(badgeLabel)
         picture.stage = self
@@ -116,15 +128,17 @@ final class PictureStage: NSView {
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
+        wantsLayer = true
         addSubview(picture)
         addSubview(badgeLabel)
         picture.stage = self
         registerForDraggedTypes(FilmDrop.pasteboardTypes)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
-        dirtyRect.fill()
+    /// One plain color under the picture. The layer holds it, so zooming never redraws the stage
+    /// on the CPU. AppKit calls this again when light or dark mode changes.
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -134,6 +148,7 @@ final class PictureStage: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        lastCanPan = nil
         liftSidebar()
         layoutPicture(recenter: false)
     }
@@ -160,6 +175,7 @@ final class PictureStage: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         if pans(event) {
+            finishLiveZoom()
             let moved = delta(of: event)
             movePicture(by: moved)
             return
@@ -168,16 +184,29 @@ final class PictureStage: NSView {
         let deltaY = event.scrollingDeltaY
         guard deltaY != 0 else { return }
         let multiplier = event.hasPreciseScrollingDeltas ? exp(deltaY * 0.008) : pow(1.15, deltaY)
-        changeZoom(multiplier: multiplier, windowPoint: event.locationInWindow)
+        changeZoom(multiplier: multiplier, windowPoint: event.locationInWindow, live: false)
     }
 
+    /// A pinch scales and moves the picture on the GPU only, the way NSScrollView handles live
+    /// magnification. The views, the cursor and the session catch up once the fingers lift.
+    /// An event without a phase has no end to wait for; it lays out at once and reports a moment later.
     override func magnify(with event: NSEvent) {
+        let phase = event.phase
+        let ending = phase.contains(.ended) || phase.contains(.cancelled)
+        if phase.contains(.began) {
+            rawMagnification = nil
+            snappedToHundred = false
+        }
         let multiplier = 1 + event.magnification
-        guard multiplier > 0.01 else { return }
-        changeZoom(multiplier: multiplier, windowPoint: event.locationInWindow)
+        if multiplier > 0.01 {
+            // The last tick of a gesture still uses the live detent rules, then the real frame lands.
+            changeZoom(multiplier: multiplier, windowPoint: event.locationInWindow, live: !phase.isEmpty)
+        }
+        if ending { finishLiveZoom() }
     }
 
     func trackMouse(_ event: NSEvent) {
+        finishLiveZoom()
         let startWindow = event.locationInWindow
         let startOrigin = picture.frame.origin
         let movable = panAxes()
@@ -242,6 +271,27 @@ final class PictureStage: NSView {
         guard pixelWidth > 0, pixelHeight > 0 else { return }
 
         if !zoomToFit { lastReportedFit = false }
+        let target = placement(recenter: recenter)
+        // One transaction: the transform of a pinch goes away as the real frame takes its place,
+        // so the picture does not move by a pixel.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if liveFrame != nil {
+            liveFrame = nil
+            picture.screenIfCreated()?.setLiveFrame(nil, from: self)
+        }
+        picture.setFrameSize(target.size)
+        picture.setFrameOrigin(target.origin)
+        picture.screenIfCreated()?.layout(in: picture.bounds)
+        CATransaction.commit()
+        picture.sharp = !zoomToFit && magnification >= 0.999
+        updateCursorIfNeeded()
+        reportFitIfNeeded(size: target.size)
+    }
+
+    /// Size and origin of the picture for the current zoom and pan, kept inside the free area.
+    /// Updates `pan` to the clamped origin.
+    private func placement(recenter: Bool) -> CGRect {
         let safe = safeRect()
         let size = pictureSize(in: safe)
         let ranges = ranges(for: size, safe: safe)
@@ -263,12 +313,84 @@ final class PictureStage: NSView {
             )
             pan = origin
         }
-        picture.setFrameSize(size)
-        picture.setFrameOrigin(origin)
-        picture.sharp = !zoomToFit && magnification >= 0.999
-        needsDisplay = true
+        // On whole device pixels, so the pinch transform and the final frame land on the same pixels.
+        let aligned = CGPoint(
+            x: Self.align(origin.x, within: ranges.horizontal, scale: screenScale),
+            y: Self.align(origin.y, within: ranges.vertical, scale: screenScale)
+        )
+        return CGRect(origin: aligned, size: size)
+    }
+
+    /// Rounds to the backing grid. A picture larger than the free area stays inside its range,
+    /// so rounding never uncovers a sliver of background at an edge.
+    private static func align(_ value: CGFloat, within axis: Axis, scale: CGFloat) -> CGFloat {
+        var pixels = (value * scale).rounded()
+        if axis.high > axis.low {
+            pixels = min(max(pixels, (axis.low * scale).rounded(.up)), (axis.high * scale).rounded(.down))
+        }
+        return pixels / scale
+    }
+
+    /// The open hand only when there is something to drag. Cursor rects follow the frame by
+    /// themselves; they are rebuilt here only when panning becomes possible or impossible.
+    private func updateCursorIfNeeded() {
+        let pannable = canPan()
+        guard pannable != lastCanPan else { return }
+        lastCanPan = pannable
         window?.invalidateCursorRects(for: picture)
-        reportFitIfNeeded(size: size)
+    }
+
+    /// One step of a pinch: the screen transforms the picture to where the layout would put it.
+    private func showLiveZoom() {
+        guard let screen = picture.screenIfCreated(), picture.frame.width > 1, picture.frame.height > 1 else {
+            layoutPicture(recenter: false)
+            return
+        }
+        let target = placement(recenter: false)
+        liveFrame = target
+        screen.setLiveFrame(target, from: self)
+        picture.sharp = magnification >= 0.999
+    }
+
+    /// The pinch is over, or something else needs the real frame: lay out where the picture
+    /// already is and tell the session.
+    private func finishLiveZoom() {
+        rawMagnification = nil
+        snappedToHundred = false
+        if liveFrame != nil { layoutPicture(recenter: false) }
+        reportZoomNow()
+    }
+
+    /// The zoom factor feeds the toolbar slider and label. Reporting it sets published session
+    /// state, which renders the whole window again; doing that on every step of a pinch or a
+    /// scroll made zooming stutter. A pinch reports when the fingers lift; this is the fallback
+    /// for events without an end and for a pinch that never sends one.
+    private func scheduleZoomReport(after delay: TimeInterval) {
+        zoomDirty = true
+        zoomReport?.cancel()
+        let report = DispatchWorkItem { [weak self] in self?.finishLiveZoom() }
+        zoomReport = report
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: report)
+    }
+
+    private func reportZoomNow() {
+        zoomReport?.cancel()
+        zoomReport = nil
+        guard zoomDirty else { return }
+        zoomDirty = false
+        guard !zoomToFit else { return }
+        onZoom?(false, magnification)
+    }
+
+    /// The toolbar, a menu or a script sets the zoom. A pinch in progress lands where it is,
+    /// and its pending report is dropped so the old value does not come back.
+    func adoptZoom() {
+        zoomReport?.cancel()
+        zoomReport = nil
+        zoomDirty = false
+        rawMagnification = nil
+        snappedToHundred = false
+        if liveFrame != nil { layoutPicture(recenter: false) }
     }
 
     /// Keeps the point in the middle of the free area fixed. Used when the toolbar slider moves.
@@ -314,7 +436,8 @@ final class PictureStage: NSView {
 
     private func movePicture(by delta: CGPoint) {
         guard pixelWidth > 0 else { return }
-        let origin = picture.frame.origin
+        // From the unrounded pan, so small trackpad steps add up instead of rounding away.
+        let origin = zoomToFit ? (liveFrame ?? picture.frame).origin : (pan ?? picture.frame.origin)
         pan = CGPoint(x: origin.x + delta.x, y: origin.y + delta.y)
         zoomToFit = false
         layoutPicture(recenter: false)
@@ -326,21 +449,43 @@ final class PictureStage: NSView {
         layoutPicture(recenter: false)
     }
 
-    private func changeZoom(multiplier: CGFloat, windowPoint: NSPoint) {
+    private func changeZoom(multiplier: CGFloat, windowPoint: NSPoint, live: Bool) {
         guard pixelWidth > 0, pixelHeight > 0, multiplier > 0 else { return }
         let scale = screenScale
-        let old = picture.frame
+        let old = liveFrame ?? picture.frame
         let natural = CGFloat(pixelWidth) / scale
         let visual = zoomToFit && natural > 1 ? old.width / natural : magnification
-        var next = min(max(visual * multiplier, ZoomScale.minimum), ZoomScale.maximum)
-        let wasHundred = !zoomToFit && abs(visual - 1) < 0.0001
-        let nearHundred = abs(log2(next)) < 0.10
-        let crossedHundred = (visual < 1 && next >= 1) || (visual > 1 && next <= 1)
-        if !wasHundred, nearHundred {
-            next = 1
-        }
-        if !wasHundred, nearHundred || crossedHundred {
-            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        let next: CGFloat
+        if live {
+            if rawMagnification == nil {
+                snappedToHundred = !zoomToFit && abs(visual - 1) < 0.0001
+            }
+            let raw = min(max((rawMagnification ?? visual) * multiplier, ZoomScale.minimum), ZoomScale.maximum)
+            rawMagnification = raw
+            // Detent around 100 %: about 96 %–104 %. The raw value decides, not the last displayed zoom.
+            if abs(log2(raw)) < 0.06 {
+                next = 1
+                if !snappedToHundred {
+                    snappedToHundred = true
+                    NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+                }
+            } else {
+                snappedToHundred = false
+                next = raw
+            }
+        } else {
+            let raw = min(max(visual * multiplier, ZoomScale.minimum), ZoomScale.maximum)
+            let wasHundred = !zoomToFit && abs(visual - 1) < 0.0001
+            let nearHundred = abs(log2(raw)) < 0.06
+            let crossedHundred = (visual < 1 && raw >= 1) || (visual > 1 && raw <= 1)
+            if wasHundred {
+                next = raw
+            } else if nearHundred || crossedHundred {
+                next = 1
+                NSHapticFeedbackManager.defaultPerformer.perform(.levelChange, performanceTime: .now)
+            } else {
+                next = raw
+            }
         }
         guard zoomToFit || abs(next - magnification) > 0.0001 else { return }
         let local = convert(windowPoint, from: nil)
@@ -361,8 +506,13 @@ final class PictureStage: NSView {
             x: local.x - fraction.x * size.width,
             y: local.y - fraction.y * size.height
         )
-        layoutPicture(recenter: false)
-        onZoom?(false, next)
+        if live {
+            showLiveZoom()
+            scheduleZoomReport(after: 0.5)
+        } else {
+            layoutPicture(recenter: false)
+            scheduleZoomReport(after: 0.25)
+        }
     }
 
     private func showAlternate(_ show: Bool) {
@@ -600,13 +750,23 @@ struct Viewer: NSViewRepresentable {
         stage.onZoom = onZoom
         stage.onAlternate = onAlternate
         stage.badge = badge
-        let sameZoom = stage.zoomToFit == zoomToFit && abs(stage.magnification - magnification) < 0.0001
+        let coordinator = context.coordinator
+        // Only a change on the session side moves the zoom. Until a pinch reports, the session
+        // still holds the old value, and every other update (frame counter, cache bar) would
+        // otherwise pull the picture back.
+        let zoomChanged = coordinator.zoomToFit != zoomToFit
+            || coordinator.magnification.map { abs($0 - magnification) >= 0.0001 } ?? true
+        coordinator.zoomToFit = zoomToFit
+        coordinator.magnification = magnification
+        let samePlacement = coordinator.placement == placement
+        let takeZoom = zoomChanged || !samePlacement
+        let sameZoom = !takeZoom
+            || (stage.zoomToFit == zoomToFit && abs(stage.magnification - magnification) < 0.0001)
         let samePixels = stage.pixelWidth == pixelWidth && stage.pixelHeight == pixelHeight
         let sameInsets = stage.fallbackTop == fallbackTop
             && stage.fallbackLeading == fallbackLeading
             && stage.fallbackBottom == fallbackBottom
             && stage.fallbackTrailing == fallbackTrailing
-        let samePlacement = context.coordinator.placement == placement
         // The frame counter publishes on every film frame. Laying the picture out again marks it
         // dirty and the video layer drops frames to keep up with a window that is redrawing.
         if sameZoom && samePixels && sameInsets && samePlacement {
@@ -618,16 +778,19 @@ struct Viewer: NSViewRepresentable {
         stage.fallbackBottom = fallbackBottom
         stage.fallbackTrailing = fallbackTrailing
         let recenter = !samePlacement
-        context.coordinator.placement = placement
+        coordinator.placement = placement
         let wasFit = stage.zoomToFit
         let oldMagnification = stage.magnification
+        if takeZoom { stage.adoptZoom() }
         stage.pixelWidth = pixelWidth
         stage.pixelHeight = pixelHeight
-        stage.zoomToFit = zoomToFit
-        stage.magnification = magnification
+        if takeZoom {
+            stage.zoomToFit = zoomToFit
+            stage.magnification = magnification
+        }
         if recenter || !samePixels {
             stage.layoutPicture(recenter: true)
-        } else if !zoomToFit && (wasFit || abs(oldMagnification - magnification) > 0.0001) {
+        } else if takeZoom && !zoomToFit && (wasFit || abs(oldMagnification - magnification) > 0.0001) {
             stage.zoomAboutSafeCenter()
         } else {
             stage.layoutPicture(recenter: false)
@@ -641,5 +804,8 @@ struct Viewer: NSViewRepresentable {
 
     final class Coordinator {
         var placement = 0
+        /// The zoom the session last handed over. Nil before the first update.
+        var zoomToFit: Bool?
+        var magnification: CGFloat?
     }
 }

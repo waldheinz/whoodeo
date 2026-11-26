@@ -12,8 +12,10 @@ nonisolated struct Shown {
 }
 
 /// The main actor only enqueues work. `queue` runs the model, and `lock` covers the request slot.
+/// The queue runs at utility, below the main thread, so background fill never competes with
+/// scrolling or a pinch. A frame the user asks for raises its own work to user-initiated.
 nonisolated final class Engine: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "whoodeo.engine")
+    private let queue = DispatchQueue(label: "whoodeo.engine", qos: .utility)
     private let lock = NSLock()
     private var wanted: Int?
     private var handler: ((Result<Shown, Error>) -> Void)?
@@ -28,7 +30,7 @@ nonisolated final class Engine: @unchecked Sendable {
 
     /// `map` is the preprocessing of the film; one made for another frame count is ignored.
     func openFilm(_ url: URL, filmID: String, map: FrameMap? = nil, done: @escaping (Result<FilmFacts, Error>) -> Void) {
-        queue.async {
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
             do {
                 let film = try Self.wait { try await Film.load(url, map: map) }
                 self.film = film
@@ -41,7 +43,7 @@ nonisolated final class Engine: @unchecked Sendable {
 
     /// Switch the preprocessing of the open film. Runs after the requests already queued.
     func applyMap(_ map: FrameMap?, done: @escaping (Result<FilmFacts, Error>) -> Void) {
-        queue.async {
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
             guard let film = self.film else {
                 done(.failure(CLIError("kein Film")))
                 return
@@ -52,7 +54,7 @@ nonisolated final class Engine: @unchecked Sendable {
     }
 
     func openModel(_ url: URL, condition: SourceCodec? = nil, done: @escaping (Result<PackageInfo, Error>) -> Void) {
-        queue.async {
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
             do {
                 let predictor = try Predictor(url: url)
                 if let condition { predictor.setCondition(condition) }
@@ -66,12 +68,19 @@ nonisolated final class Engine: @unchecked Sendable {
 
     /// Set the condition vector of a `-cond` package. Runs on the model queue, before later requests.
     func setCondition(_ codec: SourceCodec) {
-        queue.async {
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
             self.predictor?.setCondition(codec)
         }
     }
 
-    func request(_ index: Int, store: FrameStore?, done: @escaping (Result<Shown, Error>) -> Void) {
+    /// `qos` is how urgent the frame is: `.utility` for background fill, `.userInitiated` for a
+    /// frame on screen. Enforced, so fill does not inherit the main thread's priority.
+    func request(
+        _ index: Int,
+        store: FrameStore?,
+        qos: DispatchQoS = .userInitiated,
+        done: @escaping (Result<Shown, Error>) -> Void
+    ) {
         lock.lock()
         if closing {
             lock.unlock()
@@ -90,7 +99,11 @@ nonisolated final class Engine: @unchecked Sendable {
             displaced(.failure(CancellationError()))
         }
         if start {
-            queue.async { self.drain() }
+            queue.async(execute: DispatchWorkItem(qos: qos, flags: .enforceQoS) { self.drain() })
+        } else if qos.qosClass.rawValue.rawValue > DispatchQoS.QoSClass.utility.rawValue.rawValue {
+            // The slot is taken over by a running utility drain. An empty item at the higher QoS
+            // behind it lifts that drain until it has run this request.
+            queue.async(execute: DispatchWorkItem(qos: qos, flags: .enforceQoS) {})
         }
     }
 
@@ -104,7 +117,7 @@ nonisolated final class Engine: @unchecked Sendable {
         stored: @escaping (Int) -> Void,
         done: @escaping (Result<Void, Error>) -> Void
     ) {
-        queue.async {
+        queue.async(qos: .userInitiated, flags: .enforceQoS) {
             self.lock.lock()
             self.hold = true
             self.cancelExport = false
