@@ -144,8 +144,7 @@ nonisolated enum CacheSettings {
 
     /// Film folders are named by the 64-digit hex digest of the film.
     static func isFilmFolderName(_ name: String) -> Bool {
-        let base = name.hasSuffix(".deleting") ? String(name.dropLast(".deleting".count)) : name
-        return base.count == 64 && base.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+        ModelCacheKey.isFilmFolderName(name)
     }
 }
 

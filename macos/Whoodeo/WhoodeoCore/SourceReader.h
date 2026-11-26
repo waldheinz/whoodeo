@@ -9,6 +9,11 @@ typedef struct SourceFile SourceFile;
 typedef struct SourceAudio SourceAudio;
 
 SourceFile *source_open(const char *path, char *error, int errorLength);
+// Training path: no packet timeline scan. Frame times come from the stream
+// frame rate and start_time; source_frame seeks backward and decodes forward.
+SourceFile *source_open_fast(const char *path, char *error, int errorLength);
+// Sets the picture count after a fast open (catalog/DB is authoritative).
+int source_set_count(SourceFile *file, int count);
 void source_close(SourceFile *file);
 const char *source_error(const SourceFile *file);
 

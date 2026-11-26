@@ -25,6 +25,11 @@
             <cocoa class="WhoodeoExportCommand"/>
             <direct-parameter type="text" description="Pfad zur Zieldatei. Eine vorhandene Datei wird ersetzt."/>
         </command>
+        <command name="start training" code="WhooTrSt" description="Startet whoodeo-train wie der Knopf „Training starten“: eigener Prozess, läuft nach dem Beenden der App weiter, Ausgabe nach Models/&lt;Lauf&gt;/train.log. Der Text sind die Argumente von whoodeo-train, zum Beispiel „start --steps 100 --w-vgg 0“ oder „resume 4 --steps 500“. Ohne --name vergibt die App train-JJJJMMTT-HHMMSS. Das Ergebnis ist der Lauf-Name.">
+            <cocoa class="WhoodeoStartTrainingCommand"/>
+            <direct-parameter type="text" description="Argumente: start … oder resume &lt;run-id|name&gt; …"/>
+            <result type="text" description="Name des Laufs, also auch der Ordner des train.log."/>
+        </command>
         <class name="application" code="capp" description="Whoodeo">
             <cocoa class="NSApplication"/>
             <property name="frame" code="Wfrm" type="integer" access="rw" description="Bild unter dem Regler, beginnend bei 1.">
@@ -39,7 +44,7 @@
             <property name="showing original" code="Word" type="boolean" access="rw" description="Das Original statt der Hochskalierung zeigen, wie bei gedrückter Maustaste ohne Vergleichsmodell.">
                 <cocoa key="scriptShowingOriginal"/>
             </property>
-            <property name="comparison model" code="Wcmp" type="text" access="rw" description="Das Vergleichsmodell in der Seitenleiste, wie bei model. Ein Klick ins Standbild zeigt dann dessen Hochskalierung statt des Originals. Leer hebt den Vergleich auf. Das Hauptmodell geht nicht.">
+            <property name="comparison model" code="Wcmp" type="text" access="rw" description="Das Referenzmodell (Vergleich), wie bei model. Ein Klick ins Standbild zeigt dann dessen Hochskalierung statt des Originals. Leer hebt den Vergleich auf. Das Hauptmodell geht nicht.">
                 <cocoa key="scriptComparisonModel"/>
             </property>
             <property name="showing comparison" code="Wcon" type="boolean" access="rw" description="Lesen: Das Bild des Vergleichsmodells ist zu sehen. Setzen: wie gedrückte Maustaste mit Vergleichsmodell. Hält die Wiedergabe an; fehlt das Bild im Cache des Vergleichsmodells, wird es gerechnet und dann gezeigt.">
@@ -69,7 +74,7 @@
             <property name="model" code="Wmod" type="text" access="rw" description="Das gewählte Modell, zum Beispiel „Schritt 21250 · flexibel“. Leer, wenn keins gewählt ist. Die Wahl bleibt nach einem Neustart erhalten.">
                 <cocoa key="scriptModel"/>
             </property>
-            <property name="models" code="Wmds" access="r" description="Die Modelle in der Seitenleiste.">
+            <property name="models" code="Wmds" access="r" description="Die Modelle, die die App kennt.">
                 <cocoa key="scriptModels"/>
                 <type type="text" list="yes"/>
             </property>
@@ -105,6 +110,12 @@
             </property>
             <property name="current film" code="Wcur" type="text" access="rw" description="ID des gezeigten Films. Leer, wenn keiner gezeigt wird. Setzen zeigt diese ID und fügt keinen Film hinzu.">
                 <cocoa key="scriptCurrentFilm"/>
+            </property>
+            <property name="main pane" code="Wpan" type="text" access="rw" description="Ansicht des Hauptfensters: films oder models.">
+                <cocoa key="scriptMainPane"/>
+            </property>
+            <property name="trainer path" code="Wtrp" type="text" access="r" description="Pfad des whoodeo-train, das die App für „Training starten“ nimmt. Leer, wenn keins gefunden wird.">
+                <cocoa key="scriptTrainerPath"/>
             </property>
             <element type="film">
                 <cocoa key="scriptFilms"/>

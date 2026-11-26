@@ -80,6 +80,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc var scriptMainPane: String {
+        get { MainActor.assumeIsolated { Session.current?.mainPane.rawValue ?? "" } }
+        set {
+            MainActor.assumeIsolated {
+                guard let pane = MainPane(rawValue: newValue.lowercased()) else {
+                    NSScriptCommand.current()?.scriptErrorNumber = errAECoercionFail
+                    NSScriptCommand.current()?.scriptErrorString = "films oder models"
+                    return
+                }
+                Session.current?.mainPane = pane
+            }
+        }
+    }
+
+    @objc var scriptTrainerPath: String {
+        TrainLauncher.binaryURL()?.path ?? ""
+    }
+
     /// Turning one source off returns to the upscale only when that source is on screen.
     @MainActor
     private static func show(_ source: ScreenSource, _ on: Bool) {
@@ -244,7 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         "scriptStatus", "scriptFillError", "scriptCachedFrames", "scriptFilling",
         "scriptModel", "scriptModels",
         "scriptCodec", "scriptSourceCodec", "scriptActiveCodec", "scriptDecimate", "scriptPipeline", "scriptPipelineShown", "scriptColorGrade", "scriptInPoint", "scriptOutPoint", "scriptExporting",
-        "scriptCurrentFilm", "scriptFilms",
+        "scriptCurrentFilm", "scriptFilms", "scriptMainPane", "scriptTrainerPath",
     ]
 }
 
@@ -395,5 +413,46 @@ final class WhoodeoExportCommand: NSScriptCommand {
             scriptErrorString = problem
         }
         return nil
+    }
+}
+
+/// `start training "start --steps 100"`: same detached launch and train.log as the start sheet.
+@objc(WhoodeoStartTrainingCommand)
+final class WhoodeoStartTrainingCommand: NSScriptCommand {
+    override func performDefaultImplementation() -> Any? {
+        guard let line = scriptText(self) else {
+            scriptErrorNumber = errAECoercionFail
+            return nil
+        }
+        var args = line.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).map(String.init)
+        let runName: String
+        switch args.first {
+        case "start":
+            if let index = args.firstIndex(of: "--name"), index + 1 < args.count {
+                runName = args[index + 1]
+            } else {
+                runName = TrainConfig.automaticName()
+                args.insert(contentsOf: ["--name", runName], at: 1)
+            }
+        case "resume":
+            guard args.count >= 2, let run = try? WhoodeoDB.shared?.run(idOrName: args[1]) else {
+                scriptErrorNumber = errAENoSuchObject
+                scriptErrorString = "resume braucht eine vorhandene Lauf-ID oder einen Namen"
+                return nil
+            }
+            runName = run.name
+        default:
+            scriptErrorNumber = errAEParamMissed
+            scriptErrorString = "Argumente müssen mit start oder resume beginnen"
+            return nil
+        }
+        do {
+            try TrainLauncher.launch(arguments: args, runName: runName) { _, _ in }
+        } catch {
+            scriptErrorNumber = errAEEventFailed
+            scriptErrorString = error.localizedDescription
+            return nil
+        }
+        return runName
     }
 }

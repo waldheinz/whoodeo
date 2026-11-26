@@ -8,10 +8,12 @@
 
 /* Begin PBXBuildFile section */
 		A10000000000000000000012 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000011 /* MLX */; };
+		A20000000000000000000010 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000011 /* MLX */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000007 /* Whoodeo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Whoodeo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000000000000000000003 /* whoodeo-train */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "whoodeo-train"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -37,6 +39,24 @@
 			path = Whoodeo;
 			sourceTree = "<group>";
 		};
+		A20000000000000000000001 /* WhoodeoCore */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			explicitFileTypes = {
+			};
+			explicitFolders = (
+			);
+			path = WhoodeoCore;
+			sourceTree = "<group>";
+		};
+		A20000000000000000000002 /* whoodeo-train */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			explicitFileTypes = {
+			};
+			explicitFolders = (
+			);
+			path = "whoodeo-train";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,6 +68,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A20000000000000000000006 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A20000000000000000000010 /* MLX in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -55,6 +83,8 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000008 /* Whoodeo */,
+				A20000000000000000000001 /* WhoodeoCore */,
+				A20000000000000000000002 /* whoodeo-train */,
 				A10000000000000000000006 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -63,6 +93,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000007 /* Whoodeo.app */,
+				A20000000000000000000003 /* whoodeo-train */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -84,6 +115,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				A10000000000000000000008 /* Whoodeo */,
+				A20000000000000000000001 /* WhoodeoCore */,
 			);
 			name = Whoodeo;
 			packageProductDependencies = (
@@ -92,6 +124,30 @@
 			productName = Whoodeo;
 			productReference = A10000000000000000000007 /* Whoodeo.app */;
 			productType = "com.apple.product-type.application";
+		};
+		A20000000000000000000004 /* whoodeo-train */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A20000000000000000000007 /* Build configuration list for PBXNativeTarget "whoodeo-train" */;
+			buildPhases = (
+				A20000000000000000000005 /* Sources */,
+				A20000000000000000000006 /* Frameworks */,
+				A20000000000000000000012 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A20000000000000000000001 /* WhoodeoCore */,
+				A20000000000000000000002 /* whoodeo-train */,
+			);
+			name = "whoodeo-train";
+			packageProductDependencies = (
+				A20000000000000000000011 /* MLX */,
+			);
+			productName = "whoodeo-train";
+			productReference = A20000000000000000000003 /* whoodeo-train */;
+			productType = "com.apple.product-type.tool";
 		};
 /* End PBXNativeTarget section */
 
@@ -103,6 +159,9 @@
 				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					A10000000000000000000002 = {
+						CreatedOnToolsVersion = 26.0;
+					};
+					A20000000000000000000004 = {
 						CreatedOnToolsVersion = 26.0;
 					};
 				};
@@ -125,6 +184,7 @@
 			projectRoot = "";
 			targets = (
 				A10000000000000000000002 /* Whoodeo */,
+				A20000000000000000000004 /* whoodeo-train */,
 			);
 		};
 /* End PBXProject section */
@@ -137,10 +197,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A20000000000000000000012 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A10000000000000000000003 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A20000000000000000000005 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -287,6 +361,10 @@
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Whoodeo/Info.plist;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/WhoodeoCore",
+				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -333,6 +411,10 @@
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Whoodeo/Info.plist;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/WhoodeoCore",
+				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -366,6 +448,94 @@
 			};
 			name = Release;
 		};
+		A20000000000000000000008 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_IDENTITY = "Whoodeo Local Signing";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/WhoodeoCore",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/opt/ffmpeg/lib,
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_CFLAGS = (
+					"-isystem",
+					/opt/homebrew/opt/ffmpeg/include,
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lavformat",
+					"-lavcodec",
+					"-lswscale",
+					"-lswresample",
+					"-lavutil",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "meins.whoodeo.whoodeo-train";
+				PRODUCT_NAME = "whoodeo-train";
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "whoodeo-train/whoodeo-train-Bridging-Header.h";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A20000000000000000000009 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				CODE_SIGN_IDENTITY = "Whoodeo Local Signing";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/WhoodeoCore",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					/opt/homebrew/opt/ffmpeg/lib,
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_CFLAGS = (
+					"-isystem",
+					/opt/homebrew/opt/ffmpeg/include,
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lavformat",
+					"-lavcodec",
+					"-lswscale",
+					"-lswresample",
+					"-lavutil",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "meins.whoodeo.whoodeo-train";
+				PRODUCT_NAME = "whoodeo-train";
+				SDKROOT = macosx;
+				SWIFT_OBJC_BRIDGING_HEADER = "whoodeo-train/whoodeo-train-Bridging-Header.h";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -387,6 +557,15 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		A20000000000000000000007 /* Build configuration list for PBXNativeTarget "whoodeo-train" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A20000000000000000000008 /* Debug */,
+				A20000000000000000000009 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -402,6 +581,11 @@
 
 /* Begin XCSwiftPackageProductDependency section */
 		A10000000000000000000011 /* MLX */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000010 /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLX;
+		};
+		A20000000000000000000011 /* MLX */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = A10000000000000000000010 /* XCRemoteSwiftPackageReference "mlx-swift" */;
 			productName = MLX;

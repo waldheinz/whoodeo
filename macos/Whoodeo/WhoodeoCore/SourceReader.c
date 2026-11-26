@@ -43,6 +43,9 @@ struct SourceFile {
     int positioned;
     int inputEOF;
     int audioCount;
+    int fast;
+    int64_t startPts;
+    AVRational frameRate;
     char error[512];
 };
 
@@ -301,6 +304,74 @@ SourceFile *source_open(const char *path, char *error, int errorLength) {
     return file;
 }
 
+
+SourceFile *source_open_fast(const char *path, char *error, int errorLength) {
+    silence_logs();
+    SourceFile *file = av_mallocz(sizeof(SourceFile));
+    if (file == NULL) {
+        set_error(error, errorLength, "Film lässt sich nicht öffnen");
+        return NULL;
+    }
+    file->video = -1;
+    file->nextIndex = -1;
+    file->fast = 1;
+    int status = avformat_open_input(&file->fmt, path, NULL, NULL);
+    if (status < 0) {
+        set_status(error, errorLength, status, "Film lässt sich nicht öffnen");
+        source_close(file);
+        return NULL;
+    }
+    status = avformat_find_stream_info(file->fmt, NULL);
+    if (status < 0) {
+        set_status(error, errorLength, status, "Film lässt sich nicht öffnen");
+        source_close(file);
+        return NULL;
+    }
+    file->video = av_find_best_stream(file->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (file->video < 0) {
+        set_error(error, errorLength, "kein Bild in der Datei");
+        source_close(file);
+        return NULL;
+    }
+    AVStream *stream = file->fmt->streams[file->video];
+    file->timeBase = stream->time_base.num > 0 && stream->time_base.den > 0
+        ? stream->time_base
+        : (AVRational){1, 25};
+    AVRational rate = stream->avg_frame_rate;
+    if (rate.num <= 0 || rate.den <= 0) rate = stream->r_frame_rate;
+    if (rate.num <= 0 || rate.den <= 0) rate = av_guess_frame_rate(file->fmt, stream, NULL);
+    if (rate.num <= 0 || rate.den <= 0) rate = (AVRational){25, 1};
+    file->frameRate = rate;
+    file->fps = av_q2d(rate);
+    if (!(file->fps > 0)) {
+        file->frameRate = (AVRational){25, 1};
+        file->fps = 25;
+    }
+    file->startPts = stream->start_time != AV_NOPTS_VALUE ? stream->start_time : 0;
+    if (stream->nb_frames > 0) {
+        file->count = (int)stream->nb_frames;
+    } else {
+        double seconds = 0;
+        if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0) {
+            seconds = (double)stream->duration * av_q2d(stream->time_base);
+        } else if (file->fmt->duration > 0) {
+            seconds = (double)file->fmt->duration / AV_TIME_BASE;
+        }
+        if (seconds > 0 && file->fps > 0) {
+            int frames = (int)llround(seconds * file->fps);
+            file->count = frames > 0 ? frames : 0;
+        }
+    }
+    if (open_decoder(file, stream, error, errorLength) != 0) {
+        source_close(file);
+        return NULL;
+    }
+    for (unsigned i = 0; i < file->fmt->nb_streams; i++) {
+        if (file->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) file->audioCount++;
+    }
+    return file;
+}
+
 void source_close(SourceFile *file) {
     if (file == NULL) return;
     sws_freeContext(file->sws);
@@ -329,10 +400,23 @@ const char *source_codec(const SourceFile *file) {
     return avcodec_get_name(file->fmt->streams[file->video]->codecpar->codec_id);
 }
 
+static int64_t fast_pts(const SourceFile *file, int index) {
+    AVRational rate = file->frameRate;
+    if (rate.num <= 0 || rate.den <= 0) rate = (AVRational){25, 1};
+    return file->startPts + av_rescale_q((int64_t)index, av_inv_q(rate), file->timeBase);
+}
+
 int source_time(const SourceFile *file, int index, int64_t *value, int32_t *timescale) {
     if (index < 0 || index >= file->count) return -1;
-    *value = file->pts[index] * (int64_t)file->timeBase.num;
+    int64_t pts = file->fast || file->pts == NULL ? fast_pts(file, index) : file->pts[index];
+    *value = pts * (int64_t)file->timeBase.num;
     *timescale = file->timeBase.den > 0 ? file->timeBase.den : 1;
+    return 0;
+}
+
+int source_set_count(SourceFile *file, int count) {
+    if (file == NULL || !file->fast || count < 1) return -1;
+    file->count = count;
     return 0;
 }
 
@@ -464,6 +548,33 @@ static int convert(SourceFile *file, const AVFrame *frame, float *rgb, int capac
 
 // Puts the decoder right before `index`. A short step forward decodes through instead of seeking,
 // so a film that skips its repeated frames still reads in order.
+static int64_t frame_pts(const AVFrame *frame) {
+    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) return frame->best_effort_timestamp;
+    if (frame->pts != AV_NOPTS_VALUE) return frame->pts;
+    return frame->pkt_dts;
+}
+
+// Seek backward to the keyframe before the target PTS, then decode forward
+// until that PTS. Leaves the wanted picture in file->frame.
+static int position_fast(SourceFile *file, int index) {
+    int64_t target = fast_pts(file, index);
+    int status = av_seek_frame(file->fmt, file->video, target, AVSEEK_FLAG_BACKWARD);
+    if (status < 0) return status;
+    avcodec_flush_buffers(file->dec);
+    file->inputEOF = 0;
+    for (;;) {
+        status = decode_one(file, file->frame);
+        if (status < 0) return status;
+        int64_t pts = frame_pts(file->frame);
+        if (pts == AV_NOPTS_VALUE || pts >= target) {
+            file->nextIndex = index;
+            file->positioned = 1;
+            return 0;
+        }
+        av_frame_unref(file->frame);
+    }
+}
+
 static int arrive(SourceFile *file, int index) {
     if (index < 0 || index >= file->count) {
         snprintf(file->error, sizeof file->error, "Bild %d fehlt", index);
@@ -480,12 +591,13 @@ static int arrive(SourceFile *file, int index) {
         }
     }
     if (!file->positioned || index != file->nextIndex) {
-        int status = position(file, index);
+        int status = file->fast ? position_fast(file, index) : position(file, index);
         if (status < 0) {
             file->positioned = 0;
             snprintf(file->error, sizeof file->error, "Bild %d fehlt", index);
             return -1;
         }
+        if (file->fast) return 0;
     }
     int status = decode_one(file, file->frame);
     if (status < 0) {

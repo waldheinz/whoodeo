@@ -31,9 +31,16 @@ enum ZoomScale {
     static let hundred = position(for: 1)
 }
 
+enum MainPane: String, CaseIterable {
+    case films, models
+}
+
 @MainActor
 final class Session: ObservableObject {
     @Published var zoomToFit = true
+    @Published var mainPane: MainPane {
+        didSet { UserDefaults.standard.set(mainPane.rawValue, forKey: Self.mainPaneKey) }
+    }
     @Published var magnification: CGFloat = 1
     @Published private(set) var zoomPlacement = 0
     @Published var codec: Codec = .hevc
@@ -128,6 +135,7 @@ final class Session: ObservableObject {
     private var conditionSize = 0
     private var deleteTarget: URL?
     private var librarySource: DispatchSourceFileSystemObject?
+    private var libraryWatches: [DispatchSourceFileSystemObject] = []
     /// The open film after preprocessing: `count` and `fps` as shown, `sourceCount` and `sourceFps` of the file.
     @Published private(set) var facts: FilmFacts?
     /// Which source frames the open film keeps. Nil when it keeps all of them.
@@ -180,11 +188,17 @@ final class Session: ObservableObject {
     private var loadingFilmID: String?
     private static let fillCacheKey = "fillCache"
     private static let lastModelKey = "lastModel"
+    private static let mainPaneKey = "mainPane"
     private var didRestoreModel = false
     /// Counts model loads. A load that finishes after a newer one started is dropped.
     private var modelLoad = 0
 
     init() {
+        if let raw = UserDefaults.standard.string(forKey: Self.mainPaneKey), let pane = MainPane(rawValue: raw) {
+            mainPane = pane
+        } else {
+            mainPane = .films
+        }
         let stored = UserDefaults.standard.object(forKey: Self.fillCacheKey) as? Bool
         fillCache = stored ?? true
         Session.current = self
@@ -648,7 +662,7 @@ final class Session: ObservableObject {
     func openSelection() {
         if comparison != nil, comparison == selection { setComparison(nil) }
         guard let selection, let (url, codec) = resolvedPackage() else { return }
-        UserDefaults.standard.set(selection.lastPathComponent, forKey: Self.lastModelKey)
+        UserDefaults.standard.set(WhoodeoDB.relativeModelPath(of: selection), forKey: Self.lastModelKey)
         if url == modelURL { return }
         if exporting {
             failure = "Während des Exports bleibt das Modell."
@@ -662,6 +676,29 @@ final class Session: ObservableObject {
     var selectedModel: LibraryModel? {
         guard let selection else { return nil }
         return library.first { $0.url == selection }
+    }
+
+    var selectedComparison: LibraryModel? {
+        guard let comparison else { return nil }
+        return library.first { $0.url == comparison }
+    }
+
+    func isActiveModel(_ url: URL) -> Bool {
+        guard let selection else { return false }
+        return Self.samePackage(selection, url)
+    }
+
+    func isReferenceModel(_ url: URL) -> Bool {
+        guard let comparison else { return false }
+        return Self.samePackage(comparison, url)
+    }
+
+    static func samePackage(_ a: URL, _ b: URL) -> Bool {
+        if a == b { return true }
+        if a.standardizedFileURL.resolvingSymlinksInPath() == b.standardizedFileURL.resolvingSymlinksInPath() {
+            return true
+        }
+        return WhoodeoDB.relativeModelPath(of: a) == WhoodeoDB.relativeModelPath(of: b)
     }
 
     /// The codec menu works for a latent_up with FiLM, and not while an export runs.
@@ -802,7 +839,8 @@ final class Session: ObservableObject {
                 if removingCurrent { self.clearModel() }
                 if removingSelection {
                     self.selection = nil
-                    if UserDefaults.standard.string(forKey: Self.lastModelKey) == target.lastPathComponent {
+                    let stored = UserDefaults.standard.string(forKey: Self.lastModelKey)
+                    if stored == target.lastPathComponent || stored == WhoodeoDB.relativeModelPath(of: target) {
                         UserDefaults.standard.removeObject(forKey: Self.lastModelKey)
                     }
                 }
@@ -1111,7 +1149,6 @@ final class Session: ObservableObject {
         frameCount = 0
         shownFilmID = id
         loadingFilmID = id
-        busy = true
         failure = nil
         originals = nil
         let entry = films.first { $0.id == id }
@@ -1123,6 +1160,7 @@ final class Session: ObservableObject {
         frameMap = resolved?.map
         decimateNote = resolved?.note ?? ""
         releaseArchive()
+        busy = true
         status = "öffnet \(url.lastPathComponent)"
         engine.openFilm(url, filmID: id, map: frameMap) { [weak self] result in
             Task { @MainActor in
@@ -1199,12 +1237,31 @@ final class Session: ObservableObject {
 
     private func startLibraryWatch() {
         reloadLibrary()
-        if librarySource != nil { return }
-        let fd = Darwin.open(ModelLibrary.directory.path, O_EVTONLY)
-        guard fd >= 0 else { return }
+        if librarySource == nil {
+            librarySource = watchFolder(ModelLibrary.directory)
+        }
+        if libraryWatches.isEmpty {
+            let db = WhoodeoPaths.databaseURL
+            let paths = [
+                WhoodeoPaths.supportDirectory,
+                db,
+                URL(fileURLWithPath: db.path + "-wal"),
+                URL(fileURLWithPath: db.path + "-shm"),
+            ]
+            for path in paths {
+                if let source = watchFolder(path) {
+                    libraryWatches.append(source)
+                }
+            }
+        }
+    }
+
+    private func watchFolder(_ folder: URL) -> DispatchSourceFileSystemObject? {
+        let fd = Darwin.open(folder.path, O_EVTONLY)
+        guard fd >= 0 else { return nil }
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd,
-            eventMask: [.write, .rename, .delete],
+            eventMask: [.write, .extend, .rename, .delete, .attrib],
             queue: .main
         )
         source.setEventHandler { [weak self] in
@@ -1212,7 +1269,7 @@ final class Session: ObservableObject {
         }
         source.setCancelHandler { Darwin.close(fd) }
         source.resume()
-        librarySource = source
+        return source
     }
 
     private func reloadLibrary() {
@@ -1233,7 +1290,9 @@ final class Session: ObservableObject {
         didRestoreModel = true
         guard selection == nil,
               let name = UserDefaults.standard.string(forKey: Self.lastModelKey),
-              let match = library.first(where: { $0.url.lastPathComponent == name })
+              let match = library.first(where: {
+                  $0.url.lastPathComponent == name || WhoodeoDB.relativeModelPath(of: $0.url) == name
+              })
         else { return }
         selection = match.url
         openSelection()
@@ -1250,7 +1309,7 @@ final class Session: ObservableObject {
         pixelHeight = 0
         releaseArchive()
         failure = nil
-        status = facts == nil ? "Modell in der Seitenleiste wählen" : status
+        status = facts == nil ? "Modell unter Modelle wählen" : status
     }
 
     /// Quit: stop playback, fill and scans, then wait off the main thread until both engines
@@ -1288,6 +1347,8 @@ final class Session: ObservableObject {
         scrubTask?.cancel()
         scrubbing = false
         filling = nil
+        playFetching = false
+        busy = false
         resetFillHolds()
         store = nil
         dropComparison()
@@ -1316,6 +1377,7 @@ final class Session: ObservableObject {
         resetFillHolds()
         adoptStore()
         if store?.contains(index) == true {
+            busy = false
             display()
             scheduleFill()
             return

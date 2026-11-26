@@ -1,6 +1,5 @@
 import AVFoundation
 import CoreMedia
-import CryptoKit
 import Foundation
 import os
 import VideoToolbox
@@ -140,7 +139,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
 
     /// Digest of the file as it is now. Call this once, when the film is added, and store the result.
     static func filmDigest(of url: URL) -> String {
-        digest(identity(url))
+        ModelCacheKey.digest(ModelCacheKey.identity(url))
     }
 
     /// `filmID` is the digest stored on the film. Opening does not hash the file again.
@@ -152,11 +151,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
     /// The digest is of this package's path and weight.bin, so an align package
     /// does not share a cache with a model that has no alignment.
     static func folderName(model: URL, condition: String? = nil) -> String {
-        var name = "\(digest(identity(model)))-\(unitSuffix)"
-        if let condition, !condition.isEmpty {
-            name += "-\(condition)"
-        }
-        return name
+        ModelCacheKey.folderName(model: model, condition: condition)
     }
 
     static func open(filmID: String, model: URL, count: Int, condition: String? = nil) throws -> FrameStore {
@@ -167,7 +162,11 @@ nonisolated final class FrameStore: @unchecked Sendable {
         gate.lock()
         defer { gate.unlock() }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        return try FrameStore(directory: root, count: count)
+        let store = try FrameStore(directory: root, count: count)
+        if let db = WhoodeoDB.shared {
+            try? db.registerCache(forModel: model, filmID: filmID, condition: condition)
+        }
+        return store
     }
 
     /// Deletes one film directory and every model archive in it.
@@ -220,7 +219,7 @@ nonisolated final class FrameStore: @unchecked Sendable {
 
     /// Key of a model's archives inside a film folder: the folder name up to "-<unit>".
     static func modelKey(of url: URL) -> String {
-        digest(identity(url))
+        ModelCacheKey.modelKey(of: url)
     }
 
     /// Deletes the model archives in every film folder whose model is gone or has changed.
@@ -864,26 +863,6 @@ nonisolated final class FrameStore: @unchecked Sendable {
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: raw.baseAddress!)
         }
         return status == kCMBlockBufferNoErr ? data : nil
-    }
-
-    private static func identity(_ url: URL) -> String {
-        let file = url.standardizedFileURL
-        let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isDirectoryKey])
-        if values?.isDirectory == true, file.pathExtension == MLXAlignModel.fileExtension {
-            let weights = file.appendingPathComponent("model.safetensors")
-            let config = file.appendingPathComponent("config.json")
-            return "\(file.path)\n\(stamp(weights))\n\(stamp(config))"
-        }
-        return "\(file.path)\n\(values?.fileSize ?? 0)\n\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-    }
-
-    private static func stamp(_ url: URL) -> String {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        return "\(values?.fileSize ?? 0)-\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-    }
-
-    private static func digest(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     private struct Meta: Codable {

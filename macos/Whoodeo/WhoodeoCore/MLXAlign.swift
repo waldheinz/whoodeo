@@ -30,15 +30,18 @@ nonisolated final class MLXAlignModel {
     static let fileExtension = "mlxmodel"
     private static let dilations = [1, 2, 4]
     private static let factor = 4
-    /// State-dict prefix of the frozen SPyNet inside latent_up's FeatureAlign.
+    /// State-dict prefix of SPyNet inside latent_up's FeatureAlign.
     private static let spynetPrefix = "align.spynet."
 
     let config: Config
     /// Precision of latent_up and the decoder. float16, what the app
     /// computes; WHOODEO_MLX_PRECISION=float32 overrides it for checks.
     let dtype: DType
-    private let p: [String: MLXArray]
+    private(set) var p: [String: MLXArray]
     private let relu: Bool
+    /// When true, the SPyNet flow stays in the graph so its weights can learn.
+    /// The default detaches the flow (inference and the usual frozen-SPyNet training).
+    var trainSpynet = false
     private let mean = MLXArray([Float(0.485), 0.456, 0.406])
     private let std = MLXArray([Float(0.229), 0.224, 0.225])
 
@@ -77,6 +80,27 @@ nonisolated final class MLXAlignModel {
         // MLX keeps freed GPU buffers for reuse, by default up to the memory limit. A 720p
         // film left about 37 GB there. 12 GB costs a few percent at 720p and nothing below.
         Memory.cacheLimit = 12 << 30
+    }
+
+    /// In-memory model for training or export, already in `dtype` except SPyNet (fp32).
+    init(config: Config, weights: [String: MLXArray], dtype: DType) {
+        self.config = config
+        self.dtype = dtype
+        var cast: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            cast[key] = key.hasPrefix(Self.spynetPrefix) || dtype == .float32 ? value : value.asType(dtype)
+        }
+        p = cast
+        relu = config.activation == "relu"
+        guard config.in_frames == 3, p[Self.spynetPrefix + "basic_module.0.basic_module.0.conv.weight"] != nil,
+              p["align.inner.weight"] != nil else {
+            fatalError("das MLX-Modell braucht 3 Bilder mit Feature-Ausrichtung (align.spynet, align.inner)")
+        }
+        eval(Array(p.values))
+    }
+
+    func replaceWeights(_ weights: [String: MLXArray]) {
+        p = weights
     }
 
     // MARK: ops, as mlxport/ops.py
@@ -178,7 +202,8 @@ nonisolated final class MLXAlignModel {
         let flat = x.reshaped([n * h * w, c])
         let base = (MLXArray((0..<n).map { Int32($0 * h * w) })).reshaped([n, 1, 1])
         func gather(_ yi: MLXArray, _ xi: MLXArray) -> MLXArray {
-            let index = (base + yi * Int32(w) + xi).reshaped([-1])
+            // The corners are discrete; bilinear grads go through fx/fy, not the gather index.
+            let index = stopGradient((base + yi * Int32(w) + xi).reshaped([-1]))
             return take(flat, index, axis: 0).reshaped([n, h, w, c])
         }
         return gather(y0, x0) * ((1 - fx) * (1 - fy))
@@ -237,7 +262,8 @@ nonisolated final class MLXAlignModel {
         let b = feats[1].dim(0)
         let supp = concatenated([images[0], images[2]], axis: 0)
         let ref = concatenated([images[1], images[1]], axis: 0)
-        let flow = spynet(ref, supp)
+        var flow = spynet(ref, supp)
+        if !trainSpynet { flow = stopGradient(flow) }
         let error = abs(Self.flowWarp(supp, flow) - ref).mean(axis: -1, keepDims: true).asType(dtype)
         let warped = Self.flowWarp(concatenated([feats[0], feats[2]], axis: 0), flow).asType(dtype)
         let parts = [
@@ -342,6 +368,7 @@ nonisolated final class MLXAlignModel {
         let image = clip(decode(latent), min: Float(0), max: Float(1))
         return image[0..., 0 ..< 2 * height, 0 ..< 2 * width].asType(.float32)
     }
+
 
     /// Planar 9 × H × W in, planar 3 × 2H × 2W out, as Predictor hands frames around.
     /// With `frames` the front features of frames from the previous window are reused.

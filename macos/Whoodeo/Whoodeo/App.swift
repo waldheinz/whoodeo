@@ -54,10 +54,15 @@ struct WhoodeoApp: App {
                     .disabled(session.selection == nil)
             }
             CommandGroup(after: .sidebar) {
+                Button("Filme") { session.mainPane = .films }
+                    .keyboardShortcut("1")
+                Button("Modelle") { session.mainPane = .models }
+                    .keyboardShortcut("2")
+                Divider()
                 Button("Einpassen") { session.chooseZoom(.fit) }
-                    .disabled(session.frameCount == 0)
+                    .disabled(session.frameCount == 0 || session.mainPane != .films)
                 Button("100 %") { session.chooseZoom(.full) }
-                    .disabled(session.frameCount == 0)
+                    .disabled(session.frameCount == 0 || session.mainPane != .films)
                 Divider()
                 Toggle("Cache im Hintergrund füllen", isOn: $session.fillCache)
                 Divider()
@@ -73,6 +78,7 @@ struct WhoodeoApp: App {
                 .environmentObject(session)
         }
         .defaultSize(width: 1500, height: 950)
+
     }
 }
 

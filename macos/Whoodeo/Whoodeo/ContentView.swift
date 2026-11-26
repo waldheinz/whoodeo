@@ -1,41 +1,32 @@
 import SwiftUI
 
-/// One line of the sidebar. Models and films share one list; each kind keeps its own selection.
-private enum SidebarItem: Hashable {
-    case model(URL)
-    case film(String)
-}
-
 struct ContentView: View {
     @EnvironmentObject private var session: Session
     @State private var swiftDrop = false
     @State private var viewDrop = false
     @State private var transportInset: CGFloat = 0
     @AppStorage("showPipeline") private var showPipeline = true
-    @AppStorage("modelsExpanded") private var modelsExpanded = true
     @AppStorage("filmsExpanded") private var filmsExpanded = true
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            detail
+        Group {
+            if session.mainPane == .models {
+                TrainingView()
+            } else {
+                filmSplit
+            }
         }
-        .inspector(isPresented: $showPipeline) {
-            // With its own toolbar item the inspector reaches up through the title bar like the
-            // sidebar, and the toggle sits over it as a button of its own. The toolbar keeps the
-            // item while the panel is closed, so it is the only toggle in both states.
-            PipelinePanel()
-                .inspectorColumnWidth(min: 260, ideal: 300, max: 400)
-                .toolbar {
-                    ToolbarSpacer(.flexible)
-                    ToolbarItem {
-                        pipelineToggle
-                    }
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("Ansicht", selection: $session.mainPane) {
+                    Text("Filme").tag(MainPane.films)
+                    Text("Modelle").tag(MainPane.models)
                 }
+                .pickerStyle(.segmented)
+                .frame(minWidth: 180)
+                .help("Filme oder Modelle")
+            }
         }
-        .navigationSplitViewStyle(.balanced)
-        .toolbarBackgroundVisibility(.automatic, for: .windowToolbar)
         .onAppear { session.installKeys() }
         .onChange(of: session.selection) { _, _ in
             session.openSelection()
@@ -74,16 +65,33 @@ struct ContentView: View {
         }
     }
 
+    private var filmSplit: some View {
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            detail
+        }
+        .inspector(isPresented: $showPipeline) {
+            // With its own toolbar item the inspector reaches up through the title bar like the
+            // sidebar, and the toggle sits over it as a button of its own. The toolbar keeps the
+            // item while the panel is closed, so it is the only toggle in both states.
+            PipelinePanel()
+                .inspectorColumnWidth(min: 260, ideal: 300, max: 400)
+                .toolbar {
+                    ToolbarSpacer(.flexible)
+                    ToolbarItem {
+                        pipelineToggle
+                    }
+                }
+        }
+        .navigationSplitViewStyle(.balanced)
+        .toolbarBackgroundVisibility(.automatic, for: .windowToolbar)
+    }
+
     private var sidebar: some View {
         VStack(spacing: 0) {
-            List(selection: sidebarSelection) {
-                Section(isExpanded: $modelsExpanded) {
-                    ForEach(session.library) { model in
-                        modelRow(model)
-                    }
-                } header: {
-                    Text("Modelle")
-                }
+            currentModels
+            List(selection: filmSelection) {
                 Section(isExpanded: $filmsExpanded) {
                     ForEach(session.films) { film in
                         filmRow(film)
@@ -117,36 +125,48 @@ struct ContentView: View {
         .help("Pipeline ein- oder ausblenden: Quelle, Upscaler, Farbe & Licht")
     }
 
-    private func modelRow(_ model: LibraryModel) -> some View {
-        Label {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.title)
-                    Text(model.detail)
-                        .font(.caption)
+    private var currentModels: some View {
+        VStack(spacing: 0) {
+        Button {
+            session.mainPane = .models
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.selectedModel?.title ?? "Kein Modell")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(session.selectedModel?.detail ?? "Unter Modelle wählen")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let reference = session.selectedComparison {
+                    Text("Referenz: \(session.comparisonLabel.isEmpty ? reference.detail : session.comparisonLabel)")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                }
-                if session.comparison == model.url {
-                    Spacer()
-                    Image(systemName: "rectangle.split.2x1")
-                        .foregroundStyle(.secondary)
-                        .help("Vergleichsmodell: Ein Klick ins Bild zeigt dieses Modell.")
+                        .lineLimit(1)
                 }
             }
-        } icon: {
-            Image(systemName: model.symbol)
-                .foregroundStyle(model.tint)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
         }
-        .tag(SidebarItem.model(model.url))
-        .contextMenu {
-            Button(session.comparison == model.url ? "Vergleich aufheben" : "Zum Vergleich") {
-                session.toggleComparison(model.url)
-            }
-            .disabled(model.url == session.selection)
-            Button("In den Papierkorb legen", role: .destructive) {
-                session.askDelete(model.url)
-            }
+        .buttonStyle(.plain)
+        .help("Zu Modelle wechseln")
+        Divider()
         }
+    }
+
+    private var filmSelection: Binding<String?> {
+        Binding(
+            get: { session.filmSelection },
+            set: { id in
+                session.filmSelection = id
+                if let id {
+                    _ = session.showFilm(id: id)
+                }
+            }
+        )
     }
 
     private func filmRow(_ film: OpenFilm) -> some View {
@@ -158,44 +178,12 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .tag(SidebarItem.film(film.id))
+        .tag(film.id)
         .contextMenu {
             Button("Aus der Liste entfernen", role: .destructive) {
                 session.askRemoveFilm(film.id)
             }
         }
-    }
-
-    /// One list, two selections: the main model and the film both stay highlighted.
-    /// A click replaces one of them. An option-click on a model marks it for comparison instead,
-    /// and a second one clears it.
-    private var sidebarSelection: Binding<Set<SidebarItem>> {
-        Binding(
-            get: {
-                var items: Set<SidebarItem> = []
-                if let model = session.selection { items.insert(.model(model)) }
-                if let film = session.filmSelection { items.insert(.film(film)) }
-                return items
-            },
-            set: { next in
-                var current: Set<SidebarItem> = []
-                if let model = session.selection { current.insert(.model(model)) }
-                if let film = session.filmSelection { current.insert(.film(film)) }
-                let added = next.subtracting(current)
-                guard let picked = added.first ?? (next.count == 1 ? next.first : nil) else { return }
-                switch picked {
-                case .model(let url):
-                    if NSEvent.modifierFlags.contains(.option) {
-                        if url != session.selection { session.toggleComparison(url) }
-                    } else if url != session.selection {
-                        session.selection = url
-                    }
-                case .film(let id):
-                    session.filmSelection = id
-                    _ = session.showFilm(id: id)
-                }
-            }
-        )
     }
 
     /// While the comparison is asked for: which model, or what keeps it from the screen.
