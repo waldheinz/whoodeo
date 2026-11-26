@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		A10000000000000000000012 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000011 /* MLX */; };
 		A20000000000000000000010 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000011 /* MLX */; };
+		B10000000000000000000012 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = B10000000000000000000011 /* GRDB */; };
+		B20000000000000000000010 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = B20000000000000000000011 /* GRDB */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -65,6 +67,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000012 /* MLX in Frameworks */,
+				B10000000000000000000012 /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -73,6 +76,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A20000000000000000000010 /* MLX in Frameworks */,
+				B20000000000000000000010 /* GRDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -120,6 +124,7 @@
 			name = Whoodeo;
 			packageProductDependencies = (
 				A10000000000000000000011 /* MLX */,
+				B10000000000000000000011 /* GRDB */,
 			);
 			productName = Whoodeo;
 			productReference = A10000000000000000000007 /* Whoodeo.app */;
@@ -144,6 +149,7 @@
 			name = "whoodeo-train";
 			packageProductDependencies = (
 				A20000000000000000000011 /* MLX */,
+				B20000000000000000000011 /* GRDB */,
 			);
 			productName = "whoodeo-train";
 			productReference = A20000000000000000000003 /* whoodeo-train */;
@@ -177,6 +183,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				A10000000000000000000010 /* XCRemoteSwiftPackageReference "mlx-swift" */,
+				B10000000000000000000010 /* XCRemoteSwiftPackageReference "GRDB.swift" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = A10000000000000000000006 /* Products */;
@@ -577,6 +584,14 @@
 				minimumVersion = 0.33.0;
 			};
 		};
+		B10000000000000000000010 /* XCRemoteSwiftPackageReference "GRDB.swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/groue/GRDB.swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 7.12.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -589,6 +604,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A10000000000000000000010 /* XCRemoteSwiftPackageReference "mlx-swift" */;
 			productName = MLX;
+		};
+		B10000000000000000000011 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B10000000000000000000010 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
+		};
+		B20000000000000000000011 /* GRDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B10000000000000000000010 /* XCRemoteSwiftPackageReference "GRDB.swift" */;
+			productName = GRDB;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
