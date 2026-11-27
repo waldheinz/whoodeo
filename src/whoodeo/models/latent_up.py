@@ -85,8 +85,12 @@ def latent_layout(encoder_blocks=None, widths=None, where="latent_up"):
 
 
 def codec_of(variant):
-    """The codec of a low variant name such as x264-crf28 or mpeg4-q12, None when unknown."""
-    return CODEC_PREFIXES.get(str(variant).split("-", 1)[0])
+    """The codec of a low variant name such as x264-crf28, mpeg4-q12, or fblend-x264-crf22."""
+    for part in str(variant).split("-"):
+        found = CODEC_PREFIXES.get(part)
+        if found:
+            return found
+    return None
 
 
 def condition_vector(codec, size):

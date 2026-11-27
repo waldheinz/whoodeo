@@ -17,7 +17,7 @@ nonisolated struct WhoodeoDBError: Error, LocalizedError, CustomStringConvertibl
 /// separate `whoodeo-train` process commits as soon as it commits. Writes from both processes
 /// wait up to 5 s for each other (`busy_timeout`).
 nonisolated final class WhoodeoDB: Sendable {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
     static let shared: WhoodeoDB? = {
         do {
@@ -59,6 +59,7 @@ nonisolated final class WhoodeoDB: Sendable {
         let defaults: [(String, String)] = [
             ("dataset_root", WhoodeoPaths.defaultDatasetRootPath),
             ("schema_version", String(Self.schemaVersion)),
+            ("rungs", Self.defaultRungsJSON),
             ("holdout_mode", "title"),
             ("holdout_fraction", "0.1"),
             ("holdout_note", "The PyTorch trainer held out 10% of the frames inside every film (two spans at 30% and 70%). The database uses a stable 10% title split instead."),
@@ -358,11 +359,12 @@ nonisolated final class WhoodeoDB: Sendable {
     func trainingPairs(split: String, rungs: [String], presets: [String]) throws -> [TrainingPair] {
         var sql = """
             SELECT s.id AS source_id, s.name, s.frames, s.split, m.rung, m.rel_path AS orig_rel_path, m.width, m.height,
-                   v.preset, v.codec, v.rel_path AS low_rel_path
+                   v.preset, p.codec, v.rel_path AS low_rel_path
             FROM sources s
             JOIN source_masters m ON m.source_id = s.id
             JOIN source_variants v ON v.master_id = m.id
-            WHERE s.enabled = 1 AND v.enabled = 1 AND s.split = ?
+            JOIN degrade_presets p ON p.name = v.preset
+            WHERE s.enabled = 1 AND v.enabled = 1 AND p.enabled = 1 AND s.split = ?
             """
         var arguments: StatementArguments = [split]
         if !rungs.isEmpty {
@@ -607,13 +609,86 @@ nonisolated final class WhoodeoDB: Sendable {
 
     // MARK: - Schema
 
-    /// Creates the tables of schema version 1 on a new database. Existing databases are left as they are.
+    static let defaultRungsJSON = "[{\"name\":\"720\",\"pixels\":921600},{\"name\":\"480\",\"pixels\":409920}]"
+
+    struct BuiltInPreset: Sendable {
+        var name: String
+        var codec: String
+        var ffmpegArgs: String
+        var notes: String?
+    }
+
+    /// Seed recipes shared by a new database, the v1→v2 migration, and catalog import.
+    static let builtInPresets: [BuiltInPreset] = [
+        .init(name: "x264-crf18", codec: "h264", ffmpegArgs: "-c:v libx264 -crf 18 -preset medium", notes: "H.264 CRF 18"),
+        .init(name: "x264-crf20", codec: "h264", ffmpegArgs: "-c:v libx264 -crf 20 -preset medium", notes: "H.264 CRF 20"),
+        .init(name: "x264-crf22", codec: "h264", ffmpegArgs: "-c:v libx264 -crf 22 -preset medium", notes: "H.264 CRF 22"),
+        .init(name: "x264-crf24", codec: "h264", ffmpegArgs: "-c:v libx264 -crf 24 -preset medium", notes: "H.264 CRF 24"),
+        .init(name: "mpeg4-q04", codec: "mpeg4", ffmpegArgs: "-c:v mpeg4 -q:v 4 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "MPEG-4 q=4"),
+        .init(name: "mpeg4-q06", codec: "mpeg4", ffmpegArgs: "-c:v mpeg4 -q:v 6 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "MPEG-4 q=6"),
+        .init(name: "blend-mpeg4-q05", codec: "mpeg4", ffmpegArgs: "-vf tmix=frames=2:weights='1 1' -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "50/50 2-frame blend, MPEG-4"),
+        .init(name: "fblend-x264-crf22", codec: "h264", ffmpegArgs: "-vf \"split=3[c][p][n];[p]tpad=start=1:start_mode=clone,setpts=PTS-STARTPTS[p0];[c]setpts=PTS-STARTPTS[c0];[n]tpad=stop=1:stop_mode=clone,trim=start_frame=1,setpts=PTS-STARTPTS[n0];[c0][p0]blend=shortest=1:all_expr='if(eq(mod(N,6),1),0.83*A+0.17*B,if(eq(mod(N,6),2),0.67*A+0.33*B,if(eq(mod(N,6),3),0.5*A+0.5*B,A)))'[cp];[cp][n0]blend=shortest=1:all_expr='if(eq(mod(N,6),4),0.67*A+0.33*B,if(eq(mod(N,6),5),0.83*A+0.17*B,A))'\" -c:v libx264 -crf 22 -preset medium", notes: "6-phase 2-frame blend, H.264"),
+    ]
+
+    static func upsertPreset(
+        _ db: Database, name: String, codec: String, ffmpegArgs: String,
+        scale: Int = 2, scaleFlags: String = "bicubic", pixFmt: String = "yuv420p",
+        notes: String? = nil, enabled: Int = 1
+    ) throws {
+        try db.execute(sql: """
+            INSERT INTO degrade_presets(name, codec, ffmpeg_args, scale, scale_flags, pix_fmt, notes, enabled)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                codec = excluded.codec,
+                ffmpeg_args = excluded.ffmpeg_args,
+                scale = excluded.scale,
+                scale_flags = excluded.scale_flags,
+                pix_fmt = excluded.pix_fmt,
+                notes = excluded.notes,
+                enabled = excluded.enabled
+            """, arguments: [name, codec, ffmpegArgs, scale, scaleFlags, pixFmt, notes, enabled])
+    }
+
+    static func seedBuiltInPresets(_ db: Database) throws {
+        for preset in builtInPresets {
+            try upsertPreset(
+                db, name: preset.name, codec: preset.codec, ffmpegArgs: preset.ffmpegArgs,
+                notes: preset.notes
+            )
+        }
+    }
+
+    /// Creates schema 2 on a new database, or upgrades an existing schema 1 database.
     private static func migrate(_ db: Database) throws {
-        guard try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0 < schemaVersion else { return }
+        let version = try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0
+        guard version < schemaVersion else { return }
+        if version == 0 {
+            try createV2Schema(db)
+        } else if version == 1 {
+            try migrateV1toV2(db)
+        } else {
+            throw WhoodeoDBError("Unbekannte Datenbank-Version \(version), erwartet 0 oder 1")
+        }
+        try setSetting(db, String(schemaVersion), forKey: "schema_version")
+        try setSetting(db, defaultRungsJSON, forKey: "rungs")
+        try db.execute(sql: "PRAGMA user_version = \(schemaVersion)")
+    }
+
+    private static func createV2Schema(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS degrade_presets (
+                name TEXT PRIMARY KEY,
+                codec TEXT NOT NULL,
+                ffmpeg_args TEXT NOT NULL,
+                scale INTEGER NOT NULL DEFAULT 2,
+                scale_flags TEXT NOT NULL DEFAULT 'bicubic',
+                pix_fmt TEXT NOT NULL DEFAULT 'yuv420p',
+                notes TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY,
@@ -637,8 +712,7 @@ nonisolated final class WhoodeoDB: Sendable {
             CREATE TABLE IF NOT EXISTS source_variants (
                 id INTEGER PRIMARY KEY,
                 master_id INTEGER NOT NULL REFERENCES source_masters(id) ON DELETE CASCADE,
-                preset TEXT NOT NULL,
-                codec TEXT NOT NULL,
+                preset TEXT NOT NULL REFERENCES degrade_presets(name),
                 rel_path TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(master_id, preset)
@@ -698,7 +772,43 @@ nonisolated final class WhoodeoDB: Sendable {
             );
             CREATE INDEX IF NOT EXISTS cache_files_checkpoint ON cache_files(checkpoint_id);
             CREATE INDEX IF NOT EXISTS cache_files_model_key ON cache_files(model_key);
-            PRAGMA user_version = 1;
+            """)
+        try seedBuiltInPresets(db)
+    }
+
+    private static func migrateV1toV2(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS degrade_presets (
+                name TEXT PRIMARY KEY,
+                codec TEXT NOT NULL,
+                ffmpeg_args TEXT NOT NULL,
+                scale INTEGER NOT NULL DEFAULT 2,
+                scale_flags TEXT NOT NULL DEFAULT 'bicubic',
+                pix_fmt TEXT NOT NULL DEFAULT 'yuv420p',
+                notes TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1
+            );
+            """)
+        try seedBuiltInPresets(db)
+        // Keep any unexpected presets from the old table, with their stored FiLM codec.
+        try db.execute(sql: """
+            INSERT OR IGNORE INTO degrade_presets(name, codec, ffmpeg_args, scale, scale_flags, pix_fmt, enabled)
+            SELECT DISTINCT preset, codec, '', 2, 'bicubic', 'yuv420p', 1
+            FROM source_variants
+            """)
+        try db.execute(sql: """
+            CREATE TABLE source_variants_new (
+                id INTEGER PRIMARY KEY,
+                master_id INTEGER NOT NULL REFERENCES source_masters(id) ON DELETE CASCADE,
+                preset TEXT NOT NULL REFERENCES degrade_presets(name),
+                rel_path TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(master_id, preset)
+            );
+            INSERT INTO source_variants_new(id, master_id, preset, rel_path, enabled)
+            SELECT id, master_id, preset, rel_path, enabled FROM source_variants;
+            DROP TABLE source_variants;
+            ALTER TABLE source_variants_new RENAME TO source_variants;
             """)
     }
 }

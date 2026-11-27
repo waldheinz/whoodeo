@@ -30,6 +30,7 @@ nonisolated extension WhoodeoDB {
         var report = ImportReport()
         try pool.write { db in
             try Self.setSetting(db, root.path, forKey: "dataset_root")
+            try Self.importDegrade(db, from: json)
             for (name, raw) in titles.sorted(by: { $0.key < $1.key }) {
                 guard !name.hasPrefix("._"), let entry = raw as? [String: Any] else { continue }
                 let frames = Self.intValue(entry["frames"]) ?? 0
@@ -60,9 +61,10 @@ nonisolated extension WhoodeoDB {
                         else { continue }
                         let variantRel = "low/\(preset)/\(name).\(rung).mkv"
                         if !exists(variantRel) { report.missingFiles.append(variantRel) }
+                        try Self.ensurePreset(db, name: preset)
                         let variant = try Self.insertOrFind(db, into: "source_variants", [
                             "master_id": masterRow.id, "preset": preset,
-                            "codec": Self.codec(forPreset: preset), "rel_path": variantRel,
+                            "rel_path": variantRel,
                         ], uniqueBy: ["master_id", "preset"])
                         if variant.inserted { report.variantsInserted += 1 }
                     }
@@ -206,14 +208,50 @@ nonisolated extension WhoodeoDB {
         return hash % 10 == 0 ? "val" : "train"
     }
 
+    /// FiLM codec label (`h264` / `mpeg4` / `mpeg2`), from any hyphen-separated token of the preset name.
     static func codec(forPreset preset: String) -> String {
-        let prefix = preset.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: true).first.map(String.init) ?? preset
-        switch prefix {
-        case "x264", "h264", "avc": return "h264"
-        case "mpeg4": return "mpeg4"
-        case "mpeg2": return "mpeg2"
-        default: return prefix
+        let parts = preset.lowercased().split(separator: "-", omittingEmptySubsequences: true).map(String.init)
+        for part in parts {
+            switch part {
+            case "x264", "h264", "avc": return "h264"
+            case "mpeg4": return "mpeg4"
+            case "mpeg2": return "mpeg2"
+            default: continue
+            }
         }
+        return parts.first ?? preset
+    }
+
+    /// Writes `degrade` recipes and `rungs` from a catalog.json document.
+    static func importDegrade(_ db: Database, from json: [String: Any]) throws {
+        if let degrade = json["degrade"] as? [String: Any] {
+            let scale = Self.intValue(degrade["scale"]) ?? 2
+            let flags = (degrade["scale_flags"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "bicubic"
+            let pix = (degrade["pix_fmt"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "yuv420p"
+            if let variants = degrade["variants"] as? [String: Any] {
+                for (name, raw) in variants.sorted(by: { $0.key < $1.key }) {
+                    guard let args = raw as? String, !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                    try WhoodeoDB.upsertPreset(
+                        db, name: name, codec: codec(forPreset: name), ffmpegArgs: args,
+                        scale: scale, scaleFlags: flags, pixFmt: pix
+                    )
+                }
+            }
+        }
+        if let rungs = json["rungs"], JSONSerialization.isValidJSONObject(rungs),
+           let data = try? JSONSerialization.data(withJSONObject: rungs),
+           let text = String(data: data, encoding: .utf8)
+        {
+            try WhoodeoDB.setSetting(db, text, forKey: "rungs")
+        }
+    }
+
+    /// Inserts a placeholder preset when a low file names one that is not in `degrade_presets` yet.
+    static func ensurePreset(_ db: Database, name: String) throws {
+        if try String.fetchOne(db, sql: "SELECT name FROM degrade_presets WHERE name = ?", arguments: [name]) != nil {
+            return
+        }
+        try WhoodeoDB.upsertPreset(db, name: name, codec: codec(forPreset: name), ffmpegArgs: "")
     }
 
     static func collectPackages(in folder: URL) -> [URL] {

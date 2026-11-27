@@ -4,7 +4,9 @@ import Foundation
 nonisolated enum WhoodeoPaths {
     static let appDefaultsSuite = "meins.whoodeo.Whoodeo"
     static let cacheDirectoryKey = "cacheDirectory"
-    static let defaultDatasetRootPath = "/Volumes/Black Elem/whoodeo/train"
+    static let defaultDatasetRootPath = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("storinator/home/whoodeo/train", isDirectory: true)
+        .path
 
     static var supportDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]

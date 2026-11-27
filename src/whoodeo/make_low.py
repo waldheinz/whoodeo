@@ -1,37 +1,39 @@
 """Write training videos.
 
 `whoodeo-make-low import` writes a source into the orig folder and records
-it in catalog.json beside orig/ and low/. The catalog's rungs are pixel
+it in the Whoodeo SQLite database (and in catalog.json beside orig/ and low/,
+as a mirror). The rungs are pixel
 budgets. A source larger than a rung is encoded down to it, 10-bit 4:4:4
 HEVC with a short closed GOP, so training seeks stay cheap. A source that
 already sits on a rung is remuxed as it is: the video bitstream stays, and
 the audio is dropped. Smaller rungs are still encoded from that same
 source. Nothing is upscaled. The file is <title>.<rung>.mkv. Low variants
-come from the catalog's degrade list and are written unless `--no-degrade`
+come from the `degrade_presets` table and are written unless `--no-degrade`
 is set, under the same filename. One master is finished, variants included,
 before the next master starts. The missing variants of a master come
 from one ffmpeg run: the master is decoded and scaled once, and each
 variant encodes its own copy of those frames.
 
 The plain command writes the missing variants of masters already in the
-catalog. With no filenames it also encodes any rung the catalog's origin
+database. With no filenames it also encodes any rung the stored origin
 file can still supply, and degrades that master before the next one.
 Variant directories live under the low root. `--dry-run` prints each encode
 or remux the command would start and writes nothing.
 
 `whoodeo-make-low stats` prints one row per master size. A film is a master
-that already has a low file. Pairs count finished files from the catalog's
-degrade list, and frames are that master's frame count once.
+that already has a low file. Pairs count finished files from the enabled
+degrade presets, and frames are that master's frame count once.
 """
 
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-from whoodeo.catalog import EnvPath, resolve_data
+from whoodeo import db
 from whoodeo.library import (
     catalog_file,
     degrade_of,
@@ -40,7 +42,6 @@ from whoodeo.library import (
     open_catalog,
     plan_masters,
     picture_size,
-    rungs_of,
     same_frame_count,
     save_catalog,
     split_master_filename,
@@ -72,16 +73,111 @@ MATRIX_ALL = {
 }
 
 
+def add_db_option(parser):
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="Whoodeo SQLite database (default: $WHOODEO_DB or "
+             "~/Library/Application Support/Whoodeo/whoodeo.sqlite)",
+    )
+
+
+def open_store(args):
+    """Open the database and resolve orig/, low/, and the data root."""
+    conn = db.connect(args.db)
+    root = db.dataset_root(conn)
+    orig = Path(args.orig).expanduser() if args.orig else root / "orig"
+    orig = orig.resolve() if orig.exists() else orig
+    low = None
+    if hasattr(args, "low"):
+        low = Path(args.low).expanduser() if args.low else root / "low"
+        if low.exists():
+            low = low.resolve()
+    return conn, root, orig, low
+
+
+def load_catalog_mirror(root, create=False, dry_run=False):
+    """Load catalog.json as a write-through mirror. A missing file is OK."""
+    if catalog_file(root).is_file():
+        return open_catalog(root, create=False)
+    if create and not dry_run:
+        return open_catalog(root, create=True)
+    return empty_catalog()
+
+
+def entry_from_db(conn, title):
+    """A catalog-shaped title entry from the database, or None."""
+    source = conn.execute(
+        "SELECT origin_path, frames FROM sources WHERE name = ?",
+        (title,),
+    ).fetchone()
+    if source is None:
+        return None
+    entry = {"origin": source["origin_path"], "frames": source["frames"], "masters": {}}
+    for master in conn.execute(
+        "SELECT m.id, m.rung, m.width, m.height FROM source_masters m "
+        "JOIN sources s ON s.id = m.source_id WHERE s.name = ?",
+        (title,),
+    ):
+        entry["masters"][master["rung"]] = {
+            "width": master["width"],
+            "height": master["height"],
+            "low": db.listed_variants(conn, master["id"]),
+        }
+    return entry
+
+
+def merge_entry_from_db(entry, conn, title):
+    """Fill missing origin/masters/low names from the database."""
+    found = entry_from_db(conn, title)
+    if found is None:
+        return entry
+    if not entry.get("origin") and found.get("origin"):
+        entry["origin"] = found["origin"]
+    if entry.get("frames") is None:
+        entry["frames"] = found.get("frames")
+    masters = entry.setdefault("masters", {})
+    if not isinstance(masters, dict):
+        entry["masters"] = found["masters"]
+        return entry
+    for rung, master in found["masters"].items():
+        current = masters.get(rung)
+        if not isinstance(current, dict):
+            masters[rung] = master
+            continue
+        if not isinstance(current.get("low"), list):
+            current["low"] = list(master["low"])
+            continue
+        for name in master["low"]:
+            if name not in current["low"]:
+                current["low"].append(name)
+    return entry
+
+
+
+def db_remember_variant(conn, title, rung, preset, filename):
+    db.remember_variant(conn, title, rung, preset, f"low/{preset}/{filename}")
+    conn.commit()
+
+
 def select_variants(variants, text):
     if text is None:
-        return list(variants.items())
-    names = [part.strip() for part in text.split(",") if part.strip()]
-    if not names:
-        raise SystemExit("--variants is empty")
-    missing = [name for name in names if name not in variants]
-    if missing:
-        raise SystemExit("unknown variant: " + ", ".join(missing))
-    return [(name, variants[name]) for name in names]
+        selected = list(variants.items())
+    else:
+        names = [part.strip() for part in text.split(",") if part.strip()]
+        if not names:
+            raise SystemExit("--variants is empty")
+        missing = [name for name in names if name not in variants]
+        if missing:
+            raise SystemExit("unknown variant: " + ", ".join(missing))
+        selected = [(name, variants[name]) for name in names]
+    for name, args in selected:
+        try:
+            split_variant_vf(args)
+        except ValueError as exc:
+            raise SystemExit(f"variant {name}: {exc}") from exc
+    return selected
 
 
 def codec_of(args):
@@ -92,6 +188,35 @@ def codec_of(args):
             if index + 1 < len(tokens):
                 return tokens[index + 1]
     return None
+
+
+def split_variant_vf(args):
+    """Pull an optional -vf / -filter:v out of a variant argument string.
+
+    Returns (filter or None, remaining encoder tokens). Existing variants
+    without a filter are unchanged.
+    """
+    tokens = shlex.split(args)
+    vf = None
+    rest = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("-vf", "-filter:v"):
+            if index + 1 >= len(tokens):
+                raise ValueError(f"{token} is missing its filter")
+            if vf is not None:
+                raise ValueError("only one -vf is allowed")
+            vf = tokens[index + 1]
+            if not vf.strip():
+                raise ValueError("-vf is empty")
+            if vf.count("[") != vf.count("]"):
+                raise ValueError("-vf has unbalanced '[' / ']'")
+            index += 2
+            continue
+        rest.append(token)
+        index += 1
+    return vf, rest
 
 
 def run_probe(args):
@@ -171,7 +296,8 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
     """Write several low variants of one master from a single decode.
 
     jobs is a list of (variant, ffmpeg_args). The master is decoded and scaled
-    once, split, and each copy is encoded to its own file. Return a dict from
+    once, split, and each copy is encoded to its own file. A variant may
+    include -vf, which runs after the shared scale. Return a dict from
     variant to its frame count, -1 when ignored, None on failure.
     """
     name = src.name
@@ -226,11 +352,30 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
     low_h = height // scale
 
     count = len(todo)
-    labels = "".join(f"[v{index}]" for index in range(count))
-    graph = f"[0:v:0]scale={low_w}:{low_h}:flags={scale_flags},split={count}{labels}"
+    split_labels = []
+    branches = []
+    encoder_args = []
+    for index, (variant, ffmpeg_args, out) in enumerate(todo):
+        try:
+            vf, rest = split_variant_vf(ffmpeg_args)
+        except ValueError as exc:
+            return fail_all(str(exc))
+        encoder_args.append(rest)
+        if vf:
+            scoped = re.sub(r"\[([A-Za-z0-9_]+)\]", rf"[b{index}_\1]", vf)
+            split_labels.append(f"[s{index}]")
+            branches.append(f"[s{index}]{scoped}[v{index}]")
+        else:
+            split_labels.append(f"[v{index}]")
+    graph = (
+        f"[0:v:0]scale={low_w}:{low_h}:flags={scale_flags},"
+        f"split={count}{''.join(split_labels)}"
+    )
+    if branches:
+        graph += ";" + ";".join(branches)
     outputs = []
     temps = []
-    for index, (variant, ffmpeg_args, out) in enumerate(todo):
+    for index, ((variant, ffmpeg_args, out), rest) in enumerate(zip(todo, encoder_args)):
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
         tmp.unlink(missing_ok=True)
@@ -238,7 +383,7 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
         print(f"encode {variant}/{name}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", flush=True)
         outputs += [
             "-map", f"[v{index}]", "-an",
-            *shlex.split(ffmpeg_args),
+            *rest,
             "-pix_fmt", pix_fmt,
             "-fps_mode", "passthrough",
             str(tmp),
@@ -784,7 +929,7 @@ def title_entry(catalog, root, title):
     return entry
 
 
-def remember_master(catalog, root, title, rung, path, frames, force):
+def remember_master(catalog, root, title, rung, path, frames, force, conn=None):
     entry = title_entry(catalog, root, title)
     width, height = picture_size(path)
     same_frame_count(entry, title, frames)
@@ -794,9 +939,14 @@ def remember_master(catalog, root, title, rung, path, frames, force):
         low = list(previous["low"])
     entry["masters"][rung] = {"width": width, "height": height, "low": low}
     save_catalog(root, catalog)
+    if conn is not None:
+        db.remember_master(
+            conn, title, rung, f"orig/{path.name}", width, height, frames=frames,
+        )
+        conn.commit()
 
 
-def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root, dry_run=False):
+def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root, dry_run=False, conn=None):
     """Write the planned masters that are missing. Return (filenames, failed).
 
     `dry_run` prints the master line and writes nothing. A file that is
@@ -845,7 +995,7 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
                     failed = True
                     continue
                 try:
-                    remember_master(catalog, root, title, rung, out, frames, False)
+                    remember_master(catalog, root, title, rung, out, frames, False, conn=conn)
                 except RuntimeError as exc:
                     print(f"{name}: {exc}", file=sys.stderr)
                     failed = True
@@ -873,7 +1023,7 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
             failed = True
             continue
         try:
-            remember_master(catalog, root, title, rung, out, frames, force)
+            remember_master(catalog, root, title, rung, out, frames, force, conn=conn)
         except RuntimeError as exc:
             print(f"{name}: {exc}", file=sys.stderr)
             failed = True
@@ -892,7 +1042,7 @@ def masters_to_write(orig_dir, title, planned, force):
     ]
 
 
-def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=False):
+def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=False, conn=None):
     """Record src as the title's origin. Return (title, planned, probed), or None.
 
     `dry_run` leaves the catalog untouched. The source packet count runs only
@@ -930,6 +1080,9 @@ def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=Fal
             return None
     entry["origin"] = str(src.resolve())
     save_catalog(root, catalog)
+    if conn is not None:
+        db.remember_source(conn, title, origin_path=entry["origin"], frames=entry.get("frames"))
+        conn.commit()
     return title, planned, probed
 
 
@@ -1011,7 +1164,7 @@ def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry):
 
 def degrade_master(
     src, low_dir, selected, scale, flags, pix_fmt, force, strict, catalog, root,
-    dry_run=False, geometry=None, unlisted=False,
+    dry_run=False, geometry=None, unlisted=False, conn=None,
 ):
     """Write the selected lows of one master and record them. Return False on failure.
 
@@ -1045,6 +1198,11 @@ def degrade_master(
         low_path = low_dir / variant / src.name
         if low_path.is_file() and not force and variant in master["low"]:
             print(f"keep {variant}/{src.name}", flush=True)
+            if conn is not None:
+                try:
+                    db_remember_variant(conn, title, rung, variant, src.name)
+                except RuntimeError as exc:
+                    print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
             continue
         jobs.append((variant, ffmpeg_args))
     encoded = encode_variants(
@@ -1084,12 +1242,19 @@ def degrade_master(
         if variant not in master["low"]:
             master["low"].append(variant)
         save_catalog(root, catalog)
+        if conn is not None:
+            try:
+                db_remember_variant(conn, title, rung, variant, src.name)
+            except RuntimeError as exc:
+                print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
+                failed = True
     return not failed
 
 
 def finish_title(
     title, orig_dir, rungs, low_dir, selected,
     scale, flags, pix_fmt, force, strict, catalog, root, dry_run=False,
+    conn=None,
 ):
     """Degrade one master before the next one is encoded.
 
@@ -1098,9 +1263,15 @@ def finish_title(
     A missing origin leaves the written masters in place. `dry_run` lists
     those encodes and writes nothing. Return False when a step fails.
     """
-    entry = titles_of(catalog, catalog_file(root)).get(title)
+    titles = titles_of(catalog, catalog_file(root))
+    entry = titles.get(title)
     if not isinstance(entry, dict):
-        return True
+        entry = entry_from_db(conn, title) if conn is not None else None
+        if not isinstance(entry, dict):
+            return True
+        titles[title] = entry
+    elif conn is not None:
+        merge_entry_from_db(entry, conn, title)
     failed = False
     planned = []
     src = None
@@ -1122,7 +1293,7 @@ def finish_title(
         ok = degrade_master(
             path, low_dir, selected, scale, flags, pix_fmt,
             force, strict, catalog, root,
-            dry_run=dry_run, geometry=geometry, unlisted=unlisted,
+            dry_run=dry_run, geometry=geometry, unlisted=unlisted, conn=conn,
         )
         failed = failed or not ok
 
@@ -1143,7 +1314,7 @@ def finish_title(
         if unlisted:
             names, one_failed = produce_planned(
                 src, title, [item], probed, orig_dir, False, catalog, root,
-                dry_run=dry_run,
+                dry_run=dry_run, conn=conn,
             )
             failed = failed or one_failed
             if one_failed or path.name not in names:
@@ -1167,7 +1338,7 @@ def finish_title(
         path = orig_dir / master_filename(title, rung)
         names, one_failed = produce_planned(
             src, title, [item], probed, orig_dir, False, catalog, root,
-            dry_run=dry_run,
+            dry_run=dry_run, conn=conn,
         )
         failed = failed or one_failed
         ready = path.name in names and (path.is_file() or dry_run)
@@ -1276,6 +1447,59 @@ def library_stats(catalog, where, orig_dir, low_dir):
     return recipe, rows, gaps
 
 
+def library_stats_from_db(conn, orig_dir, low_dir):
+    """Ready films grouped by master size, plus masters that are not ready."""
+    scale, _, _, variants = db.load_degrade(conn, enabled_only=True)
+    recipe = list(variants)
+    groups = {}
+    gaps = []
+    for row in db.list_masters(conn):
+        if not row["source_enabled"]:
+            continue
+        name = master_filename(row["name"], row["rung"])
+        frames = row["frames"]
+        width = row["width"]
+        height = row["height"]
+        if not isinstance(frames, int) or frames < 1:
+            gaps.append(("skip", name, "missing frames"))
+            continue
+        if not isinstance(width, int) or width < 1 or not isinstance(height, int) or height < 1:
+            gaps.append(("skip", name, "missing size"))
+            continue
+        listed = db.listed_variants(conn, row["master_id"])
+        if not (orig_dir / name).is_file():
+            gaps.append(("no master", name, None))
+            continue
+        present = [variant for variant in recipe if (low_dir / variant / name).is_file()]
+        other = [
+            variant for variant in listed
+            if variant not in variants and (low_dir / variant / name).is_file()
+        ]
+        if not present and not other:
+            gaps.append(("no low", name, None))
+            continue
+        bucket = groups.setdefault((width, height), {"films": 0, "pairs": 0, "frames": 0})
+        bucket["films"] += 1
+        bucket["pairs"] += len(present)
+        bucket["frames"] += frames
+        missing = [variant for variant in recipe if variant not in present]
+        if missing:
+            gaps.append(("incomplete", name, (len(present), len(recipe), missing)))
+    rows = []
+    for (width, height), bucket in groups.items():
+        rows.append({
+            "width": width,
+            "height": height,
+            "low_w": width // scale,
+            "low_h": height // scale,
+            "films": bucket["films"],
+            "pairs": bucket["pairs"],
+            "frames": bucket["frames"],
+        })
+    rows.sort(key=lambda row: (row["width"] * row["height"], row["width"]), reverse=True)
+    return recipe, rows, gaps
+
+
 def format_stats(recipe, rows, gaps):
     """The size table, then any master that is not fully degraded."""
     lines = ["degrade  " + " ".join(recipe)]
@@ -1351,9 +1575,10 @@ def parse_args(argv):
         "`whoodeo-make-low import` writes a source into orig first. "
         "`whoodeo-make-low stats` prints masters grouped by size",
     )
-    parser.add_argument("--variants", help="comma-separated names from the catalog degrade list; default is all of them")
-    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
+    add_db_option(parser)
+    parser.add_argument("--variants", help="comma-separated names from the database degrade presets; default is all enabled presets")
+    parser.add_argument("-o", "--orig", type=Path, default=None, help="master videos (default: dataset_root/orig from the database)")
+    parser.add_argument("-l", "--low", type=Path, default=None, help="degraded variants (default: dataset_root/low from the database)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing low video")
     parser.add_argument(
         "-n", "--dry-run", action="store_true",
@@ -1371,26 +1596,26 @@ def parse_stats_args(argv):
         prog="whoodeo-make-low stats",
         description="print catalog masters grouped by size. "
         "A film has at least one low file. Pairs are finished files from "
-        "the catalog degrade list. Frames are counted once per film.",
+        "the enabled degrade presets. Frames are counted once per film.",
     )
-    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="degraded variants (default: %(default)s)")
+    add_db_option(parser)
+    parser.add_argument("-o", "--orig", type=Path, default=None, help="master videos (default: dataset_root/orig from the database)")
+    parser.add_argument("-l", "--low", type=Path, default=None, help="degraded variants (default: dataset_root/low from the database)")
     return parser.parse_args(argv)
 
 
 def stats_main(argv):
     args = parse_stats_args(argv)
-    args.orig = resolve_data(args.orig)
-    args.low = resolve_data(args.low)
-    orig_dir = args.orig.expanduser().resolve()
-    low_dir = args.low.expanduser().resolve()
-    if not orig_dir.is_dir():
-        raise SystemExit(f"no orig folder: {orig_dir}")
-    root = orig_dir.parent
-    catalog = open_catalog(root, create=False)
-    where = catalog_file(root)
-    text = format_stats(*library_stats(catalog, where, orig_dir, low_dir))
-    sys.stdout.write(text)
+    conn, root, orig_dir, low_dir = open_store(args)
+    try:
+        if not orig_dir.is_dir():
+            raise SystemExit(f"no orig folder: {orig_dir}")
+        if low_dir is None or not low_dir.is_dir():
+            raise SystemExit(f"no low folder: {low_dir}")
+        text = format_stats(*library_stats_from_db(conn, orig_dir, low_dir))
+        sys.stdout.write(text)
+    finally:
+        conn.close()
 
 
 def parse_import_args(argv):
@@ -1401,8 +1626,9 @@ def parse_import_args(argv):
         "already sits on a rung is remuxed. Each master's low variants are "
         "written before the next master, unless --no-degrade",
     )
-    parser.add_argument("-o", "--orig", type=Path, default=EnvPath("orig"), help="master videos (default: %(default)s)")
-    parser.add_argument("-l", "--low", type=Path, default=EnvPath("low"), help="low variants, written unless --no-degrade (default: %(default)s)")
+    add_db_option(parser)
+    parser.add_argument("-o", "--orig", type=Path, default=None, help="master videos (default: dataset_root/orig from the database)")
+    parser.add_argument("-l", "--low", type=Path, default=None, help="low variants, written unless --no-degrade (default: dataset_root/low from the database)")
     parser.add_argument("-f", "--force", action="store_true", help="replace an existing master")
     parser.add_argument("--no-degrade", action="store_true", help="do not write the low variants of each new master")
     parser.add_argument(
@@ -1415,61 +1641,67 @@ def parse_import_args(argv):
 
 def import_main(argv):
     args = parse_import_args(argv)
-    args.orig = resolve_data(args.orig)
-    orig_dir = args.orig.expanduser().resolve()
-    root = orig_dir.parent
-    if args.dry_run:
-        if catalog_file(root).is_file():
-            catalog = open_catalog(root, create=False)
-        else:
-            catalog = empty_catalog()
-    else:
-        orig_dir.mkdir(parents=True, exist_ok=True)
-        catalog = open_catalog(root, create=True)
-    where = catalog_file(root)
-    rungs = rungs_of(catalog, where)
-    low_dir = None
-    selected = None
-    scale = flags = pix_fmt = None
-    if not args.no_degrade:
-        args.low = resolve_data(args.low)
-        low_dir = args.low.expanduser().resolve()
+    conn, root, orig_dir, low_dir = open_store(args)
+    try:
+        catalog = load_catalog_mirror(root, create=True, dry_run=args.dry_run)
         if not args.dry_run:
-            low_dir.mkdir(parents=True, exist_ok=True)
-        scale, flags, pix_fmt, variants = degrade_of(catalog, where)
-        selected = list(variants.items())
-    failed = False
-    for name in args.videos:
-        src = Path(name).expanduser().resolve()
-        prepared = prepare_import(
-            src, orig_dir, rungs, catalog, root,
-            dry_run=args.dry_run, force=args.force,
-        )
-        if prepared is None:
-            failed = True
-            continue
-        title, planned, probed = prepared
-        for item in planned:
-            written, one_failed = produce_planned(
-                src, title, [item], probed, orig_dir, args.force, catalog, root,
-                dry_run=args.dry_run,
+            orig_dir.mkdir(parents=True, exist_ok=True)
+        rungs = db.load_rungs(conn)
+        selected = None
+        scale = flags = pix_fmt = None
+        if not args.no_degrade:
+            if low_dir is None:
+                raise SystemExit("no low folder")
+            if not args.dry_run:
+                low_dir.mkdir(parents=True, exist_ok=True)
+            scale, flags, pix_fmt, variants = db.load_degrade(conn, enabled_only=True)
+            selected = select_variants(variants, None)
+        failed = False
+        for name in args.videos:
+            src = Path(name).expanduser().resolve()
+            prepared = prepare_import(
+                src, orig_dir, rungs, catalog, root,
+                dry_run=args.dry_run, force=args.force, conn=conn,
             )
-            failed = failed or one_failed
-            if args.no_degrade:
+            if prepared is None:
+                failed = True
                 continue
-            for master_name in written:
-                path = orig_dir / master_name
-                geometry = None
-                if args.dry_run and (args.force or not path.is_file()):
-                    geometry = planned_geometry(item, probed)
-                ok = degrade_master(
-                    path, low_dir, selected,
-                    scale, flags, pix_fmt, args.force, True, catalog, root,
-                    dry_run=args.dry_run, geometry=geometry,
+            title, planned, probed = prepared
+            for item in planned:
+                written, one_failed = produce_planned(
+                    src, title, [item], probed, orig_dir, args.force, catalog, root,
+                    dry_run=args.dry_run, conn=conn,
                 )
-                failed = failed or not ok
-    if failed:
-        raise SystemExit(1)
+                failed = failed or one_failed
+                if args.no_degrade:
+                    continue
+                for master_name in written:
+                    path = orig_dir / master_name
+                    geometry = None
+                    if args.dry_run and (args.force or not path.is_file()):
+                        geometry = planned_geometry(item, probed)
+                    ok = degrade_master(
+                        path, low_dir, selected,
+                        scale, flags, pix_fmt, args.force, True, catalog, root,
+                        dry_run=args.dry_run, geometry=geometry, conn=conn,
+                    )
+                    failed = failed or not ok
+        if failed:
+            raise SystemExit(1)
+    finally:
+        conn.close()
+
+
+def _title_names(conn, catalog, root):
+    names = [row[0] for row in conn.execute(
+        "SELECT name FROM sources WHERE enabled = 1 ORDER BY name"
+    )]
+    seen = set(names)
+    for title in titles_of(catalog, catalog_file(root)):
+        if title not in seen:
+            names.append(title)
+            seen.add(title)
+    return names
 
 
 def main(argv=None):
@@ -1482,40 +1714,44 @@ def main(argv=None):
         stats_main(argv[1:])
         return
     args = parse_args(argv)
-    args.orig = resolve_data(args.orig)
-    args.low = resolve_data(args.low)
-    orig_dir = args.orig.expanduser().resolve()
-    low_dir = args.low.expanduser().resolve()
-    if not orig_dir.is_dir():
-        raise SystemExit(f"no orig folder: {orig_dir}")
-    if not args.dry_run:
-        low_dir.mkdir(parents=True, exist_ok=True)
-    root = orig_dir.parent
-    catalog = open_catalog(root, create=False)
-    where = catalog_file(root)
-    scale, scale_flags, pix_fmt, variants = degrade_of(catalog, where)
-    selected = select_variants(variants, args.variants)
-    rungs = rungs_of(catalog, where)
-    titles = titles_of(catalog, where)
-    failed = False
-    if not args.videos:
-        for title in list(titles):
-            ok = finish_title(
-                title, orig_dir, rungs, low_dir, selected,
-                scale, scale_flags, pix_fmt, args.force, False, catalog, root,
-                dry_run=args.dry_run,
-            )
-            failed = failed or not ok
-    else:
-        sources, strict = sources_from_args(orig_dir, args.videos)
-        for src in sources:
-            ok = degrade_master(
-                src, low_dir, selected, scale, scale_flags, pix_fmt,
-                args.force, strict, catalog, root, dry_run=args.dry_run,
-            )
-            failed = failed or not ok
-    if failed:
-        raise SystemExit(1)
+    conn, root, orig_dir, low_dir = open_store(args)
+    try:
+        if not orig_dir.is_dir():
+            raise SystemExit(f"no orig folder: {orig_dir}")
+        if not args.dry_run:
+            low_dir.mkdir(parents=True, exist_ok=True)
+        catalog = load_catalog_mirror(root, create=False, dry_run=args.dry_run)
+        scale, scale_flags, pix_fmt, variants = db.load_degrade(conn, enabled_only=False)
+        enabled = {
+            row["name"]
+            for row in conn.execute("SELECT name FROM degrade_presets WHERE enabled = 1")
+        }
+        if args.variants is None:
+            variants = {name: args_ for name, args_ in variants.items() if name in enabled}
+        selected = select_variants(variants, args.variants)
+        rungs = db.load_rungs(conn)
+        failed = False
+        if not args.videos:
+            for title in _title_names(conn, catalog, root):
+                ok = finish_title(
+                    title, orig_dir, rungs, low_dir, selected,
+                    scale, scale_flags, pix_fmt, args.force, False, catalog, root,
+                    dry_run=args.dry_run, conn=conn,
+                )
+                failed = failed or not ok
+        else:
+            sources, strict = sources_from_args(orig_dir, args.videos)
+            for src in sources:
+                ok = degrade_master(
+                    src, low_dir, selected, scale, scale_flags, pix_fmt,
+                    args.force, strict, catalog, root, dry_run=args.dry_run,
+                    conn=conn,
+                )
+                failed = failed or not ok
+        if failed:
+            raise SystemExit(1)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
