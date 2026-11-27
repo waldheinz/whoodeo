@@ -13,6 +13,8 @@ SourceFile *source_open(const char *path, char *error, int errorLength);
 // frame rate and start_time; source_frame seeks backward and decodes forward.
 SourceFile *source_open_fast(const char *path, char *error, int errorLength);
 // Sets the picture count after a fast open (catalog/DB is authoritative).
+// Also corrects the frame rate when the container header still carries
+// the master's rate, as 2/1 low files written with -fps_mode passthrough do.
 int source_set_count(SourceFile *file, int count);
 void source_close(SourceFile *file);
 const char *source_error(const SourceFile *file);

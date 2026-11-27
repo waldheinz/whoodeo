@@ -9,6 +9,7 @@
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,6 +48,8 @@ struct SourceFile {
     int64_t startPts;
     AVRational frameRate;
     int clipped;
+    AVFrame *held;
+    int heldReady;
     char error[512];
 };
 
@@ -410,6 +413,7 @@ void source_close(SourceFile *file) {
     if (file == NULL) return;
     sws_freeContext(file->sws);
     av_freep(&file->rgb);
+    av_frame_free(&file->held);
     av_frame_free(&file->frame);
     av_packet_free(&file->packet);
     avcodec_free_context(&file->dec);
@@ -448,13 +452,80 @@ int source_time(const SourceFile *file, int index, int64_t *value, int32_t *time
     return 0;
 }
 
-int source_set_count(SourceFile *file, int count) {
-    if (file == NULL || !file->fast || count < 1) return -1;
-    file->count = count;
+// Container duration in seconds. Matroska often leaves the stream duration unset.
+static double container_seconds(const SourceFile *file) {
+    if (file == NULL || file->fmt == NULL) return 0;
+    if (file->video >= 0) {
+        AVStream *stream = file->fmt->streams[file->video];
+        if (stream != NULL && stream->duration != AV_NOPTS_VALUE && stream->duration > 0) {
+            return (double)stream->duration * av_q2d(stream->time_base);
+        }
+    }
+    if (file->fmt->duration > 0) {
+        return (double)file->fmt->duration / (double)AV_TIME_BASE;
+    }
     return 0;
 }
 
+// The MKV header of a 2/1 low file often keeps the master's frame rate
+// (`-fps_mode passthrough`). When the catalog has an authoritative frame
+// count, pick the rational (header, header/2, or a standard rate such as
+// 25/1) whose implied count is closest to that. A short packet-step would
+// drift on 29.97 files, because Matroska rounds those to 33/34 ms.
+static void snap_fast_rate(SourceFile *file, int count) {
+    if (file == NULL || !file->fast || count < 1) return;
+    double seconds = container_seconds(file);
+    if (!(seconds > 0)) return;
+    AVRational header = file->frameRate;
+    if (header.num <= 0 || header.den <= 0) header = (AVRational){25, 1};
+
+    AVRational raw[] = {
+        header,
+        av_mul_q(header, (AVRational){1, 2}),
+        av_mul_q(header, (AVRational){1, 3}),
+        {24, 1}, {25, 1}, {30, 1}, {50, 1}, {60, 1},
+        {24000, 1001}, {30000, 1001}, {60000, 1001}, {120000, 1001},
+    };
+    AVRational best = header;
+    double bestErr = 1e300;
+    for (size_t i = 0; i < sizeof raw / sizeof raw[0]; i++) {
+        int num = raw[i].num, den = raw[i].den;
+        if (num <= 0 || den <= 0) continue;
+        av_reduce(&num, &den, num, den, INT_MAX);
+        AVRational cand = {num, den};
+        double fps = av_q2d(cand);
+        if (!(fps > 0)) continue;
+        double err = fabs(seconds * fps - (double)count);
+        if (err < bestErr) {
+            bestErr = err;
+            best = cand;
+        }
+    }
+    // More than 2 % off is not a plausible rate; keep the header.
+    if (bestErr > 0.02 * (double)count) return;
+    file->frameRate = best;
+    file->fps = av_q2d(best);
+}
+
+int source_set_count(SourceFile *file, int count) {
+    if (file == NULL || !file->fast || count < 1) return -1;
+    file->count = count;
+    snap_fast_rate(file, count);
+    return 0;
+}
+
+static void drop_held(SourceFile *file) {
+    if (file->held != NULL) av_frame_unref(file->held);
+    file->heldReady = 0;
+}
+
 static int decode_one(SourceFile *file, AVFrame *frame) {
+    if (file->heldReady && file->held != NULL) {
+        av_frame_unref(frame);
+        av_frame_move_ref(frame, file->held);
+        file->heldReady = 0;
+        return 0;
+    }
     for (;;) {
         int got = avcodec_receive_frame(file->dec, frame);
         if (got == 0) return 0;
@@ -495,6 +566,7 @@ static int position(SourceFile *file, int index) {
     if (status < 0) return status;
     avcodec_flush_buffers(file->dec);
     file->inputEOF = 0;
+    drop_held(file);
     // A backward seek can land on the keyframe before the wanted one, a whole GOP early.
     // Skip packets until the wanted keyframe, or every frame after it is off by that GOP.
     for (;;) {
@@ -589,23 +661,70 @@ static int64_t frame_pts(const AVFrame *frame) {
 }
 
 // Seek backward to the keyframe before the target PTS, then decode forward
-// until that PTS. Leaves the wanted picture in file->frame.
+// and keep the picture whose PTS is nearest the target. 2/1 files can be
+// slightly VFR around an otherwise regular grid (fblend of a 59.94 master),
+// so the first PTS at or past the target can be the neighbour.
 static int position_fast(SourceFile *file, int index) {
     int64_t target = fast_pts(file, index);
     int status = av_seek_frame(file->fmt, file->video, target, AVSEEK_FLAG_BACKWARD);
     if (status < 0) return status;
     avcodec_flush_buffers(file->dec);
     file->inputEOF = 0;
+    drop_held(file);
+    AVFrame *prev = av_frame_alloc();
+    if (prev == NULL) return AVERROR(ENOMEM);
+    int havePrev = 0;
     for (;;) {
         status = decode_one(file, file->frame);
-        if (status < 0) return status;
+        if (status < 0) {
+            // Past the last picture: use it if we have one.
+            if (havePrev && (status == AVERROR_EOF || status == AVERROR(EPIPE))) {
+                av_frame_unref(file->frame);
+                av_frame_move_ref(file->frame, prev);
+                av_frame_free(&prev);
+                file->nextIndex = index;
+                file->positioned = 1;
+                return 0;
+            }
+            av_frame_free(&prev);
+            return status;
+        }
         int64_t pts = frame_pts(file->frame);
         if (pts == AV_NOPTS_VALUE || pts >= target) {
+            if (havePrev && pts != AV_NOPTS_VALUE) {
+                int64_t prevPts = frame_pts(prev);
+                if (prevPts != AV_NOPTS_VALUE) {
+                    int64_t toCur = pts - target;
+                    int64_t toPrev = target - prevPts;
+                    if (toPrev <= toCur) {
+                        // Keep the overshot picture so a following sequential
+                        // read (t, t+1) does not skip a frame.
+                        if (file->held == NULL) {
+                            file->held = av_frame_alloc();
+                            if (file->held == NULL) {
+                                av_frame_unref(file->frame);
+                                av_frame_move_ref(file->frame, prev);
+                                av_frame_free(&prev);
+                                file->nextIndex = index;
+                                file->positioned = 1;
+                                return 0;
+                            }
+                        }
+                        av_frame_unref(file->held);
+                        av_frame_move_ref(file->held, file->frame);
+                        file->heldReady = 1;
+                        av_frame_move_ref(file->frame, prev);
+                    }
+                }
+            }
+            av_frame_free(&prev);
             file->nextIndex = index;
             file->positioned = 1;
             return 0;
         }
-        av_frame_unref(file->frame);
+        av_frame_unref(prev);
+        av_frame_move_ref(prev, file->frame);
+        havePrev = 1;
     }
 }
 

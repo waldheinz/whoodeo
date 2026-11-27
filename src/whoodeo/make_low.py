@@ -26,6 +26,7 @@ degrade presets, and frames are that master's frame count once.
 
 import argparse
 import json
+import math
 import re
 import shlex
 import shutil
@@ -79,6 +80,26 @@ def describe_frames(variant, master_frames):
     if (num, den) == (1, 1):
         return str(expected)
     return f"{expected} (= {master_frames} * {den} // {num})"
+
+
+def scaled_frame_rate(master_rate, variant):
+    """Output (num, den) for a non-1:1 preset, else None.
+
+    A low file of a master with rate R and frame ratio num/den holds
+    master_frames * den // num frames, so its constant frame rate is
+    R * den / num. encode_variants uses this both as -r and as a trailing
+    setpts so the MKV header (r_frame_rate, avg_frame_rate, DefaultDuration)
+    matches the packet timestamps, instead of inheriting the master's rate
+    through -fps_mode passthrough.
+    """
+    num, den = frame_ratio(variant)
+    if (num, den) == (1, 1):
+        return None
+    rate_num, rate_den = master_rate
+    out_num = rate_num * den
+    out_den = rate_den * num
+    g = math.gcd(out_num, out_den)
+    return out_num // g, out_den // g
 
 
 # ffprobe matrix name → colorspace filter `all`/`iall` value.
@@ -577,19 +598,36 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
     low_h = height // scale
 
     count = len(todo)
+    try:
+        master_rate, _ = video_timing(src)
+    except RuntimeError as exc:
+        return fail_all(str(exc))
+
     split_labels = []
     branches = []
     encoder_args = []
+    output_rates = []
     for index, (variant, ffmpeg_args, out) in enumerate(todo):
         try:
             vf, rest = split_variant_vf(ffmpeg_args)
         except ValueError as exc:
             return fail_all(str(exc))
         encoder_args.append(rest)
-        if vf:
-            scoped = re.sub(r"\[([A-Za-z0-9_]+)\]", rf"[b{index}_\1]", vf)
+        rate = scaled_frame_rate(master_rate, variant)
+        output_rates.append(rate)
+        # Non-1:1 filters keep fewer frames but, with passthrough, would
+        # leave the master's r_frame_rate in the MKV header. setpts plus
+        # -r/-fps_mode cfr writes a constant rate that matches the new
+        # spacing without dropping or duplicating a frame. 1:1 variants
+        # stay on passthrough so existing timestamps are left alone.
+        retimestamp = (
+            f"setpts=N/({rate[0]}/{rate[1]}*TB)" if rate is not None else None
+        )
+        if vf or retimestamp:
+            scoped = re.sub(r"\[([A-Za-z0-9_]+)\]", rf"[b{index}_\1]", vf) if vf else ""
+            filt = ",".join(part for part in (scoped, retimestamp) if part)
             split_labels.append(f"[s{index}]")
-            branches.append(f"[s{index}]{scoped}[v{index}]")
+            branches.append(f"[s{index}]{filt}[v{index}]")
         else:
             split_labels.append(f"[v{index}]")
     graph = (
@@ -600,17 +638,24 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
         graph += ";" + ";".join(branches)
     outputs = []
     temps = []
-    for index, ((variant, ffmpeg_args, out), rest) in enumerate(zip(todo, encoder_args)):
+    for index, ((variant, ffmpeg_args, out), rest, rate) in enumerate(
+        zip(todo, encoder_args, output_rates)
+    ):
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
         tmp.unlink(missing_ok=True)
         temps.append(tmp)
         say(f"encode {variant}/{name}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", verbose)
+        rate_args = (
+            ["-r", f"{rate[0]}/{rate[1]}", "-fps_mode", "cfr"]
+            if rate is not None else
+            ["-fps_mode", "passthrough"]
+        )
         outputs += [
             "-map", f"[v{index}]", "-an",
             *rest,
             "-pix_fmt", pix_fmt,
-            "-fps_mode", "passthrough",
+            *rate_args,
             str(tmp),
         ]
     command = [
