@@ -18,7 +18,10 @@ enum ValPreview {
     struct Sample: Codable, Equatable, Identifiable, Sendable {
         var index: Int
         var name: String
+        /// Master frame of `orig`.
         var frame: Int
+        /// Center low frame of `low`, when it differs from `frame` (frame ratio not 1/1).
+        var lowFrame: Int?
         var rung: String
         var preset: String
         var psnr: Double?
@@ -30,7 +33,11 @@ enum ValPreview {
             var parts = [name]
             if !preset.isEmpty { parts.append(preset) }
             if !rung.isEmpty { parts.append("rung \(rung)") }
-            parts.append("Bild \(frame + 1)")
+            if let lowFrame, lowFrame != frame {
+                parts.append("Bild \(frame + 1) (low \(lowFrame + 1))")
+            } else {
+                parts.append("Bild \(frame + 1)")
+            }
             if let psnr { parts.append(String(format: "PSNR %.2f", psnr)) }
             if let ssim { parts.append(String(format: "SSIM %.3f", ssim)) }
             return parts.joined(separator: " · ")
@@ -118,7 +125,8 @@ enum ValPreview {
             try PlaygroundImage.savePNG(origImage, to: folder.appendingPathComponent(String(format: "sample-%02d-orig.png", index)))
             let info = sample.meta
             rows.append(Sample(
-                index: index, name: info.name, frame: info.frame, rung: info.rung, preset: info.preset,
+                index: index, name: info.name, frame: info.frame,
+                lowFrame: info.lowFrame == info.frame ? nil : info.lowFrame, rung: info.rung, preset: info.preset,
                 psnr: psnr, ssim: ssim
             ))
         }

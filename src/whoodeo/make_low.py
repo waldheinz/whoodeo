@@ -63,6 +63,30 @@ HDR_TRANSFER = {"smpte2084", "arib-std-b67"}
 HDR_PRIMARIES = {"bt2020"}
 HDR_MATRIX = {"bt2020nc", "bt2020c", "bt2020ncl"}
 INTERLACED = {"tt", "bb", "tb", "bt"}
+# Preset name → (frame_ratio_num, frame_ratio_den) from degrade_presets.
+# A low file of a master with N frames has N * den // num frames, and low
+# frame k trains against master frame (k * num + den // 2) // den. Presets
+# not listed here are 1/1.
+FRAME_RATIOS = {}
+
+
+def frame_ratio(variant):
+    return FRAME_RATIOS.get(variant, (1, 1))
+
+
+def expected_low_frames(variant, master_frames):
+    num, den = frame_ratio(variant)
+    return db.expected_low_frames(master_frames, num, den)
+
+
+def describe_frames(variant, master_frames):
+    num, den = frame_ratio(variant)
+    expected = db.expected_low_frames(master_frames, num, den)
+    if (num, den) == (1, 1):
+        return str(expected)
+    return f"{expected} (= {master_frames} * {den} // {num})"
+
+
 # ffprobe matrix name → colorspace filter `all`/`iall` value.
 MATRIX_ALL = {
     "bt709": "bt709",
@@ -322,12 +346,31 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
             continue
         out = low_dir / variant / name
         if out.exists() and not force:
-            print(f"keep {label}", flush=True)
             try:
-                results[variant] = packets_of(out)
+                kept = packets_of(out)
             except RuntimeError as exc:
                 print(f"{label}: {exc}", file=sys.stderr)
                 results[variant] = None
+                continue
+            # A preset whose frame ratio is not 1/1 may have an older 1/1 file
+            # on disk (written before the ratio was set). That file is stale.
+            if frame_ratio(variant) != (1, 1):
+                try:
+                    master_frames = packets_of(src)
+                except RuntimeError as exc:
+                    print(f"{label}: {exc}", file=sys.stderr)
+                    results[variant] = None
+                    continue
+                if kept != expected_low_frames(variant, master_frames):
+                    print(
+                        f"stale {label}: {kept} frames, expected "
+                        f"{describe_frames(variant, master_frames)}; re-encode",
+                        flush=True,
+                    )
+                    todo.append((variant, ffmpeg_args, out))
+                    continue
+            print(f"keep {label}", flush=True)
+            results[variant] = kept
             continue
         todo.append((variant, ffmpeg_args, out))
     if not todo:
@@ -420,8 +463,11 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
         problem = None
         if out_size != (low_w, low_h):
             problem = f"output is {out_size[0]}x{out_size[1]}, expected {low_w}x{low_h}"
-        elif in_packets != out_packets:
-            problem = f"{in_packets} input frames, {out_packets} output frames"
+        elif out_packets != expected_low_frames(variant, in_packets):
+            problem = (
+                f"{in_packets} input frames, {out_packets} output frames, "
+                f"expected {describe_frames(variant, in_packets)}"
+            )
         elif audio:
             problem = "output still has audio"
         if problem:
@@ -1216,10 +1262,12 @@ def degrade_master(
             continue
         if frames < 0:
             continue
-        if entry.get("frames") != frames:
+        master_frames = entry.get("frames")
+        if not isinstance(master_frames, int) or frames != expected_low_frames(variant, master_frames):
             print(
-                f"{variant}/{src.name}: {frames} frames, "
-                f"catalog says {entry.get('frames')}",
+                f"{variant}/{src.name}: {frames} frames, catalog says "
+                f"{master_frames} master frames, expected "
+                f"{describe_frames(variant, master_frames) if isinstance(master_frames, int) else '?'}",
                 file=sys.stderr,
             )
             failed = True
@@ -1449,7 +1497,8 @@ def library_stats(catalog, where, orig_dir, low_dir):
 
 def library_stats_from_db(conn, orig_dir, low_dir):
     """Ready films grouped by master size, plus masters that are not ready."""
-    scale, _, _, variants = db.load_degrade(conn, enabled_only=True)
+    scale, _, _, variants, ratios = db.load_degrade_ratios(conn, enabled_only=True)
+    FRAME_RATIOS.update(ratios)
     recipe = list(variants)
     groups = {}
     gaps = []
@@ -1654,7 +1703,8 @@ def import_main(argv):
                 raise SystemExit("no low folder")
             if not args.dry_run:
                 low_dir.mkdir(parents=True, exist_ok=True)
-            scale, flags, pix_fmt, variants = db.load_degrade(conn, enabled_only=True)
+            scale, flags, pix_fmt, variants, ratios = db.load_degrade_ratios(conn, enabled_only=True)
+            FRAME_RATIOS.update(ratios)
             selected = select_variants(variants, None)
         failed = False
         for name in args.videos:
@@ -1721,7 +1771,8 @@ def main(argv=None):
         if not args.dry_run:
             low_dir.mkdir(parents=True, exist_ok=True)
         catalog = load_catalog_mirror(root, create=False, dry_run=args.dry_run)
-        scale, scale_flags, pix_fmt, variants = db.load_degrade(conn, enabled_only=False)
+        scale, scale_flags, pix_fmt, variants, ratios = db.load_degrade_ratios(conn, enabled_only=False)
+        FRAME_RATIOS.update(ratios)
         enabled = {
             row["name"]
             for row in conn.execute("SELECT name FROM degrade_presets WHERE enabled = 1")

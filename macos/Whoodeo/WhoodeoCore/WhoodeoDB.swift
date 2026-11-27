@@ -17,7 +17,7 @@ nonisolated struct WhoodeoDBError: Error, LocalizedError, CustomStringConvertibl
 /// separate `whoodeo-train` process commits as soon as it commits. Writes from both processes
 /// wait up to 5 s for each other (`busy_timeout`).
 nonisolated final class WhoodeoDB: Sendable {
-    static let schemaVersion = 2
+    static let schemaVersion = 3
 
     static let shared: WhoodeoDB? = {
         do {
@@ -359,7 +359,7 @@ nonisolated final class WhoodeoDB: Sendable {
     func trainingPairs(split: String, rungs: [String], presets: [String]) throws -> [TrainingPair] {
         var sql = """
             SELECT s.id AS source_id, s.name, s.frames, s.split, m.rung, m.rel_path AS orig_rel_path, m.width, m.height,
-                   v.preset, p.codec, v.rel_path AS low_rel_path
+                   v.preset, p.codec, p.frame_ratio_num, p.frame_ratio_den, v.rel_path AS low_rel_path
             FROM sources s
             JOIN source_masters m ON m.source_id = s.id
             JOIN source_variants v ON v.master_id = m.id
@@ -616,7 +616,16 @@ nonisolated final class WhoodeoDB: Sendable {
         var codec: String
         var ffmpegArgs: String
         var notes: String?
+        /// Low frame k trains against master frame `(k * num + den / 2) / den`;
+        /// a low file has `masterFrames * den / num` frames.
+        var frameRatioNum: Int = 1
+        var frameRatioDen: Int = 1
     }
+
+    /// True 50i → 25p blend: disjoint pairs, one low frame per two master frames.
+    static let blendMpeg4Args = "-vf \"tmix=frames=2:weights='1 1',select='eq(mod(n\\,2)\\,1)'\" -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
+    static let blendMpeg4Notes = "Echtes 50i->25p-Blend-Deinterlacing (wie Avantgarde Extreme 34): disjunkte Paare L[k] = 0.5*M[2k] + 0.5*M[2k+1] (tmix 1 1 + select jedes 2. Bild, floor(N/2) Frames, pts von M[2k+1]). frame_ratio = 2/1: Ziel von L[k] ist M[2k], also immer das fruehere Halbbild. Im 3-Frame-Fenster (L[k-1], L[k], L[k+1]) gibt es keine gemeinsame Quelle zwischen Nachbarn (wie im echten Film), die Bewegungsrichtung aus L[k-1]/L[k+1] entscheidet, welcher der beiden Geister M[2k] ist."
+
 
     /// Seed recipes shared by a new database, the v1→v2 migration, and catalog import.
     static let builtInPresets: [BuiltInPreset] = [
@@ -626,18 +635,21 @@ nonisolated final class WhoodeoDB: Sendable {
         .init(name: "x264-crf24", codec: "h264", ffmpegArgs: "-c:v libx264 -crf 24 -preset medium", notes: "H.264 CRF 24"),
         .init(name: "mpeg4-q04", codec: "mpeg4", ffmpegArgs: "-c:v mpeg4 -q:v 4 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "MPEG-4 q=4"),
         .init(name: "mpeg4-q06", codec: "mpeg4", ffmpegArgs: "-c:v mpeg4 -q:v 6 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "MPEG-4 q=6"),
-        .init(name: "blend-mpeg4-q05", codec: "mpeg4", ffmpegArgs: "-vf tmix=frames=2:weights='1 1' -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1", notes: "50/50 2-frame blend, MPEG-4"),
+        .init(name: "blend-mpeg4-q05", codec: "mpeg4", ffmpegArgs: blendMpeg4Args, notes: blendMpeg4Notes, frameRatioNum: 2, frameRatioDen: 1),
         .init(name: "fblend-x264-crf22", codec: "h264", ffmpegArgs: "-vf \"split=3[c][p][n];[p]tpad=start=1:start_mode=clone,setpts=PTS-STARTPTS[p0];[c]setpts=PTS-STARTPTS[c0];[n]tpad=stop=1:stop_mode=clone,trim=start_frame=1,setpts=PTS-STARTPTS[n0];[c0][p0]blend=shortest=1:all_expr='if(eq(mod(N,6),1),0.83*A+0.17*B,if(eq(mod(N,6),2),0.67*A+0.33*B,if(eq(mod(N,6),3),0.5*A+0.5*B,A)))'[cp];[cp][n0]blend=shortest=1:all_expr='if(eq(mod(N,6),4),0.67*A+0.33*B,if(eq(mod(N,6),5),0.83*A+0.17*B,A))'\" -c:v libx264 -crf 22 -preset medium", notes: "6-phase 2-frame blend, H.264"),
     ]
 
     static func upsertPreset(
         _ db: Database, name: String, codec: String, ffmpegArgs: String,
         scale: Int = 2, scaleFlags: String = "bicubic", pixFmt: String = "yuv420p",
-        notes: String? = nil, enabled: Int = 1
+        notes: String? = nil, enabled: Int = 1, frameRatioNum: Int = 1, frameRatioDen: Int = 1
     ) throws {
+        guard frameRatioNum > 0, frameRatioDen > 0 else {
+            throw WhoodeoDBError("\(name): frame_ratio \(frameRatioNum)/\(frameRatioDen) muss positiv sein")
+        }
         try db.execute(sql: """
-            INSERT INTO degrade_presets(name, codec, ffmpeg_args, scale, scale_flags, pix_fmt, notes, enabled)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO degrade_presets(name, codec, ffmpeg_args, scale, scale_flags, pix_fmt, notes, enabled, frame_ratio_num, frame_ratio_den)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 codec = excluded.codec,
                 ffmpeg_args = excluded.ffmpeg_args,
@@ -645,36 +657,57 @@ nonisolated final class WhoodeoDB: Sendable {
                 scale_flags = excluded.scale_flags,
                 pix_fmt = excluded.pix_fmt,
                 notes = excluded.notes,
-                enabled = excluded.enabled
-            """, arguments: [name, codec, ffmpegArgs, scale, scaleFlags, pixFmt, notes, enabled])
+                enabled = excluded.enabled,
+                frame_ratio_num = excluded.frame_ratio_num,
+                frame_ratio_den = excluded.frame_ratio_den
+            """, arguments: [name, codec, ffmpegArgs, scale, scaleFlags, pixFmt, notes, enabled, frameRatioNum, frameRatioDen])
+    }
+
+    /// Built-in frame ratio of a preset name, 1/1 when it is not built in.
+    static func builtInFrameRatio(_ name: String) -> (num: Int, den: Int) {
+        guard let preset = builtInPresets.first(where: { $0.name == name }) else { return (1, 1) }
+        return (preset.frameRatioNum, preset.frameRatioDen)
     }
 
     static func seedBuiltInPresets(_ db: Database) throws {
         for preset in builtInPresets {
             try upsertPreset(
                 db, name: preset.name, codec: preset.codec, ffmpegArgs: preset.ffmpegArgs,
-                notes: preset.notes
+                notes: preset.notes, frameRatioNum: preset.frameRatioNum, frameRatioDen: preset.frameRatioDen
             )
         }
     }
 
-    /// Creates schema 2 on a new database, or upgrades an existing schema 1 database.
+    /// Creates schema 3 on a new database, or upgrades an existing schema 1 or 2 database.
     private static func migrate(_ db: Database) throws {
         let version = try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0
         guard version < schemaVersion else { return }
-        if version == 0 {
-            try createV2Schema(db)
-        } else if version == 1 {
+        switch version {
+        case 0:
+            try createSchema(db)
+        case 1:
             try migrateV1toV2(db)
-        } else {
-            throw WhoodeoDBError("Unbekannte Datenbank-Version \(version), erwartet 0 oder 1")
+            try migrateV2toV3(db)
+        case 2:
+            try migrateV2toV3(db)
+        default:
+            throw WhoodeoDBError("Unbekannte Datenbank-Version \(version), erwartet 0, 1 oder 2")
         }
         try setSetting(db, String(schemaVersion), forKey: "schema_version")
-        try setSetting(db, defaultRungsJSON, forKey: "rungs")
+        // v2 already carries the user's rungs; only a new or v1 database gets the defaults.
+        if version < 2 {
+            try setSetting(db, defaultRungsJSON, forKey: "rungs")
+        }
         try db.execute(sql: "PRAGMA user_version = \(schemaVersion)")
     }
 
-    private static func createV2Schema(_ db: Database) throws {
+    /// Columns of `degrade_presets` added in schema 3, in CREATE TABLE form.
+    private static let frameRatioColumns = """
+                frame_ratio_num INTEGER NOT NULL DEFAULT 1 CHECK(frame_ratio_num > 0),
+                frame_ratio_den INTEGER NOT NULL DEFAULT 1 CHECK(frame_ratio_den > 0)
+    """
+
+    private static func createSchema(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -688,7 +721,8 @@ nonisolated final class WhoodeoDB: Sendable {
                 scale_flags TEXT NOT NULL DEFAULT 'bicubic',
                 pix_fmt TEXT NOT NULL DEFAULT 'yuv420p',
                 notes TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1
+                enabled INTEGER NOT NULL DEFAULT 1,
+            \(frameRatioColumns)
             );
             CREATE TABLE IF NOT EXISTS sources (
                 id INTEGER PRIMARY KEY,
@@ -786,7 +820,8 @@ nonisolated final class WhoodeoDB: Sendable {
                 scale_flags TEXT NOT NULL DEFAULT 'bicubic',
                 pix_fmt TEXT NOT NULL DEFAULT 'yuv420p',
                 notes TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1
+                enabled INTEGER NOT NULL DEFAULT 1,
+            \(frameRatioColumns)
             );
             """)
         try seedBuiltInPresets(db)
@@ -810,5 +845,33 @@ nonisolated final class WhoodeoDB: Sendable {
             DROP TABLE source_variants;
             ALTER TABLE source_variants_new RENAME TO source_variants;
             """)
+    }
+
+    /// Adds `frame_ratio_num` / `frame_ratio_den` and switches `blend-mpeg4-q05` to true
+    /// 50i → 25p disjoint pairs (2/1). Its `source_variants` rows were written by the old
+    /// 1:1 filter, so they are dropped from the database (the files stay on disk; make-low
+    /// sees their frame count is stale and re-encodes them).
+    private static func migrateV2toV3(_ db: Database) throws {
+        let columns = Set(try Row.fetchAll(db, sql: "PRAGMA table_info(degrade_presets)").map { $0["name"] as String })
+        if !columns.contains("frame_ratio_num") {
+            try db.execute(sql: "ALTER TABLE degrade_presets ADD COLUMN frame_ratio_num INTEGER NOT NULL DEFAULT 1 CHECK(frame_ratio_num > 0)")
+        }
+        if !columns.contains("frame_ratio_den") {
+            try db.execute(sql: "ALTER TABLE degrade_presets ADD COLUMN frame_ratio_den INTEGER NOT NULL DEFAULT 1 CHECK(frame_ratio_den > 0)")
+        }
+        let blend = try Row.fetchOne(
+            db, sql: "SELECT frame_ratio_num, frame_ratio_den FROM degrade_presets WHERE name = 'blend-mpeg4-q05'"
+        )
+        if let blend {
+            let wasOneToOne = (blend["frame_ratio_num"] as Int) == 1 && (blend["frame_ratio_den"] as Int) == 1
+            try db.execute(sql: """
+                UPDATE degrade_presets
+                SET ffmpeg_args = ?, notes = ?, frame_ratio_num = 2, frame_ratio_den = 1
+                WHERE name = 'blend-mpeg4-q05'
+                """, arguments: [blendMpeg4Args, blendMpeg4Notes])
+            if wasOneToOne {
+                try db.execute(sql: "DELETE FROM source_variants WHERE preset = 'blend-mpeg4-q05'")
+            }
+        }
     }
 }

@@ -78,7 +78,20 @@ nonisolated struct TrainingPair: Equatable, Sendable {
     var height: Int
     var preset: String
     var codec: String
+    /// Low frame k trains against master frame `(k * frameRatioNum + frameRatioDen / 2) / frameRatioDen`.
+    var frameRatioNum: Int = 1
+    var frameRatioDen: Int = 1
     var lowRelPath: String
+
+    /// Frames the low file has for `masterFrames` master frames.
+    func lowFrames(masterFrames: Int) -> Int {
+        masterFrames * frameRatioDen / frameRatioNum
+    }
+
+    /// Master frame that is the target of low frame `lowIndex`.
+    func masterIndex(lowIndex: Int) -> Int {
+        (lowIndex * frameRatioNum + frameRatioDen / 2) / frameRatioDen
+    }
 }
 
 nonisolated extension RunRecord: FetchableRecord {
@@ -127,7 +140,9 @@ nonisolated extension TrainingPair: FetchableRecord {
         self.init(
             sourceID: row["source_id"], name: row["name"], frames: row["frames"], split: row["split"],
             rung: row["rung"], origRelPath: row["orig_rel_path"], width: row["width"], height: row["height"],
-            preset: row["preset"], codec: row["codec"], lowRelPath: row["low_rel_path"]
+            preset: row["preset"], codec: row["codec"],
+            frameRatioNum: row["frame_ratio_num"] ?? 1, frameRatioDen: row["frame_ratio_den"] ?? 1,
+            lowRelPath: row["low_rel_path"]
         )
     }
 }

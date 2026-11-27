@@ -228,12 +228,21 @@ nonisolated extension WhoodeoDB {
             let scale = Self.intValue(degrade["scale"]) ?? 2
             let flags = (degrade["scale_flags"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "bicubic"
             let pix = (degrade["pix_fmt"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "yuv420p"
+            // Optional `frame_ratios: {name: [num, den]}`; otherwise the built-in ratio (1/1 if unknown).
+            let ratios = degrade["frame_ratios"] as? [String: Any] ?? [:]
             if let variants = degrade["variants"] as? [String: Any] {
                 for (name, raw) in variants.sorted(by: { $0.key < $1.key }) {
                     guard let args = raw as? String, !args.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                    var ratio = WhoodeoDB.builtInFrameRatio(name)
+                    if let pair = ratios[name] as? [Any], pair.count == 2,
+                       let num = Self.intValue(pair[0]), let den = Self.intValue(pair[1]), num > 0, den > 0
+                    {
+                        ratio = (num, den)
+                    }
                     try WhoodeoDB.upsertPreset(
                         db, name: name, codec: codec(forPreset: name), ffmpegArgs: args,
-                        scale: scale, scaleFlags: flags, pixFmt: pix
+                        scale: scale, scaleFlags: flags, pixFmt: pix,
+                        frameRatioNum: ratio.num, frameRatioDen: ratio.den
                     )
                 }
             }
@@ -251,7 +260,11 @@ nonisolated extension WhoodeoDB {
         if try String.fetchOne(db, sql: "SELECT name FROM degrade_presets WHERE name = ?", arguments: [name]) != nil {
             return
         }
-        try WhoodeoDB.upsertPreset(db, name: name, codec: codec(forPreset: name), ffmpegArgs: "")
+        let ratio = WhoodeoDB.builtInFrameRatio(name)
+        try WhoodeoDB.upsertPreset(
+            db, name: name, codec: codec(forPreset: name), ffmpegArgs: "",
+            frameRatioNum: ratio.num, frameRatioDen: ratio.den
+        )
     }
 
     static func collectPackages(in folder: URL) -> [URL] {

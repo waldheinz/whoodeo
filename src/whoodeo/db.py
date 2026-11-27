@@ -82,10 +82,31 @@ def load_rungs(conn):
     return DEFAULT_RUNGS
 
 
+def frame_ratio_columns(conn):
+    """True when degrade_presets has frame_ratio_num / frame_ratio_den (schema v3)."""
+    names = {row[1] for row in conn.execute("PRAGMA table_info(degrade_presets)")}
+    return "frame_ratio_num" in names and "frame_ratio_den" in names
+
+
 def load_degrade(conn, enabled_only=True):
     """Shared scale / flags / pix_fmt and an ordered {name: ffmpeg_args} map."""
+    scale, flags, pix_fmt, variants, _ = load_degrade_ratios(conn, enabled_only)
+    return scale, flags, pix_fmt, variants
+
+
+def load_degrade_ratios(conn, enabled_only=True):
+    """Like load_degrade, plus {name: (frame_ratio_num, frame_ratio_den)}.
+
+    master_idx = (low_idx * num + den // 2) // den, and a low file has
+    expected_low_frames(master_frames, num, den) frames. A database without
+    the columns (schema v2) reads 1/1 for every preset.
+    """
+    ratio_sql = (
+        "frame_ratio_num, frame_ratio_den" if frame_ratio_columns(conn)
+        else "1 AS frame_ratio_num, 1 AS frame_ratio_den"
+    )
     sql = (
-        "SELECT name, ffmpeg_args, scale, scale_flags, pix_fmt, enabled "
+        f"SELECT name, ffmpeg_args, scale, scale_flags, pix_fmt, enabled, {ratio_sql} "
         "FROM degrade_presets ORDER BY name"
     )
     rows = conn.execute(sql).fetchall()
@@ -94,9 +115,14 @@ def load_degrade(conn, enabled_only=True):
     if not rows:
         raise SystemExit("no degrade presets in the database")
     variants = {}
+    ratios = {}
     metas = []
     for row in rows:
+        num, den = row["frame_ratio_num"], row["frame_ratio_den"]
+        if not isinstance(num, int) or not isinstance(den, int) or num < 1 or den < 1:
+            raise SystemExit(f"degrade preset {row['name']}: bad frame_ratio {num!r}/{den!r}")
         variants[row["name"]] = row["ffmpeg_args"]
+        ratios[row["name"]] = (num, den)
         metas.append((row["scale"], row["scale_flags"], row["pix_fmt"]))
     unique = set(metas)
     if len(unique) != 1:
@@ -105,7 +131,17 @@ def load_degrade(conn, enabled_only=True):
             f"selected degrade presets do not share scale/flags/pix_fmt: {names}"
         )
     scale, flags, pix_fmt = metas[0]
-    return scale, flags, pix_fmt, variants
+    return scale, flags, pix_fmt, variants, ratios
+
+
+def expected_low_frames(master_frames, num=1, den=1):
+    """Frames a low file must have for a master of master_frames frames."""
+    return (master_frames * den) // num
+
+
+def master_index(low_idx, num=1, den=1):
+    """Master frame that is the target of low frame low_idx."""
+    return (low_idx * num + den // 2) // den
 
 
 def remember_source(conn, name, origin_path=None, frames=None, now=None):

@@ -4,7 +4,10 @@ import MLX
 /// One packed training example: 3 low frames, the master at t, and the codec vector.
 struct TrainSampleMeta: Sendable {
     var name: String
+    /// Master frame of the target (`high`).
     var frame: Int
+    /// Center low frame of the input; equals `frame` for a 1/1 preset.
+    var lowFrame: Int
     var rung: String
     var preset: String
     var codec: String
@@ -54,7 +57,11 @@ final class TrainDataset {
                 skipped += 1
                 continue
             }
-            if pair.frames < 1 {
+            if pair.frames < 1 || pair.frameRatioNum < 1 || pair.frameRatioDen < 1 {
+                skipped += 1
+                continue
+            }
+            if (pair.frameRatioNum, pair.frameRatioDen) != (1, 1), pair.lowFrames(masterFrames: pair.frames) < 3 {
                 skipped += 1
                 continue
             }
@@ -178,12 +185,31 @@ final class TrainCursor {
         let origURL = root.appendingPathComponent(pair.origRelPath)
         let lowURL = root.appendingPathComponent(pair.lowRelPath)
         let orig = try handles.open(origURL, frames: pair.frames)
-        let low = try handles.open(lowURL, frames: pair.frames)
-        let frames = min(orig.count, low.count, pair.frames)
-        if frames < 1 { return nil }
-        let t = Int(rng.next() % UInt64(frames))
-        let prev = max(t - 1, 0)
-        let next = min(t + 1, frames - 1)
+        // A low file of a non-1/1 preset has its own frame count (e.g. 2/1: floor(N / 2)).
+        let low = try handles.open(lowURL, frames: pair.lowFrames(masterFrames: pair.frames))
+        let t: Int      // center low frame
+        let target: Int // master frame trained against L[t]
+        let prev: Int
+        let next: Int
+        if (pair.frameRatioNum, pair.frameRatioDen) == (1, 1) {
+            let frames = min(orig.count, low.count, pair.frames)
+            if frames < 1 { return nil }
+            t = Int(rng.next() % UInt64(frames))
+            target = t
+            prev = max(t - 1, 0)
+            next = min(t + 1, frames - 1)
+        } else {
+            // Interior low frames only, so L[t-1] and L[t+1] are real neighbours,
+            // and M[target] must exist in the master.
+            let masterCount = min(orig.count, pair.frames)
+            var lastLow = low.count - 2
+            while lastLow >= 1, pair.masterIndex(lowIndex: lastLow) > masterCount - 1 { lastLow -= 1 }
+            if lastLow < 1 { return nil }
+            t = 1 + Int(rng.next() % UInt64(lastLow))
+            target = pair.masterIndex(lowIndex: t)
+            prev = t - 1
+            next = t + 1
+        }
         var ox = 0, oy = 0, cropW = orig.width, cropH = orig.height
         if let crop = config.cropSize {
             guard let origin = randomOrigin(width: orig.width, height: orig.height, crop: crop, rng: &rng) else {
@@ -205,7 +231,7 @@ final class TrainCursor {
             try low.crop(frame: t, x: lx, y: ly, width: lw, height: lh),
             try low.crop(frame: next, x: lx, y: ly, width: lw, height: lh),
         ]
-        let highPlane = try orig.crop(frame: t, x: ox, y: oy, width: cropW, height: cropH)
+        let highPlane = try orig.crop(frame: target, x: ox, y: oy, width: cropW, height: cropH)
         let lowNHWC = TrainDataset.packLow(lowPlanes, width: lw, height: lh)
         let highNHWC = TrainDataset.planarToNHWC(highPlane, width: cropW, height: cropH)
         let detected = SourceCodec.detect(ffmpegName: pair.codec)
@@ -218,7 +244,7 @@ final class TrainCursor {
             condition: MLXArray(vector, [1, config.conditionSize]),
             unknown: unknown,
             meta: TrainSampleMeta(
-                name: pair.name, frame: t, rung: pair.rung, preset: pair.preset, codec: pair.codec
+                name: pair.name, frame: target, lowFrame: t, rung: pair.rung, preset: pair.preset, codec: pair.codec
             )
         )
     }

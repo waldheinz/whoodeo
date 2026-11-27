@@ -12,8 +12,15 @@ variants:
   x264-crf24: "-c:v libx264 -crf 24 -preset medium"
   mpeg4-q04: "-c:v mpeg4 -q:v 4 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
   mpeg4-q06: "-c:v mpeg4 -q:v 6 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
-  # Field-blend like 50i/60i -> 25p/30p (same frame count: 0.5*F(t-1)+0.5*F(t)).
+  # True 50i -> 25p field blend: disjoint pairs, low[k] = 0.5*M[2k] + 0.5*M[2k+1],
+  # floor(N/2) frames (select keeps every 2nd tmix output, pts of M[2k+1]).
+  # The training target of low[k] is M[2k], see frame_ratios below.
   # tmix not tblend: tblend drops one frame under -fps_mode passthrough.
-  blend-mpeg4-q05: "-vf tmix=frames=2:weights='1 1' -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
+  blend-mpeg4-q05: "-vf \"tmix=frames=2:weights='1 1',select='eq(mod(n\\,2)\\,1)'\" -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
   # 25<->30p-style 6-phase 2-frame blend (trailing t-1 & leading t+1, at most 1 ghost), then H.264.
   fblend-x264-crf22: "-vf \"split=3[c][p][n];[p]tpad=start=1:start_mode=clone,setpts=PTS-STARTPTS[p0];[c]setpts=PTS-STARTPTS[c0];[n]tpad=stop=1:stop_mode=clone,trim=start_frame=1,setpts=PTS-STARTPTS[n0];[c0][p0]blend=shortest=1:all_expr='if(eq(mod(N,6),1),0.83*A+0.17*B,if(eq(mod(N,6),2),0.67*A+0.33*B,if(eq(mod(N,6),3),0.5*A+0.5*B,A)))'[cp];[cp][n0]blend=shortest=1:all_expr='if(eq(mod(N,6),4),0.67*A+0.33*B,if(eq(mod(N,6),5),0.83*A+0.17*B,A))'\" -c:v libx264 -crf 22 -preset medium"
+# Frame ratio num/den per variant (default 1/1): a low file has
+# master_frames * den // num frames, and low frame k trains against master
+# frame (k * num + den // 2) // den.
+frame_ratios:
+  blend-mpeg4-q05: [2, 1]
