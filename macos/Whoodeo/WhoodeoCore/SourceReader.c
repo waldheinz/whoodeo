@@ -46,6 +46,7 @@ struct SourceFile {
     int fast;
     int64_t startPts;
     AVRational frameRate;
+    int clipped;
     char error[512];
 };
 
@@ -100,6 +101,16 @@ static int grow_timeline(SourceFile *file, int count) {
     return 0;
 }
 
+// False when the index or packet points past the end of a truncated file.
+static int data_in_file(const SourceFile *file, int64_t pos, int size) {
+    if (file->fmt == NULL || file->fmt->pb == NULL) return 1;
+    int64_t fileSize = avio_size(file->fmt->pb);
+    if (fileSize <= 0 || pos < 0) return 1;
+    if (pos >= fileSize) return 0;
+    if (size > 0 && pos + (int64_t)size > fileSize) return 0;
+    return 1;
+}
+
 static int timeline_from_index(SourceFile *file, AVStream *stream) {
     int entries = avformat_index_get_entries_count(stream);
     if (entries <= 0) return -1;
@@ -107,10 +118,16 @@ static int timeline_from_index(SourceFile *file, AVStream *stream) {
     int count = 0;
     int64_t previous = INT64_MIN;
     int backward = 0;
+    int clipped = 0;
     for (int i = 0; i < entries; i++) {
         const AVIndexEntry *entry = avformat_index_get_entry(stream, i);
         if (entry == NULL) return -1;
         if (entry->flags & AVINDEX_DISCARD_FRAME) continue;
+        // An MP4 moov can list samples whose bytes sit past a truncated mdat.
+        if (!data_in_file(file, entry->pos, entry->size)) {
+            clipped++;
+            continue;
+        }
         if (entry->timestamp < previous) backward++;
         previous = entry->timestamp;
         file->pts[count] = entry->timestamp;
@@ -128,7 +145,9 @@ static int timeline_from_index(SourceFile *file, AVStream *stream) {
     // A keyframe-only index steps by a whole GOP. Read the packets instead.
     if (big * 2 > count) return -1;
     int64_t declared = stream->nb_frames;
-    if (declared > 0 && count < declared) return -1;
+    // A complete index on a truncated file is shorter than nb_frames / duration.
+    // Keep it; falling back to a packet scan would only rediscover the same cut.
+    if (!clipped && declared > 0 && count < declared) return -1;
     // Matroska often indexes only the keyframes it has seen so far, sometimes just
     // the first. When the index holds far fewer pictures than duration times rate,
     // read the packets instead.
@@ -136,8 +155,9 @@ static int timeline_from_index(SourceFile *file, AVStream *stream) {
         ? (double)stream->duration * av_q2d(stream->time_base)
         : (file->fmt->duration > 0 ? (double)file->fmt->duration / AV_TIME_BASE : 0);
     double rate = av_q2d(av_guess_frame_rate(file->fmt, stream, NULL));
-    if (seconds > 0 && rate > 0 && count < 0.9 * seconds * rate) return -1;
+    if (!clipped && seconds > 0 && rate > 0 && count < 0.9 * seconds * rate) return -1;
     file->count = count;
+    file->clipped = clipped > 0;
     return 0;
 }
 
@@ -182,6 +202,12 @@ static int timeline_from_packets(SourceFile *file, AVStream *stream) {
                 return -1;
             }
             stamps = grown;
+        }
+        if ((packet->flags & AV_PKT_FLAG_CORRUPT)
+            || !data_in_file(file, packet->pos, packet->size)) {
+            file->clipped = 1;
+            av_packet_unref(packet);
+            continue;
         }
         stamps[count].pts = packet->pts == AV_NOPTS_VALUE ? packet->dts : packet->pts;
         stamps[count].order = count;
@@ -245,6 +271,9 @@ static int open_decoder(SourceFile *file, AVStream *stream, char *error, int err
     return 0;
 }
 
+static int arrive(SourceFile *file, int index);
+static int clip_unreadable_tail(SourceFile *file);
+
 SourceFile *source_open(const char *path, char *error, int errorLength) {
     silence_logs();
     SourceFile *file = av_mallocz(sizeof(SourceFile));
@@ -287,6 +316,11 @@ SourceFile *source_open(const char *path, char *error, int errorLength) {
         }
     }
     if (open_decoder(file, stream, error, errorLength) != 0) {
+        source_close(file);
+        return NULL;
+    }
+    if (file->clipped && clip_unreadable_tail(file) != 0) {
+        set_error(error, errorLength, "keine Bilder in der Datei");
         source_close(file);
         return NULL;
     }
@@ -606,6 +640,24 @@ static int arrive(SourceFile *file, int index) {
         return -1;
     }
     return 0;
+}
+
+// Drop trailing pictures that the index kept but the decoder cannot produce,
+// typically the last open GOP of a truncated file.
+static int clip_unreadable_tail(SourceFile *file) {
+    while (file->count > 0) {
+        if (arrive(file, file->count - 1) == 0) {
+            av_frame_unref(file->frame);
+            file->positioned = 0;
+            file->nextIndex = -1;
+            return 0;
+        }
+        file->error[0] = '\0';
+        file->count--;
+        file->positioned = 0;
+        file->nextIndex = -1;
+    }
+    return -1;
 }
 
 int source_frame(SourceFile *file, int index, float *rgb, int capacity, int *width, int *height) {
