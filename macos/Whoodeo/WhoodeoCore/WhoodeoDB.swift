@@ -405,7 +405,8 @@ nonisolated final class WhoodeoDB: Sendable {
         }
     }
 
-    /// Inserts a run and attaches every source with its split.
+    /// Inserts a run and attaches the sources the dataset would actually load
+    /// (enabled, with a matching master/variant for the config's rungs and presets).
     static func insertRun(
         _ db: Database, name: String, parentCheckpointID: Int?, channels: Int, blocksJSON: String, dtype: String,
         cropSize: Int?, configJSON: String, status: String, startedAt: String, notes: String?
@@ -415,8 +416,49 @@ nonisolated final class WhoodeoDB: Sendable {
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, arguments: [name, parentCheckpointID, channels, blocksJSON, dtype, cropSize, configJSON, status, startedAt, notes])
         let id = Int(db.lastInsertedRowID)
-        try db.execute(sql: "INSERT OR IGNORE INTO run_sources(run_id, source_id, split) SELECT ?, id, split FROM sources", arguments: [id])
+        try attachRunSources(db, runID: id, configJSON: configJSON)
         return id
+    }
+
+    /// Same filters as `trainingPairs`: enabled sources that have a variant for the chosen presets and rungs.
+    static func attachRunSources(_ db: Database, runID: Int, configJSON: String) throws {
+        let (rungs, presets) = trainingFilters(from: configJSON)
+        var sql = """
+            INSERT OR IGNORE INTO run_sources(run_id, source_id, split)
+            SELECT DISTINCT ?, s.id, s.split
+            FROM sources s
+            JOIN source_masters m ON m.source_id = s.id
+            JOIN source_variants v ON v.master_id = m.id
+            JOIN degrade_presets p ON p.name = v.preset
+            WHERE s.enabled = 1 AND v.enabled = 1 AND p.enabled = 1
+            """
+        var arguments: StatementArguments = [runID]
+        if !rungs.isEmpty {
+            sql += " AND m.rung IN (\(databaseQuestionMarks(count: rungs.count)))"
+            arguments += StatementArguments(rungs)
+        }
+        if !presets.isEmpty {
+            sql += " AND v.preset IN (\(databaseQuestionMarks(count: presets.count)))"
+            arguments += StatementArguments(presets)
+        }
+        try db.execute(sql: sql, arguments: arguments)
+    }
+
+    /// `rungs` and `presets` from `runs.config_json`. Empty means every rung or preset.
+    static func trainingFilters(from configJSON: String) -> (rungs: [String], presets: [String]) {
+        guard let data = configJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return ([], []) }
+        func strings(_ key: String) -> [String] {
+            if let values = object[key] as? [String] {
+                return values.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            }
+            if let text = object[key] as? String {
+                return TrainConfig.intList(text)
+            }
+            return []
+        }
+        return (strings("rungs"), strings("presets"))
     }
 
     /// Resume may change `.always` parameters; the run keeps the latest config.

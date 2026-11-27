@@ -361,11 +361,8 @@ struct PlaygroundView: View {
         VStack(spacing: 12) {
             Image(systemName: "square.stack.3d.down.right").font(.system(size: 40)).foregroundStyle(.secondary)
             Text("Kein VAE-Paar gefunden").font(.title2)
-            Text("Der Playground braucht Encoder und Decoder eines vae2 im Ordner VAE. Auf dem Mac:")
+            Text("Der Playground braucht Encoder und Decoder eines vae2 im Ordner VAE.")
                 .foregroundStyle(.secondary)
-            Text(".venv/bin/whoodeo-coreml <vae2-Lauf oder Checkpoint> --part pair")
-                .font(.system(.body, design: .monospaced))
-                .textSelection(.enabled)
             HStack {
                 Button("Ordner öffnen") { model.openFolder() }
                 Button("Erneut suchen") { model.refreshPairs() }

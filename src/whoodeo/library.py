@@ -1,28 +1,13 @@
-"""Index of the training masters and their degraded variants.
+"""Master filenames, rung names, and picture sizes for the training library.
 
-catalog.json sits beside orig/ and low/. It holds the rung list, the degrade
-recipe, and the titles. frames on a title is the packet count shared by
-every rung. One title can have several masters, each named
-<title>.<rung>.mkv. A master records its width, height, and the names of
-its low variants. Those files repeat the master name under their variant
-directory. origin is the file a later rung is encoded from. It may be null.
-A missing source leaves the masters that are already written.
-
-Import writes the document to a temp file and renames it over the old one.
-Training reads it once at startup and then works from that copy. A read that
-lands on the rename retries a few times. A new file is seeded from the
-package degrade.yaml and the 720 and 480 rungs. Older Python training
-paths still read this file; make-low and the app use whoodeo.sqlite.
+A title can have several masters, each named <title>.<rung>.mkv. Rung names
+come from the pixel budgets in settings.rungs (720, 480, or a film's own
+WxH when it sits between budgets). make-low and the database use these
+helpers; the catalog lives in whoodeo.sqlite.
 """
 
-import json
-import os
-import time
 from pathlib import Path
 
-import yaml
-
-CATALOG = "catalog.json"
 # 854*480 is the 16:9 frame at 480p. The fitter snaps each source to multiples of 4.
 DEFAULT_RUNGS = (
     ("720", 1280 * 720),
@@ -103,41 +88,6 @@ def split_master_filename(name):
     return title, rung
 
 
-def catalog_file(root):
-    return Path(root) / CATALOG
-
-
-def load_catalog(root):
-    """The catalog. A missing file is an error. A torn read is retried."""
-    path = catalog_file(root)
-    if not path.is_file():
-        raise SystemExit(f"no catalog: {path}")
-    last = None
-    for _ in range(8):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            last = exc
-            time.sleep(0.05)
-            continue
-        if not isinstance(data, dict):
-            raise SystemExit(f"{path}: expected an object")
-        return data
-    raise SystemExit(f"{path}: {last}")
-
-
-def save_catalog(root, data):
-    """Write the whole catalog and rename it into place."""
-    path = catalog_file(root)
-    tmp = path.with_name("catalog.json.tmp")
-    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-
-
 def picture_size(path):
     """Stored width and height. The container is closed before return."""
     import av
@@ -154,27 +104,8 @@ def picture_size(path):
     return width, height
 
 
-def same_frame_count(entry, title, frames):
-    """Record this packet count, or reject a title that already differs."""
-    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
-        raise RuntimeError(f"{title}: bad frame count {frames!r}")
-    current = entry.get("frames")
-    if current is None:
-        entry["frames"] = frames
-        return
-    if current != frames:
-        raise RuntimeError(f"{title}: {frames} frames, catalog says {current}")
-
-
 def _where(path):
     return str(path)
-
-
-def titles_of(catalog, path):
-    titles = catalog.get("titles") if isinstance(catalog, dict) else None
-    if not isinstance(titles, dict):
-        raise SystemExit(f"{_where(path)}: missing titles")
-    return titles
 
 
 def rungs_of(catalog, path):
@@ -209,72 +140,3 @@ def rungs_of(catalog, path):
         parsed.append((name, pixels))
     parsed.sort(key=lambda item: item[1], reverse=True)
     return tuple(parsed)
-
-
-def degrade_of(catalog, path):
-    """Scale, scale flags, pixel format, and the variant arguments."""
-    degrade = catalog.get("degrade") if isinstance(catalog, dict) else None
-    label = _where(path)
-    if not isinstance(degrade, dict):
-        raise SystemExit(f"{label}: missing degrade")
-    scale = degrade.get("scale")
-    flags = degrade.get("scale_flags")
-    pix_fmt = degrade.get("pix_fmt")
-    variants = degrade.get("variants")
-    if isinstance(scale, bool) or not isinstance(scale, int) or scale < 2:
-        raise SystemExit(f"{label}: degrade.scale must be an integer >= 2")
-    if not isinstance(flags, str) or not flags:
-        raise SystemExit(f"{label}: degrade.scale_flags must be a string")
-    if not isinstance(pix_fmt, str) or not pix_fmt:
-        raise SystemExit(f"{label}: degrade.pix_fmt must be a string")
-    if not isinstance(variants, dict) or not variants:
-        raise SystemExit(f"{label}: degrade.variants must be a non-empty object")
-    for name, args in variants.items():
-        if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name:
-            raise SystemExit(f"{label}: bad variant name {name!r}")
-        if not isinstance(args, str) or not args.strip():
-            raise SystemExit(f"{label}: variant {name} must be an ffmpeg argument string")
-    return scale, flags, pix_fmt, variants
-
-
-def empty_catalog():
-    """A new library: 720 and 480, and the package degrade recipe."""
-    path = Path(__file__).resolve().parent / "degrade.yaml"
-    try:
-        loaded = yaml.safe_load(path.read_text())
-    except FileNotFoundError:
-        raise SystemExit(f"no config: {path}")
-    except yaml.YAMLError as exc:
-        raise SystemExit(f"{path}: {exc}") from exc
-    if not isinstance(loaded, dict):
-        raise SystemExit(f"{path}: expected an object")
-    data = {
-        "rungs": [{"name": name, "pixels": pixels} for name, pixels in DEFAULT_RUNGS],
-        "degrade": loaded,
-        "titles": {},
-    }
-    rungs_of(data, path)
-    degrade_of(data, path)
-    return data
-
-
-def open_catalog(root, create=False):
-    """Load the catalog and check its three sections.
-
-    `create` writes a seeded file when none exists. Import uses that.
-    The plain command does not, so a missing file stays visible.
-    """
-    path = catalog_file(root)
-    if not path.exists():
-        if not create:
-            raise SystemExit(f"no catalog: {path}")
-        data = empty_catalog()
-        save_catalog(root, data)
-        return data
-    data = load_catalog(root)
-    rungs_of(data, path)
-    degrade_of(data, path)
-    titles_of(data, path)
-    return data
-
-

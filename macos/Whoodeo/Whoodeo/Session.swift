@@ -609,7 +609,7 @@ final class Session: ObservableObject {
     var placeholder: String {
         if failure != nil { return failure! }
         if modelURL == nil && library.isEmpty {
-            return "python -m whoodeo.mlxport.convert <Checkpoint> --app legt neue Modelle in diese Sammlung."
+            return "Lege ein .mlxmodel in die Sammlung oder starte ein Training."
         }
         if modelURL == nil { return "Wähle links ein Modell. Die Vorschau startet, sobald ein Film offen ist." }
         if facts == nil { return "Öffne einen Film oder leg ihn hier ab." }
@@ -633,6 +633,7 @@ final class Session: ObservableObject {
             if event.modifierFlags.contains(.command) { return event }
             // The playground has its own sliders; arrows and space stay there.
             if event.window?.identifier?.rawValue.contains(PlaygroundView.windowID) == true { return event }
+            if Self.playbackKeysShouldYield(event) { return event }
             switch event.keyCode {
             case 49:
                 self.togglePlay()
@@ -657,6 +658,18 @@ final class Session: ObservableObject {
                 return event
             }
         }
+    }
+
+    /// Space, arrows, I and O stay with text fields and open sheets.
+    private static func playbackKeysShouldYield(_ event: NSEvent) -> Bool {
+        if let window = event.window, window.isSheet || window.attachedSheet != nil {
+            return true
+        }
+        if let key = NSApp.keyWindow, key.isSheet || key.attachedSheet != nil {
+            return true
+        }
+        let responder = event.window?.firstResponder ?? NSApp.keyWindow?.firstResponder
+        return responder is NSTextView || responder is NSTextField
     }
 
     func openSelection() {
