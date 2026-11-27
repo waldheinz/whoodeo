@@ -11,8 +11,8 @@ A missing source leaves the masters that are already written.
 Import writes the document to a temp file and renames it over the old one.
 Training reads it once at startup and then works from that copy. A read that
 lands on the rename retries a few times. A new file is seeded from the
-package degrade.yaml and the 720 and 480 rungs. After that, this file is
-the list make-low encodes.
+package degrade.yaml and the 720 and 480 rungs. Older Python training
+paths still read this file; make-low and the app use whoodeo.sqlite.
 """
 
 import json

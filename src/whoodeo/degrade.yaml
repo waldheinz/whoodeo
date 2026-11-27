@@ -18,9 +18,10 @@ variants:
   # tmix not tblend: tblend drops one frame under -fps_mode passthrough.
   blend-mpeg4-q05: "-vf \"tmix=frames=2:weights='1 1',select='eq(mod(n\\,2)\\,1)'\" -c:v mpeg4 -q:v 5 -bf 2 -b_qfactor 1.5 -b_qoffset 1"
   # 25<->30p-style 6-phase 2-frame blend (trailing t-1 & leading t+1, at most 1 ghost), then H.264.
-  fblend-x264-crf22: "-vf \"split=3[c][p][n];[p]tpad=start=1:start_mode=clone,setpts=PTS-STARTPTS[p0];[c]setpts=PTS-STARTPTS[c0];[n]tpad=stop=1:stop_mode=clone,trim=start_frame=1,setpts=PTS-STARTPTS[n0];[c0][p0]blend=shortest=1:all_expr='if(eq(mod(N,6),1),0.83*A+0.17*B,if(eq(mod(N,6),2),0.67*A+0.33*B,if(eq(mod(N,6),3),0.5*A+0.5*B,A)))'[cp];[cp][n0]blend=shortest=1:all_expr='if(eq(mod(N,6),4),0.67*A+0.33*B,if(eq(mod(N,6),5),0.83*A+0.17*B,A))'\" -c:v libx264 -crf 22 -preset medium"
+  fblend-x264-crf22: "-vf \"split=2[ev][od];[ev]select='eq(mod(n,2),0)',setpts=N/(25*TB),split=3[c][p][n];[od]select='eq(mod(n,2),1)',setpts=N/(25*TB)[len];[c][len]blend=shortest=1:all_expr='A'[c0];[p]tpad=start=1:start_mode=clone,setpts=N/(25*TB)[p0];[n]tpad=stop=1:stop_mode=clone,trim=start_frame=1,setpts=N/(25*TB)[n0];[c0][p0]blend=shortest=1:all_expr='if(eq(mod(N,6),1),0.83*A+0.17*B,if(eq(mod(N,6),2),0.67*A+0.33*B,if(eq(mod(N,6),3),0.5*A+0.5*B,A)))'[cp];[cp][n0]blend=shortest=1:all_expr='if(eq(mod(N,6),4),0.67*A+0.33*B,if(eq(mod(N,6),5),0.83*A+0.17*B,A))'\" -c:v libx264 -crf 22 -preset medium"
 # Frame ratio num/den per variant (default 1/1): a low file has
 # master_frames * den // num frames, and low frame k trains against master
 # frame (k * num + den // 2) // den.
 frame_ratios:
   blend-mpeg4-q05: [2, 1]
+  fblend-x264-crf22: [2, 1]

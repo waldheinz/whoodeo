@@ -12,7 +12,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from whoodeo.library import DEFAULT_RUNGS, empty_catalog, rungs_of
+from whoodeo.library import rungs_of
 
 DEFAULT_DB = Path.home() / "Library/Application Support/Whoodeo/whoodeo.sqlite"
 FNV_OFFSET = 14_695_981_039_346_656_037
@@ -69,17 +69,17 @@ def title_split(name):
 
 
 def load_rungs(conn):
-    """(name, pixel budget), largest first. Falls back to degrade.yaml defaults."""
+    """(name, pixel budget), largest first, from settings.rungs."""
     raw = setting(conn, "rungs")
-    if raw:
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SystemExit(f"settings.rungs: {exc}") from exc
-        if isinstance(data, list):
-            data = {"rungs": data}
-        return rungs_of(data, "settings.rungs")
-    return DEFAULT_RUNGS
+    if not raw:
+        raise SystemExit("no settings.rungs in the database")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"settings.rungs: {exc}") from exc
+    if isinstance(data, list):
+        data = {"rungs": data}
+    return rungs_of(data, "settings.rungs")
 
 
 def frame_ratio_columns(conn):
@@ -226,13 +226,3 @@ def listed_variants(conn, master_id):
     ]
 
 
-def load_seed_variants():
-    """Fallback recipes from degrade.yaml, used only when the database has none."""
-    data = empty_catalog()
-    degrade = data["degrade"]
-    return (
-        degrade["scale"],
-        degrade["scale_flags"],
-        degrade["pix_fmt"],
-        dict(degrade["variants"]),
-    )

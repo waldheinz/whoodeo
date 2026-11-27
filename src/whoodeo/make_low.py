@@ -1,8 +1,7 @@
 """Write training videos.
 
 `whoodeo-make-low import` writes a source into the orig folder and records
-it in the Whoodeo SQLite database (and in catalog.json beside orig/ and low/,
-as a mirror). The rungs are pixel
+it in the Whoodeo SQLite database. The rungs are pixel
 budgets. A source larger than a rung is encoded down to it, 10-bit 4:4:4
 HEVC with a short closed GOP, so training seeks stay cheap. A source that
 already sits on a rung is remuxed as it is: the video bitstream stays, and
@@ -29,23 +28,18 @@ import argparse
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from whoodeo import db
 from whoodeo.library import (
-    catalog_file,
-    degrade_of,
-    empty_catalog,
     master_filename,
-    open_catalog,
     plan_masters,
     picture_size,
-    same_frame_count,
-    save_catalog,
     split_master_filename,
-    titles_of,
 )
 VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm"}
 WEBM_CODECS = {"vp8", "vp9", "libvpx", "libvpx-vp9", "av1", "libaom-av1", "libsvtav1"}
@@ -121,63 +115,200 @@ def open_store(args):
     return conn, root, orig, low
 
 
-def load_catalog_mirror(root, create=False, dry_run=False):
-    """Load catalog.json as a write-through mirror. A missing file is OK."""
-    if catalog_file(root).is_file():
-        return open_catalog(root, create=False)
-    if create and not dry_run:
-        return open_catalog(root, create=True)
-    return empty_catalog()
+
+FFMPEG = ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "error"]
 
 
-def entry_from_db(conn, title):
-    """A catalog-shaped title entry from the database, or None."""
-    source = conn.execute(
-        "SELECT origin_path, frames FROM sources WHERE name = ?",
-        (title,),
-    ).fetchone()
-    if source is None:
-        return None
-    entry = {"origin": source["origin_path"], "frames": source["frames"], "masters": {}}
-    for master in conn.execute(
-        "SELECT m.id, m.rung, m.width, m.height FROM source_masters m "
-        "JOIN sources s ON s.id = m.source_id WHERE s.name = ?",
-        (title,),
-    ):
-        entry["masters"][master["rung"]] = {
-            "width": master["width"],
-            "height": master["height"],
-            "low": db.listed_variants(conn, master["id"]),
-        }
-    return entry
+def run_ffmpeg(command, label=None):
+    """Run ffmpeg without a status line. Report stderr only on failure."""
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        parts = [f"{label}: ffmpeg failed" if label else "ffmpeg failed"]
+        err = (result.stderr or "").strip()
+        out = (result.stdout or "").strip()
+        if err:
+            parts.append(err)
+        elif out:
+            parts.append(out)
+        print("\n".join(parts), file=sys.stderr)
+    return result
 
 
-def merge_entry_from_db(entry, conn, title):
-    """Fill missing origin/masters/low names from the database."""
-    found = entry_from_db(conn, title)
-    if found is None:
-        return entry
-    if not entry.get("origin") and found.get("origin"):
-        entry["origin"] = found["origin"]
-    if entry.get("frames") is None:
-        entry["frames"] = found.get("frames")
-    masters = entry.setdefault("masters", {})
-    if not isinstance(masters, dict):
-        entry["masters"] = found["masters"]
-        return entry
-    for rung, master in found["masters"].items():
-        current = masters.get(rung)
-        if not isinstance(current, dict):
-            masters[rung] = master
-            continue
-        if not isinstance(current.get("low"), list):
-            current["low"] = list(master["low"])
-            continue
-        for name in master["low"]:
-            if name not in current["low"]:
-                current["low"].append(name)
-    return entry
+def _format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
+
+class FilmProgress:
+    """A compact progress bar over films/masters that still need work."""
+
+    def __init__(self, total, skipped=0, stream=None):
+        self.total = total
+        self.skipped = skipped
+        self.done = 0
+        self.started = time.monotonic()
+        self.stream = stream if stream is not None else sys.stderr
+        self.tty = self.stream.isatty()
+        self._current = ""
+        self._jobs = 0
+        self._drawn = False
+        self._closed = False
+
+    def start_item(self, name, jobs=0):
+        if self._closed:
+            return
+        self._current = name
+        self._jobs = jobs
+        self._render()
+
+    def advance(self):
+        if self._closed:
+            return
+        self.done += 1
+        if self.done >= self.total:
+            self._current = ""
+            self._jobs = 0
+        self._render()
+
+    def clear_line(self):
+        if self.tty and self._drawn and not self._closed:
+            self.stream.write("\r\x1b[2K")
+            self.stream.flush()
+            self._drawn = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self.total == 0:
+            if self.skipped:
+                self._write(f"nothing to do ({self.skipped} already done)", newline=True)
+            elif self.tty and self._drawn:
+                self.stream.write("\r\x1b[2K")
+                self.stream.flush()
+                self._drawn = False
+            return
+        self._current = ""
+        self._jobs = 0
+        self._render()
+        if self.tty:
+            self.stream.write("\n")
+            self.stream.flush()
+            self._drawn = False
+
+    def _render(self, final=False):
+        self._write(self._line(), newline=not self.tty)
+
+    def _write(self, line, newline=False):
+        if self.tty:
+            self.stream.write("\r\x1b[2K" + line)
+            if newline:
+                self.stream.write("\n")
+                self._drawn = False
+            else:
+                self._drawn = True
+        else:
+            self.stream.write(line + "\n")
+            self._drawn = False
+        self.stream.flush()
+
+    def _line(self):
+        width = max(40, shutil.get_terminal_size((80, 24)).columns)
+        total = self.total
+        frac = 1.0 if not total else min(max(self.done, 0) / total, 1.0)
+        pct = 100 if not total else int(frac * 100)
+        elapsed = time.monotonic() - self.started
+        bar_w = 12
+        filled = bar_w if not total else min(bar_w, int(bar_w * frac))
+        bar = "[" + "#" * filled + "-" * (bar_w - filled) + "]"
+        prefix = f"{bar}  {self.done}/{total}  {pct}%  {_format_duration(elapsed)} elapsed"
+        if self.done >= 1 and self.done < total:
+            eta = (elapsed / self.done) * (total - self.done)
+            prefix += f"  {_format_duration(eta)} eta"
+        if self.skipped:
+            prefix += f"  {self.skipped} skipped"
+        name = self._current
+        jobs = ""
+        if name and self._jobs:
+            jobs = f"  {self._jobs} var" if self._jobs == 1 else f"  {self._jobs} vars"
+        if name:
+            room = width - len(prefix) - len(jobs) - 2
+            if room < 4:
+                jobs = ""
+                room = width - len(prefix) - 2
+            if room < 4:
+                name = ""
+            elif len(name) > room:
+                name = "…" + name[-(room - 1):]
+        suffix = f"  {name}{jobs}" if name else ""
+        return (prefix + suffix)[:width]
+
+
+class _BarAwareStderr:
+    """Clear the progress bar before other stderr output, then redraw."""
+
+    def __init__(self, wrapped, get_progress):
+        self._wrapped = wrapped
+        self._get_progress = get_progress
+
+    def write(self, data):
+        progress = self._get_progress()
+        if progress is not None:
+            progress.clear_line()
+        written = self._wrapped.write(data)
+        if progress is not None and not progress._closed and str(data).endswith("\n"):
+            progress._render()
+        return written
+
+    def flush(self):
+        return self._wrapped.flush()
+
+    def isatty(self):
+        return self._wrapped.isatty()
+
+    def fileno(self):
+        return self._wrapped.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+_ACTIVE_PROGRESS = None
+_REAL_STDERR = sys.stderr
+
+
+def _current_progress():
+    return _ACTIVE_PROGRESS
+
+
+def begin_progress(total, skipped=0):
+    """Install a film progress bar on stderr. Return the bar."""
+    global _ACTIVE_PROGRESS
+    progress = FilmProgress(total, skipped=skipped, stream=_REAL_STDERR)
+    _ACTIVE_PROGRESS = progress
+    if not isinstance(sys.stderr, _BarAwareStderr):
+        sys.stderr = _BarAwareStderr(_REAL_STDERR, _current_progress)
+    return progress
+
+
+def end_progress():
+    """Close the bar and restore stderr."""
+    global _ACTIVE_PROGRESS
+    progress = _ACTIVE_PROGRESS
+    _ACTIVE_PROGRESS = None
+    if isinstance(sys.stderr, _BarAwareStderr):
+        sys.stderr = _REAL_STDERR
+    if progress is not None:
+        progress.close()
+
+
+def say(message, verbose=True):
+    if verbose:
+        print(message, flush=True)
 
 
 def db_remember_variant(conn, title, rung, preset, filename):
@@ -306,6 +437,53 @@ def packets_of(path):
     return int(text)
 
 
+def header_frame_count(path):
+    """Frame count from the container header (nb_frames or duration * rate).
+
+    This does not read every packet, so it is safe to use while planning work
+    over a network disk. Returns None when the header has no usable count.
+    """
+    text = run_probe([
+        "-select_streams", "v:0",
+        "-show_entries", "stream=nb_frames,duration,r_frame_rate,avg_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(path),
+    ])
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    stream = (payload.get("streams") or [{}])[0]
+    nb = stream.get("nb_frames")
+    if nb not in (None, "N/A", ""):
+        try:
+            value = int(nb)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    duration = stream.get("duration")
+    if duration in (None, "N/A", ""):
+        duration = (payload.get("format") or {}).get("duration")
+    rate = stream.get("r_frame_rate") or stream.get("avg_frame_rate")
+    try:
+        duration = float(duration)
+        rate = str(rate)
+        if "/" in rate:
+            num, den = rate.split("/", 1)
+            fps = float(num) / float(den)
+        else:
+            fps = float(rate)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if duration <= 0 or fps <= 0:
+        return None
+    return int(round(duration * fps))
+
+
 def has_audio(path):
     text = run_probe([
         "-select_streams", "a",
@@ -316,7 +494,7 @@ def has_audio(path):
     return bool(text)
 
 
-def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, strict):
+def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, strict, verbose=True):
     """Write several low variants of one master from a single decode.
 
     jobs is a list of (variant, ffmpeg_args). The master is decoded and scaled
@@ -347,7 +525,9 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
         out = low_dir / variant / name
         if out.exists() and not force:
             try:
-                kept = packets_of(out)
+                kept = header_frame_count(out)
+                if kept is None:
+                    kept = packets_of(out)
             except RuntimeError as exc:
                 print(f"{label}: {exc}", file=sys.stderr)
                 results[variant] = None
@@ -356,20 +536,22 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
             # on disk (written before the ratio was set). That file is stale.
             if frame_ratio(variant) != (1, 1):
                 try:
-                    master_frames = packets_of(src)
+                    master_frames = header_frame_count(src)
+                    if master_frames is None:
+                        master_frames = packets_of(src)
                 except RuntimeError as exc:
                     print(f"{label}: {exc}", file=sys.stderr)
                     results[variant] = None
                     continue
                 if kept != expected_low_frames(variant, master_frames):
-                    print(
+                    say(
                         f"stale {label}: {kept} frames, expected "
                         f"{describe_frames(variant, master_frames)}; re-encode",
-                        flush=True,
+                        verbose,
                     )
                     todo.append((variant, ffmpeg_args, out))
                     continue
-            print(f"keep {label}", flush=True)
+            say(f"keep {label}", verbose)
             results[variant] = kept
             continue
         todo.append((variant, ffmpeg_args, out))
@@ -423,7 +605,7 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
         tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
         tmp.unlink(missing_ok=True)
         temps.append(tmp)
-        print(f"encode {variant}/{name}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", flush=True)
+        say(f"encode {variant}/{name}  {width}x{height} -> {low_w}x{low_h}  {ffmpeg_args}", verbose)
         outputs += [
             "-map", f"[v{index}]", "-an",
             *rest,
@@ -432,12 +614,12 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
             str(tmp),
         ]
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        *FFMPEG,
         "-i", str(src),
         "-filter_complex", graph,
         *outputs,
     ]
-    result = subprocess.run(command, check=False)
+    result = run_ffmpeg(command, name)
     if result.returncode != 0:
         for tmp in temps:
             tmp.unlink(missing_ok=True)
@@ -476,7 +658,7 @@ def encode_variants(src, low_dir, jobs, scale, scale_flags, pix_fmt, force, stri
             results[variant] = None
             continue
         tmp.replace(out)
-        print(f"wrote {out}  {low_w}x{low_h}  {out_packets} frames", flush=True)
+        say(f"wrote {out}  {low_w}x{low_h}  {out_packets} frames", verbose)
         results[variant] = out_packets
     return results
 
@@ -666,19 +848,20 @@ def restamp_timestamps(src, dst):
     tb_num, tb_den = base
     expr = f"floor(N*{rate_den}*{tb_den}/({rate_num}*{tb_num})+0.5)"
     dst.unlink(missing_ok=True)
-    result = subprocess.run(
+    result = run_ffmpeg(
         [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
+            *FFMPEG, "-y",
             "-i", str(src),
             "-map", "0:v:0", "-an", "-c", "copy",
             "-bsf:v", f"setts=pts={expr}:dts={expr}",
             str(dst),
         ],
-        check=False,
+        src.name,
     )
     if result.returncode != 0:
         dst.unlink(missing_ok=True)
-        return "restamp failed"
+        err = (result.stderr or "").strip()
+        return f"restamp failed ({err})" if err else "restamp failed"
     if packets_of(dst) != len(pts):
         dst.unlink(missing_ok=True)
         return "restamp changed the frame count"
@@ -730,7 +913,7 @@ def b_frame_delay(path):
     return delay
 
 
-def settle_remux_time(path, label):
+def settle_remux_time(path, label, verbose=True):
     """Accept path, or restamp it when packet order is display order.
 
     setts numbers packets in file order. That is wrong once B-frames have
@@ -749,7 +932,7 @@ def settle_remux_time(path, label):
     # B-frames and no backwards PTS can be renumbered that way.
     if err != "two frames share one timestamp" or delay != 0 or backwards:
         return err
-    print(f"{label}: {err}; restamping timestamps", flush=True)
+    say(f"{label}: {err}; restamping timestamps", verbose)
     stamped = path.with_name(f"{path.stem}.stamped{path.suffix}")
     restamp_error = restamp_timestamps(path, stamped)
     if restamp_error:
@@ -812,7 +995,7 @@ def master_problem(path, width, height, packets):
     return timestamp_problem(path)
 
 
-def encode_master(src, label, out, stream, in_packets, width, height, matrix_name, out_w, out_h):
+def encode_master(src, label, out, stream, in_packets, width, height, matrix_name, out_w, out_h, verbose=True):
     """Encode src to a 10-bit 4:4:4 HEVC master at out_w by out_h."""
     matrix = input_matrix(matrix_name)
     if matrix is None:
@@ -820,12 +1003,12 @@ def encode_master(src, label, out, stream, in_packets, width, height, matrix_nam
         return None
     tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
     tmp.unlink(missing_ok=True)
-    print(
+    say(
         f"import {label}  {width}x{height} -> {out_w}x{out_h}  {MASTER_PIX_FMT} crf 12",
-        flush=True,
+        verbose,
     )
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        *FFMPEG,
         "-i", str(src),
         "-map", "0:v:0", "-an",
         "-vf", master_filter(out_w, out_h, matrix, stream_text(stream, "color_range")),
@@ -837,15 +1020,14 @@ def encode_master(src, label, out, stream, in_packets, width, height, matrix_nam
         "-x265-params", X265_PARAMS,
         str(tmp),
     ]
-    result = subprocess.run(command, check=False)
+    result = run_ffmpeg(command, label)
     if result.returncode != 0:
         tmp.unlink(missing_ok=True)
-        print(f"{label}: ffmpeg failed", file=sys.stderr)
         return None
     try:
         problem = timestamp_problem(tmp)
         if problem:
-            print(f"{label}: {problem}; restamping timestamps", flush=True)
+            say(f"{label}: {problem}; restamping timestamps", verbose)
             stamped = tmp.with_name(f"{tmp.stem}.stamped{tmp.suffix}")
             restamp_error = restamp_timestamps(tmp, stamped)
             if restamp_error:
@@ -864,30 +1046,29 @@ def encode_master(src, label, out, stream, in_packets, width, height, matrix_nam
         print(f"{label}: {problem}", file=sys.stderr)
         return None
     tmp.replace(out)
-    print(f"wrote {out}  {out_w}x{out_h}  {in_packets} frames", flush=True)
+    say(f"wrote {out}  {out_w}x{out_h}  {in_packets} frames", verbose)
     return out.name
 
 
-def remux_master(src, label, out, stream, in_packets, width, height):
+def remux_master(src, label, out, stream, in_packets, width, height, verbose=True):
     """Copy the video bitstream into orig and drop the audio."""
     tmp = out.with_name(f"{out.stem}.partial{out.suffix}")
     tmp.unlink(missing_ok=True)
-    print(f"import {label}  {width}x{height}  remux", flush=True)
+    say(f"import {label}  {width}x{height}  remux", verbose)
     command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-stats",
+        *FFMPEG,
         "-i", str(src),
         "-map", "0:v:0", "-an", "-c", "copy",
         str(tmp),
     ]
-    result = subprocess.run(command, check=False)
+    result = run_ffmpeg(command, label)
     if result.returncode != 0:
         tmp.unlink(missing_ok=True)
-        print(f"{label}: ffmpeg failed", file=sys.stderr)
         return None
     try:
         problem = remux_problem(tmp, stream, in_packets)
         if problem is None:
-            problem = settle_remux_time(tmp, label)
+            problem = settle_remux_time(tmp, label, verbose=verbose)
             if problem is None:
                 problem = remux_problem(tmp, stream, in_packets)
     except (RuntimeError, json.JSONDecodeError) as exc:
@@ -899,7 +1080,7 @@ def remux_master(src, label, out, stream, in_packets, width, height):
         print(f"{label}: {problem}", file=sys.stderr)
         return None
     tmp.replace(out)
-    print(f"wrote {out}  {width}x{height}  {in_packets} frames", flush=True)
+    say(f"wrote {out}  {width}x{height}  {in_packets} frames", verbose)
     return out.name
 
 
@@ -961,38 +1142,46 @@ def source_packets(src, probed):
         probed["packets"] = cached
     return cached
 
-
-def title_entry(catalog, root, title):
-    titles = titles_of(catalog, catalog_file(root))
-    entry = titles.get(title)
-    if not isinstance(entry, dict):
-        entry = {"origin": None, "masters": {}}
-        titles[title] = entry
-    if "origin" not in entry:
-        entry["origin"] = None
-    if not isinstance(entry.get("masters"), dict):
-        entry["masters"] = {}
-    return entry
+def check_frames(conn, title, frames):
+    """Refuse a frame count that disagrees with the database."""
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
+        raise RuntimeError(f"{title}: bad frame count {frames!r}")
+    row = conn.execute("SELECT frames FROM sources WHERE name = ?", (title,)).fetchone()
+    if row is not None and row["frames"] is not None and row["frames"] != frames:
+        raise RuntimeError(f"{title}: {frames} frames, database says {row['frames']}")
 
 
-def remember_master(catalog, root, title, rung, path, frames, force, conn=None):
-    entry = title_entry(catalog, root, title)
+def source_record(conn, title):
+    return conn.execute(
+        "SELECT id, name, frames, origin_path, enabled FROM sources WHERE name = ?",
+        (title,),
+    ).fetchone()
+
+
+def masters_for_title(conn, title):
+    return conn.execute(
+        """
+        SELECT m.id, m.rung, m.rel_path, m.width, m.height
+        FROM source_masters m
+        JOIN sources s ON s.id = m.source_id
+        WHERE s.name = ?
+        ORDER BY m.rung
+        """,
+        (title,),
+    ).fetchall()
+
+
+def remember_master(conn, title, rung, path, frames, origin_path=None):
     width, height = picture_size(path)
-    same_frame_count(entry, title, frames)
-    previous = entry["masters"].get(rung)
-    low = []
-    if not force and isinstance(previous, dict) and isinstance(previous.get("low"), list):
-        low = list(previous["low"])
-    entry["masters"][rung] = {"width": width, "height": height, "low": low}
-    save_catalog(root, catalog)
-    if conn is not None:
-        db.remember_master(
-            conn, title, rung, f"orig/{path.name}", width, height, frames=frames,
-        )
-        conn.commit()
+    check_frames(conn, title, frames)
+    db.remember_master(
+        conn, title, rung, f"orig/{path.name}", width, height,
+        frames=frames, origin_path=origin_path,
+    )
+    conn.commit()
 
 
-def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root, dry_run=False, conn=None):
+def produce_planned(src, title, planned, probed, orig_dir, force, conn, dry_run=False, verbose=True):
     """Write the planned masters that are missing. Return (filenames, failed).
 
     `dry_run` prints the master line and writes nothing. A file that is
@@ -1027,21 +1216,21 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
                 )
             names.append(name)
         return names, failed
-    entry = title_entry(catalog, root, title)
     for rung, out_w, out_h, kind in planned:
         name = master_filename(title, rung)
         out = orig_dir / name
         if out.exists() and not force:
-            print(f"keep {name}", flush=True)
-            if rung not in entry["masters"]:
+            say(f"keep {name}", verbose)
+            row = conn.execute(
+                "SELECT m.id FROM source_masters m "
+                "JOIN sources s ON s.id = m.source_id "
+                "WHERE s.name = ? AND m.rung = ?",
+                (title, rung),
+            ).fetchone()
+            if row is None:
                 try:
                     frames = packets_of(out)
-                except RuntimeError as exc:
-                    print(f"{name}: {exc}", file=sys.stderr)
-                    failed = True
-                    continue
-                try:
-                    remember_master(catalog, root, title, rung, out, frames, False, conn=conn)
+                    remember_master(conn, title, rung, out, frames)
                 except RuntimeError as exc:
                     print(f"{name}: {exc}", file=sys.stderr)
                     failed = True
@@ -1050,7 +1239,7 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
             continue
         try:
             frames = source_packets(src, probed)
-            same_frame_count(entry, title, frames)
+            check_frames(conn, title, frames)
         except RuntimeError as exc:
             print(f"{name}: {exc}", file=sys.stderr)
             failed = True
@@ -1059,17 +1248,20 @@ def produce_planned(src, title, planned, probed, orig_dir, force, catalog, root,
             wrote = encode_master(
                 src, name, out, probed["stream"], frames,
                 probed["width"], probed["height"], probed["matrix"], out_w, out_h,
+                verbose=verbose,
             )
         else:
             wrote = remux_master(
                 src, name, out, probed["stream"], frames,
                 probed["width"], probed["height"],
+                verbose=verbose,
             )
         if wrote is None:
             failed = True
             continue
         try:
-            remember_master(catalog, root, title, rung, out, frames, force, conn=conn)
+            origin = str(src.resolve()) if src is not None else None
+            remember_master(conn, title, rung, out, frames, origin_path=origin)
         except RuntimeError as exc:
             print(f"{name}: {exc}", file=sys.stderr)
             failed = True
@@ -1088,10 +1280,10 @@ def masters_to_write(orig_dir, title, planned, force):
     ]
 
 
-def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=False, conn=None):
+def prepare_import(src, orig_dir, rungs, conn, dry_run=False, force=False):
     """Record src as the title's origin. Return (title, planned, probed), or None.
 
-    `dry_run` leaves the catalog untouched. The source packet count runs only
+    `dry_run` leaves the database untouched. The source packet count runs only
     when a master will be written, and a frame mismatch is refused then.
     """
     label = src.name
@@ -1114,21 +1306,25 @@ def prepare_import(src, orig_dir, rungs, catalog, root, dry_run=False, force=Fal
     title = src.stem
     if dry_run:
         return title, planned, probed
-    entry = title_entry(catalog, root, title)
     if masters_to_write(orig_dir, title, planned, force):
         try:
             frames = source_packets(src, probed)
-            same_frame_count(entry, title, frames)
+            check_frames(conn, title, frames)
         except RuntimeError as exc:
-            if not entry.get("masters") and entry.get("origin") is None:
-                titles_of(catalog, catalog_file(root)).pop(title, None)
             print(f"{label}: {exc}", file=sys.stderr)
             return None
-    entry["origin"] = str(src.resolve())
-    save_catalog(root, catalog)
-    if conn is not None:
-        db.remember_source(conn, title, origin_path=entry["origin"], frames=entry.get("frames"))
+    origin = str(src.resolve())
+    frames = probed.get("packets")
+    if frames is None:
+        existing = source_record(conn, title)
+        if existing is not None:
+            frames = existing["frames"]
+    try:
+        db.remember_source(conn, title, origin_path=origin, frames=frames)
         conn.commit()
+    except RuntimeError as exc:
+        print(f"{label}: {exc}", file=sys.stderr)
+        return None
     return title, planned, probed
 
 
@@ -1147,7 +1343,7 @@ def planned_geometry(item, probed):
     )
 
 
-def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry):
+def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry, master_frames=None):
     """Print each low encode that would be started. Write nothing.
 
     `geometry` is None to measure an existing master, or the size a missing
@@ -1173,7 +1369,7 @@ def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry):
                 failed = True
             continue
         low_path = low_dir / variant / name
-        if low_path.is_file() and not force:
+        if low_path.is_file() and not force and not low_is_stale(low_path, src, variant, master_frames=master_frames):
             continue
         if measured is None:
             if geometry is None:
@@ -1208,14 +1404,44 @@ def list_low_encodes(src, low_dir, selected, scale, force, strict, geometry):
     return not failed
 
 
+def low_is_stale(low_path, master_path, variant, master_frames=None):
+    """True when an existing low file does not match the preset frame ratio.
+
+    Uses the container header (and optional known master frame count) so a
+    plan or dry-run does not have to read every packet on a network disk.
+    """
+    if frame_ratio(variant) == (1, 1):
+        return False
+    if not low_path.is_file():
+        return True
+    if master_frames is None and master_path is not None and Path(master_path).is_file():
+        master_frames = header_frame_count(master_path)
+    if not isinstance(master_frames, int) or master_frames < 1:
+        return True
+    kept = header_frame_count(low_path)
+    if kept is None:
+        return True
+    return kept != expected_low_frames(variant, master_frames)
+
+
+def pending_jobs(src, low_dir, selected, force, master_frames=None):
+    """Variant encodes still needed for this master."""
+    jobs = []
+    for variant, ffmpeg_args in selected:
+        out = low_dir / variant / src.name
+        if force or not out.is_file() or low_is_stale(out, src, variant, master_frames=master_frames):
+            jobs.append((variant, ffmpeg_args))
+    return jobs
+
+
 def degrade_master(
-    src, low_dir, selected, scale, flags, pix_fmt, force, strict, catalog, root,
-    dry_run=False, geometry=None, unlisted=False, conn=None,
+    src, low_dir, selected, scale, flags, pix_fmt, force, strict, conn,
+    dry_run=False, geometry=None, unlisted=False, verbose=True,
 ):
     """Write the selected lows of one master and record them. Return False on failure.
 
     `dry_run` only prints the encode lines. `geometry` is the size of a master
-    that is not on disk yet. `unlisted` allows an on-disk file the catalog
+    that is not on disk yet. `unlisted` allows an on-disk file the database
     does not name yet; a real run would record it before degrading.
     """
     parts = split_master_filename(src.name)
@@ -1223,37 +1449,47 @@ def degrade_master(
         print(f"{src.name}: expected <title>.<rung>.mkv", file=sys.stderr)
         return False
     title, rung = parts
-    entry = titles_of(catalog, catalog_file(root)).get(title)
-    masters = entry.get("masters") if isinstance(entry, dict) else None
-    master = masters.get(rung) if isinstance(masters, dict) else None
-    if not isinstance(master, dict):
+    source = source_record(conn, title)
+    master = None
+    if source is not None:
+        master = conn.execute(
+            "SELECT id, width, height FROM source_masters "
+            "WHERE source_id = ? AND rung = ?",
+            (source["id"], rung),
+        ).fetchone()
+    if master is None:
         if not (dry_run and (geometry is not None or unlisted)):
-            print(f"{src.name}: not in the catalog", file=sys.stderr)
+            print(f"{src.name}: not in the database", file=sys.stderr)
             return False
-        master = {"low": []}
     if dry_run:
+        master_frames = source["frames"] if source is not None else None
         return list_low_encodes(
             src, low_dir, selected, scale, force, strict, geometry,
+            master_frames=master_frames,
         )
-    if not isinstance(master.get("low"), list):
-        print(f"{src.name}: low variants must be a list", file=sys.stderr)
-        return False
     failed = False
     jobs = []
     for variant, ffmpeg_args in selected:
         low_path = low_dir / variant / src.name
-        if low_path.is_file() and not force and variant in master["low"]:
-            print(f"keep {variant}/{src.name}", flush=True)
-            if conn is not None:
-                try:
-                    db_remember_variant(conn, title, rung, variant, src.name)
-                except RuntimeError as exc:
-                    print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
+        master_frames = source["frames"] if source is not None else None
+        if low_path.is_file() and not force and not low_is_stale(low_path, src, variant, master_frames=master_frames):
+            say(f"keep {variant}/{src.name}", verbose)
+            try:
+                db_remember_variant(conn, title, rung, variant, src.name)
+            except RuntimeError as exc:
+                print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
             continue
         jobs.append((variant, ffmpeg_args))
     encoded = encode_variants(
-        src, low_dir, jobs, scale, flags, pix_fmt, force, strict,
+        src, low_dir, jobs, scale, flags, pix_fmt, force, strict, verbose=verbose,
     ) if jobs else {}
+    source = source_record(conn, title)
+    if master is None and source is not None:
+        master = conn.execute(
+            "SELECT id, width, height FROM source_masters "
+            "WHERE source_id = ? AND rung = ?",
+            (source["id"], rung),
+        ).fetchone()
     for variant, _ in jobs:
         low_path = low_dir / variant / src.name
         frames = encoded.get(variant)
@@ -1262,12 +1498,15 @@ def degrade_master(
             continue
         if frames < 0:
             continue
-        master_frames = entry.get("frames")
+        master_frames = source["frames"] if source is not None else None
         if not isinstance(master_frames, int) or frames != expected_low_frames(variant, master_frames):
+            expected = (
+                describe_frames(variant, master_frames)
+                if isinstance(master_frames, int) else "?"
+            )
             print(
-                f"{variant}/{src.name}: {frames} frames, catalog says "
-                f"{master_frames} master frames, expected "
-                f"{describe_frames(variant, master_frames) if isinstance(master_frames, int) else '?'}",
+                f"{variant}/{src.name}: {frames} frames, database says "
+                f"{master_frames} master frames, expected {expected}",
                 file=sys.stderr,
             )
             failed = True
@@ -1278,221 +1517,178 @@ def degrade_master(
             print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
             failed = True
             continue
-        if master.get("width") != low_w * scale or master.get("height") != low_h * scale:
+        width = master["width"] if master is not None else None
+        height = master["height"] if master is not None else None
+        if width != low_w * scale or height != low_h * scale:
             print(
                 f"{variant}/{src.name} is {low_w}x{low_h}, "
-                f"orig is {master.get('width')}x{master.get('height')}, "
+                f"orig is {width}x{height}, "
                 f"expected exactly {scale}x",
                 file=sys.stderr,
             )
             failed = True
             continue
-        if variant not in master["low"]:
-            master["low"].append(variant)
-        save_catalog(root, catalog)
-        if conn is not None:
-            try:
-                db_remember_variant(conn, title, rung, variant, src.name)
-            except RuntimeError as exc:
-                print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
-                failed = True
+        try:
+            db_remember_variant(conn, title, rung, variant, src.name)
+        except RuntimeError as exc:
+            print(f"{variant}/{src.name}: {exc}", file=sys.stderr)
+            failed = True
     return not failed
 
 
-def finish_title(
-    title, orig_dir, rungs, low_dir, selected,
-    scale, flags, pix_fmt, force, strict, catalog, root, dry_run=False,
-    conn=None,
-):
-    """Degrade one master before the next one is encoded.
+def plan_title(conn, title, orig_dir, rungs, low_dir, selected, force):
+    """Work still needed for one title.
 
-    Masters already on disk come first, largest planned rung first. A missing
-    rung is encoded from origin and degraded before the next missing rung.
-    A missing origin leaves the written masters in place. `dry_run` lists
-    those encodes and writes nothing. Return False when a step fails.
+    Returns (steps, skipped, warnings, failed, record). `steps` need encoding
+    (and maybe a new master). `record` are unlisted existing masters that
+    only need a database row. `warnings` are messages to print.
     """
-    titles = titles_of(catalog, catalog_file(root))
-    entry = titles.get(title)
-    if not isinstance(entry, dict):
-        entry = entry_from_db(conn, title) if conn is not None else None
-        if not isinstance(entry, dict):
-            return True
-        titles[title] = entry
-    elif conn is not None:
-        merge_entry_from_db(entry, conn, title)
+    source = source_record(conn, title)
+    if source is None:
+        return [], 0, [], False, []
+    warnings = []
     failed = False
     planned = []
     src = None
     probed = None
-    origin = entry.get("origin")
+    origin = source["origin_path"]
     if origin:
         src = Path(origin)
         if not src.is_file():
-            print(f"{title}: origin is gone, masters stay", file=sys.stderr)
+            warnings.append(f"{title}: origin is gone, masters stay")
         else:
             probed = inspect_source(src)
             if probed is None:
                 failed = True
             else:
                 planned = plan_masters(*probed["display"], rungs)
-
-    def degrade_path(path, geometry=None, unlisted=False):
-        nonlocal failed
-        ok = degrade_master(
-            path, low_dir, selected, scale, flags, pix_fmt,
-            force, strict, catalog, root,
-            dry_run=dry_run, geometry=geometry, unlisted=unlisted, conn=conn,
-        )
-        failed = failed or not ok
-
-    def masters_of():
-        masters = entry.get("masters")
-        if isinstance(masters, dict):
-            return masters
-        return {}
-
+    db_masters = {row["rung"]: row for row in masters_for_title(conn, title)}
+    steps = []
+    skipped = 0
     seen = set()
     planned_rungs = {item[0] for item in planned}
+    record = []
+
+    def job_count(path, assume_all=False):
+        if assume_all or not path.is_file():
+            return len(selected)
+        return len(pending_jobs(path, low_dir, selected, force, master_frames=source["frames"]))
+
     for item in planned:
         rung = item[0]
         path = orig_dir / master_filename(title, rung)
         if not path.is_file():
             continue
-        unlisted = rung not in masters_of()
+        unlisted = rung not in db_masters
+        jobs = job_count(path)
         if unlisted:
-            names, one_failed = produce_planned(
-                src, title, [item], probed, orig_dir, False, catalog, root,
-                dry_run=dry_run, conn=conn,
-            )
-            failed = failed or one_failed
-            if one_failed or path.name not in names:
-                continue
+            record.append((path, item, src, probed))
+        if jobs:
+            steps.append({
+                "name": path.name,
+                "path": path,
+                "jobs": jobs,
+                "produce": None,
+                "unlisted": unlisted,
+                "item": item,
+                "src": src,
+                "probed": probed,
+            })
+        else:
+            skipped += 1
         seen.add(rung)
-        degrade_path(path, unlisted=dry_run and unlisted)
-    for rung in list(masters_of()):
+    for rung in db_masters:
         if rung in seen or rung in planned_rungs:
             continue
         path = orig_dir / master_filename(title, rung)
         if not path.is_file():
-            print(f"skip {path.name}: file missing", file=sys.stderr)
+            warnings.append(f"skip {path.name}: file missing")
             failed = True
             continue
         seen.add(rung)
-        degrade_path(path)
+        jobs = job_count(path)
+        if jobs:
+            steps.append({
+                "name": path.name,
+                "path": path,
+                "jobs": jobs,
+                "produce": None,
+                "unlisted": False,
+                "item": None,
+                "src": src,
+                "probed": probed,
+            })
+        else:
+            skipped += 1
     for item in planned:
         rung = item[0]
         if rung in seen:
             continue
         path = orig_dir / master_filename(title, rung)
-        names, one_failed = produce_planned(
-            src, title, [item], probed, orig_dir, False, catalog, root,
-            dry_run=dry_run, conn=conn,
+        if src is None or probed is None:
+            warnings.append(f"skip {path.name}: file missing")
+            failed = True
+            continue
+        steps.append({
+            "name": path.name,
+            "path": path,
+            "jobs": job_count(path, assume_all=True),
+            "produce": item,
+            "unlisted": False,
+            "item": item,
+            "src": src,
+            "probed": probed,
+        })
+    return steps, skipped, warnings, failed, record
+
+
+def execute_title(
+    conn, title, plan, orig_dir, low_dir, selected,
+    scale, flags, pix_fmt, force, strict, dry_run=False, verbose=True, progress=None,
+):
+    """Run a plan from plan_title. Return False when a step fails."""
+    steps, _skipped, warnings, failed, record = plan
+    for message in warnings:
+        print(message, file=sys.stderr)
+    for _path, item, src, probed in record:
+        if dry_run:
+            continue
+        _names, one_failed = produce_planned(
+            src, title, [item], probed, orig_dir, False, conn,
+            dry_run=False, verbose=verbose,
         )
         failed = failed or one_failed
-        ready = path.name in names and (path.is_file() or dry_run)
-        if one_failed or not ready:
-            if not path.is_file():
-                print(f"skip {path.name}: file missing", file=sys.stderr)
-                failed = True
-            continue
-        seen.add(rung)
-        geometry = planned_geometry(item, probed) if dry_run and not path.is_file() else None
-        degrade_path(path, geometry=geometry)
+    for step in steps:
+        if progress is not None:
+            progress.start_item(step["name"], step["jobs"])
+        path = step["path"]
+        if step["produce"] is not None:
+            names, one_failed = produce_planned(
+                step["src"], title, [step["produce"]], step["probed"],
+                orig_dir, False, conn, dry_run=dry_run, verbose=verbose,
+            )
+            failed = failed or one_failed
+            ready = path.name in names and (path.is_file() or dry_run)
+            if one_failed or not ready:
+                if not path.is_file() and not dry_run:
+                    print(f"skip {path.name}: file missing", file=sys.stderr)
+                    failed = True
+                if progress is not None:
+                    progress.advance()
+                continue
+        geometry = None
+        if dry_run and not path.is_file() and step["item"] is not None and step["probed"] is not None:
+            geometry = planned_geometry(step["item"], step["probed"])
+        ok = degrade_master(
+            path, low_dir, selected, scale, flags, pix_fmt,
+            force, strict, conn,
+            dry_run=dry_run, geometry=geometry, unlisted=step["unlisted"],
+            verbose=verbose,
+        )
+        failed = failed or not ok
+        if progress is not None:
+            progress.advance()
     return not failed
-
-
-def _listed_lows(master):
-    """Variant names recorded on this master, in catalog order."""
-    lows = master.get("low") if isinstance(master, dict) else None
-    if not isinstance(lows, list):
-        return None
-    names = []
-    for name in lows:
-        if (
-            not isinstance(name, str)
-            or not name
-            or name in {".", ".."}
-            or "/" in name
-            or name in names
-        ):
-            continue
-        names.append(name)
-    return names
-
-
-def library_stats(catalog, where, orig_dir, low_dir):
-    """Ready films grouped by master size, plus masters that are not ready.
-
-    A film is one catalog master whose file exists and that has at least one
-    low file. `pairs` counts files named in the degrade list. Frames are the
-    title's frame count, added once per film. Masters with no low file, and
-    masters still missing a degrade variant, are listed after the table.
-    """
-    scale, _, _, variants = degrade_of(catalog, where)
-    titles = titles_of(catalog, where)
-    recipe = list(variants)
-    groups = {}
-    gaps = []
-    for title, entry in titles.items():
-        if not isinstance(entry, dict):
-            gaps.append(("skip", title, "bad catalog entry"))
-            continue
-        frames = entry.get("frames")
-        masters = entry.get("masters")
-        if not isinstance(masters, dict):
-            gaps.append(("skip", title, "no masters"))
-            continue
-        if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
-            gaps.append(("skip", title, "missing frames"))
-            continue
-        for rung, master in masters.items():
-            name = master_filename(title, rung)
-            if not isinstance(master, dict):
-                gaps.append(("skip", name, "bad catalog entry"))
-                continue
-            width = master.get("width")
-            height = master.get("height")
-            if isinstance(width, bool) or not isinstance(width, int) or width < 1:
-                gaps.append(("skip", name, "missing width"))
-                continue
-            if isinstance(height, bool) or not isinstance(height, int) or height < 1:
-                gaps.append(("skip", name, "missing height"))
-                continue
-            listed = _listed_lows(master)
-            if listed is None:
-                gaps.append(("skip", name, "no lows"))
-                continue
-            if not (orig_dir / name).is_file():
-                gaps.append(("no master", name, None))
-                continue
-            present = [variant for variant in recipe if (low_dir / variant / name).is_file()]
-            other = [
-                variant for variant in listed
-                if variant not in variants and (low_dir / variant / name).is_file()
-            ]
-            if not present and not other:
-                gaps.append(("no low", name, None))
-                continue
-            bucket = groups.setdefault((width, height), {"films": 0, "pairs": 0, "frames": 0})
-            bucket["films"] += 1
-            bucket["pairs"] += len(present)
-            bucket["frames"] += frames
-            missing = [variant for variant in recipe if variant not in present]
-            if missing:
-                gaps.append(("incomplete", name, (len(present), len(recipe), missing)))
-    rows = []
-    for (width, height), bucket in groups.items():
-        rows.append({
-            "width": width,
-            "height": height,
-            "low_w": width // scale,
-            "low_h": height // scale,
-            "films": bucket["films"],
-            "pairs": bucket["pairs"],
-            "frames": bucket["frames"],
-        })
-    rows.sort(key=lambda row: (row["width"] * row["height"], row["width"]), reverse=True)
-    return recipe, rows, gaps
 
 
 def library_stats_from_db(conn, orig_dir, low_dir):
@@ -1617,9 +1813,18 @@ def sources_from_args(orig_dir, names):
     return sources, True
 
 
+def enabled_title_names(conn):
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sources WHERE enabled = 1 ORDER BY name"
+        )
+    ]
+
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        description="encode half-resolution variants of catalog masters, "
+        description="encode half-resolution variants of database masters, "
         "finishing one master before the next. "
         "`whoodeo-make-low import` writes a source into orig first. "
         "`whoodeo-make-low stats` prints masters grouped by size",
@@ -1643,7 +1848,7 @@ def parse_args(argv):
 def parse_stats_args(argv):
     parser = argparse.ArgumentParser(
         prog="whoodeo-make-low stats",
-        description="print catalog masters grouped by size. "
+        description="print database masters grouped by size. "
         "A film has at least one low file. Pairs are finished files from "
         "the enabled degrade presets. Frames are counted once per film.",
     )
@@ -1670,7 +1875,7 @@ def stats_main(argv):
 def parse_import_args(argv):
     parser = argparse.ArgumentParser(
         prog="whoodeo-make-low import",
-        description="write sources into orig, one file per catalog rung. "
+        description="write sources into orig, one file per database rung. "
         "A source larger than a rung is encoded down to it. A source that "
         "already sits on a rung is remuxed. Each master's low variants are "
         "written before the next master, unless --no-degrade",
@@ -1688,11 +1893,31 @@ def parse_import_args(argv):
     return parser.parse_args(argv)
 
 
+def _import_work_items(orig_dir, low_dir, selected, prepared_list, force, no_degrade):
+    """Masters that still need a write or low variants. Also a skip count."""
+    items = []
+    skipped = 0
+    for src, title, planned, probed in prepared_list:
+        for item in planned:
+            path = orig_dir / master_filename(title, item[0])
+            needs_write = force or not path.is_file()
+            jobs = 0
+            if not no_degrade and selected is not None:
+                if path.is_file() and not force:
+                    jobs = len(pending_jobs(path, low_dir, selected, force))
+                else:
+                    jobs = len(selected)
+            if needs_write or jobs:
+                items.append((src, title, item, probed, path, jobs, needs_write))
+            else:
+                skipped += 1
+    return items, skipped
+
+
 def import_main(argv):
     args = parse_import_args(argv)
     conn, root, orig_dir, low_dir = open_store(args)
     try:
-        catalog = load_catalog_mirror(root, create=True, dry_run=args.dry_run)
         if not args.dry_run:
             orig_dir.mkdir(parents=True, exist_ok=True)
         rungs = db.load_rungs(conn)
@@ -1707,51 +1932,65 @@ def import_main(argv):
             FRAME_RATIOS.update(ratios)
             selected = select_variants(variants, None)
         failed = False
+        prepared_list = []
         for name in args.videos:
             src = Path(name).expanduser().resolve()
             prepared = prepare_import(
-                src, orig_dir, rungs, catalog, root,
-                dry_run=args.dry_run, force=args.force, conn=conn,
+                src, orig_dir, rungs, conn,
+                dry_run=args.dry_run, force=args.force,
             )
             if prepared is None:
                 failed = True
                 continue
-            title, planned, probed = prepared
-            for item in planned:
-                written, one_failed = produce_planned(
-                    src, title, [item], probed, orig_dir, args.force, catalog, root,
-                    dry_run=args.dry_run, conn=conn,
-                )
-                failed = failed or one_failed
-                if args.no_degrade:
-                    continue
-                for master_name in written:
-                    path = orig_dir / master_name
-                    geometry = None
-                    if args.dry_run and (args.force or not path.is_file()):
-                        geometry = planned_geometry(item, probed)
-                    ok = degrade_master(
-                        path, low_dir, selected,
-                        scale, flags, pix_fmt, args.force, True, catalog, root,
-                        dry_run=args.dry_run, geometry=geometry, conn=conn,
+            prepared_list.append((src, *prepared))
+        verbose = args.dry_run
+        if not args.dry_run:
+            work, skipped = _import_work_items(
+                orig_dir, low_dir, selected, prepared_list, args.force, args.no_degrade,
+            )
+            begin_progress(len(work), skipped)
+        try:
+            for src, title, planned, probed in prepared_list:
+                for item in planned:
+                    path = orig_dir / master_filename(title, item[0])
+                    jobs = 0
+                    if not args.no_degrade and selected is not None:
+                        if path.is_file() and not args.force:
+                            jobs = len(pending_jobs(path, low_dir, selected, args.force))
+                        else:
+                            jobs = len(selected)
+                    needs = args.force or not path.is_file() or jobs
+                    if not args.dry_run and needs and _ACTIVE_PROGRESS is not None:
+                        _ACTIVE_PROGRESS.start_item(path.name, jobs)
+                    written, one_failed = produce_planned(
+                        src, title, [item], probed, orig_dir, args.force, conn,
+                        dry_run=args.dry_run, verbose=verbose,
                     )
-                    failed = failed or not ok
+                    failed = failed or one_failed
+                    if args.no_degrade:
+                        if not args.dry_run and needs and _ACTIVE_PROGRESS is not None:
+                            _ACTIVE_PROGRESS.advance()
+                        continue
+                    for master_name in written:
+                        master_path = orig_dir / master_name
+                        geometry = None
+                        if args.dry_run and (args.force or not master_path.is_file()):
+                            geometry = planned_geometry(item, probed)
+                        ok = degrade_master(
+                            master_path, low_dir, selected,
+                            scale, flags, pix_fmt, args.force, True, conn,
+                            dry_run=args.dry_run, geometry=geometry, verbose=verbose,
+                        )
+                        failed = failed or not ok
+                    if not args.dry_run and needs and _ACTIVE_PROGRESS is not None:
+                        _ACTIVE_PROGRESS.advance()
+        finally:
+            end_progress()
         if failed:
             raise SystemExit(1)
     finally:
+        end_progress()
         conn.close()
-
-
-def _title_names(conn, catalog, root):
-    names = [row[0] for row in conn.execute(
-        "SELECT name FROM sources WHERE enabled = 1 ORDER BY name"
-    )]
-    seen = set(names)
-    for title in titles_of(catalog, catalog_file(root)):
-        if title not in seen:
-            names.append(title)
-            seen.add(title)
-    return names
 
 
 def main(argv=None):
@@ -1770,7 +2009,6 @@ def main(argv=None):
             raise SystemExit(f"no orig folder: {orig_dir}")
         if not args.dry_run:
             low_dir.mkdir(parents=True, exist_ok=True)
-        catalog = load_catalog_mirror(root, create=False, dry_run=args.dry_run)
         scale, scale_flags, pix_fmt, variants, ratios = db.load_degrade_ratios(conn, enabled_only=False)
         FRAME_RATIOS.update(ratios)
         enabled = {
@@ -1782,26 +2020,68 @@ def main(argv=None):
         selected = select_variants(variants, args.variants)
         rungs = db.load_rungs(conn)
         failed = False
-        if not args.videos:
-            for title in _title_names(conn, catalog, root):
-                ok = finish_title(
-                    title, orig_dir, rungs, low_dir, selected,
-                    scale, scale_flags, pix_fmt, args.force, False, catalog, root,
-                    dry_run=args.dry_run, conn=conn,
-                )
-                failed = failed or not ok
-        else:
-            sources, strict = sources_from_args(orig_dir, args.videos)
-            for src in sources:
-                ok = degrade_master(
-                    src, low_dir, selected, scale, scale_flags, pix_fmt,
-                    args.force, strict, catalog, root, dry_run=args.dry_run,
-                    conn=conn,
-                )
-                failed = failed or not ok
+        verbose = args.dry_run
+        try:
+            if not args.videos:
+                titles = enabled_title_names(conn)
+                plans = []
+                total = 0
+                skipped = 0
+                for title in titles:
+                    plan = plan_title(
+                        conn, title, orig_dir, rungs, low_dir, selected, args.force,
+                    )
+                    plans.append((title, plan))
+                    total += len(plan[0])
+                    skipped += plan[1]
+                if not args.dry_run:
+                    begin_progress(total, skipped)
+                for title, plan in plans:
+                    ok = execute_title(
+                        conn, title, plan, orig_dir, low_dir, selected,
+                        scale, scale_flags, pix_fmt, args.force, False,
+                        dry_run=args.dry_run, verbose=verbose,
+                        progress=_ACTIVE_PROGRESS,
+                    )
+                    failed = failed or not ok
+            else:
+                sources, strict = sources_from_args(orig_dir, args.videos)
+                if args.dry_run:
+                    for src in sources:
+                        ok = degrade_master(
+                            src, low_dir, selected, scale, scale_flags, pix_fmt,
+                            args.force, strict, conn, dry_run=True, verbose=True,
+                        )
+                        failed = failed or not ok
+                else:
+                    pending = []
+                    skipped = 0
+                    for src in sources:
+                        jobs = pending_jobs(src, low_dir, selected, args.force)
+                        if jobs:
+                            pending.append((src, jobs))
+                        else:
+                            skipped += 1
+                            ok = degrade_master(
+                                src, low_dir, selected, scale, scale_flags, pix_fmt,
+                                args.force, strict, conn, verbose=False,
+                            )
+                            failed = failed or not ok
+                    begin_progress(len(pending), skipped)
+                    for src, jobs in pending:
+                        _ACTIVE_PROGRESS.start_item(src.name, len(jobs))
+                        ok = degrade_master(
+                            src, low_dir, selected, scale, scale_flags, pix_fmt,
+                            args.force, strict, conn, verbose=False,
+                        )
+                        failed = failed or not ok
+                        _ACTIVE_PROGRESS.advance()
+        finally:
+            end_progress()
         if failed:
             raise SystemExit(1)
     finally:
+        end_progress()
         conn.close()
 
 
