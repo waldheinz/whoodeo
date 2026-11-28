@@ -15,6 +15,11 @@ nonisolated struct FilmFacts: Sendable {
     var sourceFps: Double = 0
     /// Decimate cycle in force, nil when every source frame is used.
     var cycle: Int?
+    /// Short hash of the time plan in force, nil without one.
+    var plan: String?
+    /// Pictures the file header claims and whether the file ends before them.
+    var declaredCount: Int = 0
+    var clipped: Bool = false
 
     /// What the codec condition of a latent_up with FiLM calls this film.
     var codec: SourceCodec { SourceCodec.detect(ffmpegName: codecName) }
@@ -50,6 +55,15 @@ nonisolated final class Film {
     private let reader: OpaquePointer
     private var held: [Int: Decoded] = [:]
     private var heldOrder: [Int] = []
+    /// Reconstructed frames of a time plan by their index in the film the app sees.
+    private var virtualHeld: [Int: Decoded] = [:]
+    private var virtualOrder: [Int] = []
+    /// S3 and S4 of a group come from the same five frames: both are kept by the first of them.
+    private var pairHeld: [Int: (s3: [Float], s4: [Float])] = [:]
+    private var pairOrder: [Int] = []
+    /// Source frames held for repeated reads. A reconstruction reads five neighbors,
+    /// a window of three of them up to seven.
+    private static let heldLimit = 16
 
     @concurrent
     static func load(_ url: URL, map: FrameMap? = nil) async throws -> Film {
@@ -98,7 +112,9 @@ nonisolated final class Film {
             bits: Int(source_bits(opened)),
             codecName: String(cString: source_codec(opened)),
             sourceCount: count,
-            sourceFps: fps > 0 ? fps : 25
+            sourceFps: fps > 0 ? fps : 25,
+            declaredCount: Int(source_declared(opened)),
+            clipped: source_clipped(opened) != 0
         )
         let film = Film(facts: facts, audio: audio, frameDuration: duration, reader: opened)
         film.apply(map)
@@ -138,6 +154,10 @@ nonisolated final class Film {
 
     /// Switch the preprocessing. Nil shows every source frame again.
     func apply(_ next: FrameMap?) {
+        virtualHeld = [:]
+        virtualOrder = []
+        pairHeld = [:]
+        pairOrder = []
         guard let next, next.rawCount == source.count, next.count > 0 else {
             map = nil
             facts = source
@@ -148,6 +168,7 @@ nonisolated final class Film {
         logical.count = next.count
         logical.fps = next.fps(source: source.fps)
         logical.cycle = next.cycle
+        logical.plan = next.plan
         facts = logical
     }
 
@@ -173,16 +194,26 @@ nonisolated final class Film {
         if let map {
             // Even steps from the first source stamp: `cycle` source frames become `cycle - 1`.
             let start = Film.stamp(0, reader)
-            let ticks = Int64(max(index, 0)) * Int64(map.cycle)
-            guard ticks <= Int64(Int32.max) else { return start }
-            let offset = CMTimeMultiplyByRatio(sourceDuration, multiplier: Int32(ticks), divisor: Int32(map.cycle - 1))
-            return CMTimeAdd(start, offset)
+            return CMTimeAdd(start, Film.scaled(sourceDuration, by: Int64(max(index, 0)) * Int64(map.cycle), over: Int64(map.cycle - 1)))
         }
         if index < facts.count { return Film.stamp(max(index, 0), reader) }
         let last = Film.stamp(facts.count - 1, reader)
         let extra = index - (facts.count - 1)
         guard extra > 0, extra <= Int(Int32.max) else { return last }
         return CMTimeAdd(last, CMTimeMultiply(frameDuration, multiplier: Int32(extra)))
+    }
+
+    /// `duration · multiplier / divisor` in 64 bits. CMTimeMultiplyByRatio takes 32-bit factors,
+    /// so long films and fine timescales overflow it.
+    static func scaled(_ duration: CMTime, by multiplier: Int64, over divisor: Int64) -> CMTime {
+        guard divisor > 0, duration.timescale > 0 else { return .zero }
+        let (value, overflow) = duration.value.multipliedReportingOverflow(by: multiplier)
+        let scale = Int64(duration.timescale) * divisor
+        if !overflow, scale <= Int64(Int32.max) {
+            return CMTime(value: value, timescale: Int32(scale))
+        }
+        let seconds = Double(duration.value) * Double(multiplier) / (Double(duration.timescale) * Double(divisor))
+        return CMTime(seconds: seconds, preferredTimescale: 90_000)
     }
 
     func duration(at index: Int) -> CMTime {
@@ -199,9 +230,42 @@ nonisolated final class Film {
     /// Decodes on the calling thread. One film is not safe to share between threads.
     func decode(at index: Int) throws -> Decoded {
         let clamped = min(max(index, 0), max(facts.count - 1, 0))
+        if let map, map.op(at: clamped) != 0 {
+            return try decodeVirtual(clamped, map: map)
+        }
         var decoded = try decodeSource(sourceIndex(clamped))
         decoded.index = clamped
         decoded.time = time(for: clamped)
+        return decoded
+    }
+
+    /// A frame the time plan computes from its source neighbors, held like the source frames.
+    private func decodeVirtual(_ index: Int, map: FrameMap) throws -> Decoded {
+        if let hit = virtualHeld[index] { return hit }
+        let op = map.op(at: index)
+        guard let first = TimeSolver.firstSource(main: map.raw[index], op: op) else {
+            throw CLIError("Bild \(index + 1): unbekanntes Rezept \(op)")
+        }
+        let pair: (s3: [Float], s4: [Float])
+        if let hit = pairHeld[first] {
+            pair = hit
+        } else {
+            var planes: [[Float]] = []
+            for offset in 0..<TimeSolver.inputs {
+                planes.append(try decodeSource(first + offset).rgb)
+            }
+            pair = TimeSolver.reconstructPair(planes, width: facts.width, height: facts.height, params: map.solver)
+            pairHeld[first] = pair
+            pairOrder.append(first)
+            while pairOrder.count > 2 { pairHeld.removeValue(forKey: pairOrder.removeFirst()) }
+        }
+        let rgb = op == TimeSolver.opS3 ? pair.s3 : pair.s4
+        let decoded = Decoded(index: index, time: time(for: index), width: facts.width, height: facts.height, rgb: rgb)
+        virtualHeld[index] = decoded
+        virtualOrder.append(index)
+        while virtualOrder.count > 4 {
+            virtualHeld.removeValue(forKey: virtualOrder.removeFirst())
+        }
         return decoded
     }
 
@@ -218,6 +282,14 @@ nonisolated final class Film {
         }
         guard status == 0 else { throw CLIError(String(cString: source_error(reader))) }
         return (Int(width), Int(height))
+    }
+
+    /// A source frame as the file holds it, for diagnosis. Ignores the map.
+    func decodeRaw(source index: Int) throws -> Decoded { try decodeSource(index) }
+
+    /// Time stamp of a source frame in the file.
+    func sourceTime(_ index: Int) -> CMTime {
+        Film.stamp(min(max(index, 0), max(source.count - 1, 0)), reader)
     }
 
     /// One frame of the file, by its own index. Held by that index, so a map change keeps the hold.
@@ -258,22 +330,24 @@ nonisolated final class Film {
         let radius = frames / 2
         var planes: [[Float]] = []
         var slots: [Int] = []
+        var variants: [Int] = []
         var current: Decoded?
         for dt in -radius...radius {
             let slot = min(max(index + dt, 0), max(facts.count - 1, 0))
             let decoded = try await frame(at: slot)
             planes.append(decoded.rgb)
             slots.append(sourceIndex(slot))
+            variants.append(map?.variant(at: slot) ?? 0)
             if dt == 0 { current = decoded }
         }
         guard let current else { throw CLIError("Bild \(index) fehlt") }
-        return (Pixels.stack(planes), current, FrameKeys(film: facts.url, slots: slots))
+        return (Pixels.stack(planes), current, FrameKeys(film: facts.url, slots: slots, variants: variants))
     }
 
     private func remember(_ decoded: Decoded) {
         if held[decoded.index] == nil { heldOrder.append(decoded.index) }
         held[decoded.index] = decoded
-        while heldOrder.count > 8 {
+        while heldOrder.count > Film.heldLimit {
             held.removeValue(forKey: heldOrder.removeFirst())
         }
     }

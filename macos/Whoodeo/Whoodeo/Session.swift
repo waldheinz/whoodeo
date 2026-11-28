@@ -102,6 +102,10 @@ final class Session: ObservableObject {
     @Published private(set) var decimateProgress: Double?
     /// What automatic found, or why the scan stopped. Empty when there is nothing to say.
     @Published private(set) var decimateNote = ""
+    /// The running scan measures the time structure (not only repeats).
+    @Published private(set) var scanningTime = false
+    /// The time plan of the open film, also when automatic did not take it. Nil without one.
+    @Published private(set) var timePlan: TimePlan?
     /// Light and color after the upscaler, per film. The screen shows it at once; an export renders it in.
     @Published var grade = ColorGrade.neutral {
         didSet {
@@ -141,6 +145,8 @@ final class Session: ObservableObject {
     /// Which source frames the open film keeps. Nil when it keeps all of them.
     private var frameMap: FrameMap?
     private var decimateToken = 0
+    /// Film whose solver parameters are being measured.
+    private var solverFitting: String?
     private var decimateCancel: OSAllocatedUnfairLock<Bool>?
     private var gradeSave: Task<Void, Never>?
     /// The app is quitting; nothing new goes to the engines.
@@ -892,6 +898,47 @@ final class Session: ObservableObject {
         _ = addFilm(at: url.path)
     }
 
+    /// Menu: writes the frame on screen for diagnosis into ~/Downloads/whoodeo-diag/export/<film>_<frame>/:
+    /// the preview picture, the cached upscale, the raw source frames and an info file. Computes nothing on the GPU.
+    func exportCurrentFrame() {
+        guard let facts, frameCount > 0, let id = shownFilmID else { return }
+        let frame = min(max(index, 0), frameCount - 1)
+        let map = frameMap
+        let model = selectedModel
+        let context = FrameExportContext(
+            filmID: id,
+            plan: timePlan,
+            preprocess: preprocess,
+            store: store,
+            modelPath: modelURL?.path,
+            modelDetail: model?.detail,
+            runName: model?.runName,
+            step: model?.step,
+            cacheTag: conditionTag(),
+            gradeActive: grade != .neutral
+        )
+        let title = filmTitle ?? facts.url.deletingPathExtension().lastPathComponent
+        let url = facts.url
+        status = "exportiert Bild \(frame + 1)…"
+        let session = self
+        Task.detached(priority: .userInitiated) {
+            let result = Result<URL, Error> {
+                let film = try Film.open(url, map: map)
+                return try FrameExport.export(film: film, index: frame, title: title, context: context)
+            }
+            await MainActor.run {
+                switch result {
+                case .success(let folder):
+                    session.status = "Bild \(frame + 1) exportiert: \(folder.path)"
+                    Log.model.info("Bild exportiert: \(folder.path, privacy: .public)")
+                case .failure(let error):
+                    session.failure = error.localizedDescription
+                    session.status = "Export des Bildes fehlgeschlagen: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     func pickExport() {
         guard canExport else { return }
         let panel = NSSavePanel()
@@ -1168,10 +1215,18 @@ final class Session: ObservableObject {
         preprocess = entry?.preprocess ?? .none
         grade = entry?.grade ?? .neutral
         // A scan from before resolves at once. The film checks that it was made for this file.
-        let scan = preprocess.decimate == .off ? nil : Decimate.cached(filmID: id)
-        let resolved = scan.map { Decimate.resolve(preprocess.decimate, diffs: $0) }
+        let decimate = preprocess.decimateInForce
+        let scan = decimate == .off ? nil : Decimate.cached(filmID: id)
+        let resolved = scan.map { Decimate.resolve(decimate, diffs: $0) }
         frameMap = resolved?.map
         decimateNote = resolved?.note ?? ""
+        timePlan = nil
+        let features = preprocess.plansTime ? TimeAnalysis.cached(filmID: id) : nil
+        if let features {
+            let planned = planTime(features, id: id)
+            frameMap = planned.map
+            decimateNote = planned.note
+        }
         releaseArchive()
         busy = true
         status = "öffnet \(url.lastPathComponent)"
@@ -1182,8 +1237,12 @@ final class Session: ObservableObject {
                 case .success(let facts):
                     self.loadingFilmID = nil
                     if facts.cycle == nil { self.frameMap = nil }
-                    if self.preprocess.decimate != .off, scan?.count != facts.sourceCount {
+                    if self.preprocess.decimateInForce != .off, scan?.count != facts.sourceCount {
                         self.startDecimateScan(url: url, id: id)
+                    }
+                    if self.preprocess.plansTime, features?.count != facts.sourceCount {
+                        self.timePlan = nil
+                        self.startTimeScan(url: url, id: id)
                     }
                     self.facts = facts
                     self.originals = Originals(url: facts.url, map: self.frameMap)
@@ -1231,6 +1290,7 @@ final class Session: ObservableObject {
     private func closeShownFilm() {
         cancelDecimateScan()
         frameMap = nil
+        timePlan = nil
         preprocess = .none
         decimateNote = ""
         shownFilmID = nil
@@ -1685,7 +1745,7 @@ final class Session: ObservableObject {
     /// Why the cache folder cannot change right now. Nil when it can.
     var cacheBusyReason: String? {
         if exporting { return "Während eines Exports bleibt der Cache-Ordner, wie er ist." }
-        if decimateProgress != nil { return "Bitte warten, bis der Scan nach doppelten Bildern fertig ist." }
+        if decimateProgress != nil { return "Bitte warten, bis die Messung der Zeitstruktur fertig ist." }
         return nil
     }
 
@@ -1793,40 +1853,153 @@ final class Session: ObservableObject {
 
     // MARK: Pipeline
 
-    /// Pipeline panel and scripts: which repeated frames to drop. Scans the film once, then
-    /// switches the film the app sees. The frame cache of the other choice stays on disk.
+    /// Scripts: which repeated frames to drop. Off switches the time structure off,
+    /// anything else means "nur doppelte Bilder" with that cycle.
     func setDecimate(_ mode: DecimateMode) {
-        guard mode != preprocess.decimate else { return }
+        guard mode != preprocess.decimateInForce || (mode == .off && preprocess.timing != .off) else { return }
         guard !exporting else {
             failure = "Während des Exports bleibt die Vorverarbeitung."
             status = failure!
             return
         }
         preprocess.decimate = mode
+        preprocess.timing = mode == .off ? .off : .duplicates
         Log.model.info("Decimate \(mode.rawValue, privacy: .public)")
-        if let id = shownFilmID {
-            let config = preprocess
-            do {
-                try FilmLibrary.mutate { FilmLibrary.remember(id, preprocess: config, in: &$0) }
-            } catch {
-                Log.fill.error("Filmliste nicht geschrieben: \(error.localizedDescription, privacy: .public)")
-            }
-            reloadFilms()
+        savePreprocess()
+        applyTiming()
+    }
+
+    /// Pipeline panel and scripts: how the time structure is read. Measures the film once,
+    /// then switches the film the app sees. The frame cache of the other choice stays on disk.
+    func setTiming(_ mode: TimingMode) {
+        guard mode != preprocess.timing else { return }
+        guard !exporting else {
+            failure = "Während des Exports bleibt die Vorverarbeitung."
+            status = failure!
+            return
         }
+        preprocess.timing = mode
+        // Older versions read only `decimate`: it stays set only where repeats are dropped.
+        if mode == .duplicates {
+            if preprocess.decimate == .off { preprocess.decimate = .auto }
+        } else {
+            preprocess.decimate = .off
+        }
+        Log.model.info("Zeitstruktur \(mode.rawValue, privacy: .public)")
+        savePreprocess()
+        applyTiming()
+    }
+
+    /// Detail sheet: replaces the corrections of the time plan and plans again.
+    func setTimeOverrides(_ overrides: [TimeOverride]) {
+        guard overrides != preprocess.overrides, !exporting else { return }
+        preprocess.overrides = overrides
+        savePreprocess()
+        if preprocess.plansTime { applyTiming() }
+    }
+
+    /// Detail sheet: show the film at a source frame.
+    func showSourceFrame(_ source: Int) {
+        guard let facts, facts.count > 0 else { return }
+        scrub(frameMap?.index(forSource: source) ?? min(max(source, 0), facts.count - 1))
+    }
+
+    /// The source frame behind the frame on screen, for the detail sheet.
+    var currentSourceFrame: Int {
+        guard let frameMap, frameMap.count > 0 else { return index }
+        return frameMap.raw[min(max(index, 0), frameMap.count - 1)]
+    }
+
+    private func savePreprocess() {
+        guard let id = shownFilmID else { return }
+        let config = preprocess
+        do {
+            try FilmLibrary.mutate { FilmLibrary.remember(id, preprocess: config, in: &$0) }
+        } catch {
+            Log.fill.error("Filmliste nicht geschrieben: \(error.localizedDescription, privacy: .public)")
+        }
+        reloadFilms()
+    }
+
+    /// Bring the film in line with `preprocess`: off, repeats or a time plan, scanning when needed.
+    private func applyTiming() {
         cancelDecimateScan()
         decimateNote = ""
+        if !preprocess.plansTime { timePlan = nil }
         guard let facts, let id = shownFilmID else { return }
-        if mode == .off {
+        switch preprocess.timing {
+        case .off:
             switchMap(nil)
-            return
+        case .duplicates:
+            guard let scan = Decimate.cached(filmID: id, count: facts.sourceCount) else {
+                startDecimateScan(url: facts.url, id: id)
+                return
+            }
+            let resolved = Decimate.resolve(preprocess.decimateInForce, diffs: scan)
+            decimateNote = resolved.note
+            switchMap(resolved.map)
+        case .auto, .manual:
+            guard let features = TimeAnalysis.cached(filmID: id, count: facts.sourceCount) else {
+                startTimeScan(url: facts.url, id: id)
+                return
+            }
+            let planned = planTime(features, id: id)
+            decimateNote = planned.note
+            switchMap(planned.map)
         }
-        guard let scan = Decimate.cached(filmID: id, count: facts.sourceCount) else {
-            startDecimateScan(url: facts.url, id: id)
-            return
+    }
+
+    /// Solve the plan with the film's corrections. Automatic takes it only when it is clear.
+    private func planTime(_ features: TimeFeatures, id: String) -> (map: TimeMap?, note: String) {
+        let plan = TimePlanner.solve(
+            features,
+            fps: features.fps,
+            overrides: preprocess.overrides,
+            force: preprocess.timing == .manual,
+            solver: SolverParams.cached(filmID: id) ?? .standard
+        )
+        timePlan = plan
+        fitSolverIfNeeded(plan, id: id)
+        do {
+            try TimePlanner.store(plan, filmID: id)
+        } catch {
+            Log.model.error("Zeitplan nicht gespeichert: \(error.localizedDescription, privacy: .public)")
         }
-        let resolved = Decimate.resolve(mode, diffs: scan)
-        decimateNote = resolved.note
-        switchMap(resolved.map)
+        Log.model.info("Zeitplan \(plan.hash, privacy: .public): \(plan.note, privacy: .public)")
+        guard plan.accepted else {
+            return (nil, plan.groups.isEmpty ? "kein Muster erkannt" : plan.note)
+        }
+        return (TimePlanner.map(plan, sharp: features.sharp), plan.note)
+    }
+
+    /// The solver learns its two parameters from the film (a few dozen groups, a few seconds, in the
+    /// background). Until then it uses the standard values; with the fit the plan hash, and so the
+    /// frame cache, changes once.
+    private func fitSolverIfNeeded(_ plan: TimePlan, id: String) {
+        guard plan.accepted, solverFitting != id, SolverParams.cached(filmID: id) == nil,
+              let entry = films.first(where: { $0.id == id }) else { return }
+        solverFitting = id
+        let url = URL(fileURLWithPath: entry.path)
+        Task.detached(priority: .utility) { [weak self] in
+            let result = Result { try SolverFit.estimate(url: url, plan: plan) }
+            await MainActor.run {
+                guard let self else { return }
+                self.solverFitting = nil
+                switch result {
+                case .success(let fit):
+                    do {
+                        try SolverParams.store(fit.params, filmID: id, samples: fit.groups)
+                    } catch {
+                        Log.model.error("Solver-Parameter nicht gespeichert: \(error.localizedDescription, privacy: .public)")
+                        return
+                    }
+                    Log.model.info("Solver-Parameter κ \(fit.params.kappa, privacy: .public) σ² \(fit.params.sigma2, privacy: .public) aus \(fit.groups, privacy: .public) Gruppen")
+                    if self.shownFilmID == id, self.preprocess.plansTime, !self.exporting { self.applyTiming() }
+                case .failure(let error):
+                    Log.model.error("Solver-Parameter nicht geschätzt: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        }
     }
 
     /// `off`, `auto`, `cycle6` or `cycle5`. Returns a message when the name is unknown.
@@ -1842,7 +2015,8 @@ final class Session: ObservableObject {
     var pipelineSummary: String {
         guard let facts else { return "" }
         if let decimateProgress {
-            return "sucht doppelte Bilder … \(Int((decimateProgress * 100).rounded())) %"
+            let what = scanningTime ? "misst Zeitstruktur" : "sucht doppelte Bilder"
+            return "\(what) … \(Int((decimateProgress * 100).rounded())) %"
         }
         let rate = { (fps: Double) in fps.formatted(.number.precision(.fractionLength(0...3))) }
         var text = facts.cycle == nil
@@ -1857,6 +2031,52 @@ final class Session: ObservableObject {
         decimateCancel?.withLock { $0 = true }
         decimateCancel = nil
         decimateProgress = nil
+        scanningTime = false
+    }
+
+    /// Measure the time structure on background threads. The film stays as it is until it is done.
+    private func startTimeScan(url: URL, id: String) {
+        cancelDecimateScan()
+        let token = decimateToken
+        let cancel = OSAllocatedUnfairLock(initialState: false)
+        decimateCancel = cancel
+        decimateProgress = 0
+        scanningTime = true
+        decimateNote = ""
+        Log.model.info("Zeitstruktur-Messung startet \(url.lastPathComponent, privacy: .public)")
+        let report: @Sendable (Double) -> Void = { fraction in
+            Task { @MainActor in self.noteDecimateProgress(fraction, token: token) }
+        }
+        Task.detached(priority: .utility) { [weak self] in
+            let started = CFAbsoluteTimeGetCurrent()
+            let result = Result {
+                try TimeAnalysis.scan(url: url, progress: report, cancelled: { cancel.withLock { $0 } })
+            }
+            if case .success(let features) = result {
+                try? TimeAnalysis.store(features, filmID: id)
+                let seconds = String(format: "%.1f s", CFAbsoluteTimeGetCurrent() - started)
+                Log.model.info("Zeitstruktur \(features.count, privacy: .public) Bilder in \(seconds, privacy: .public)")
+            }
+            await self?.finishTimeScan(result, token: token, id: id)
+        }
+    }
+
+    private func finishTimeScan(_ result: Result<TimeFeatures, Error>, token: Int, id: String) {
+        guard token == decimateToken, shownFilmID == id else { return }
+        decimateCancel = nil
+        decimateProgress = nil
+        scanningTime = false
+        switch result {
+        case .success(let features):
+            guard preprocess.plansTime else { return }
+            let planned = planTime(features, id: id)
+            decimateNote = planned.note
+            switchMap(planned.map)
+        case .failure(let error):
+            if error is CancellationError { return }
+            decimateNote = "Messung fehlgeschlagen: \(error.localizedDescription)"
+            Log.model.error("Zeitstruktur-Messung: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Measure the frame differences on a background thread. The film stays as it is until the scan is done.
@@ -1896,7 +2116,7 @@ final class Session: ObservableObject {
         decimateProgress = nil
         switch result {
         case .success(let diffs):
-            let resolved = Decimate.resolve(preprocess.decimate, diffs: diffs)
+            let resolved = Decimate.resolve(preprocess.decimateInForce, diffs: diffs)
             decimateNote = resolved.note
             switchMap(resolved.map)
         case .failure(let error):

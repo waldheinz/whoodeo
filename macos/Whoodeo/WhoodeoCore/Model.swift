@@ -34,6 +34,9 @@ nonisolated struct PackageInfo {
 nonisolated struct FrameKeys {
     var film: URL
     var slots: [Int]
+    /// Per slot: 0 for the source frame as decoded, otherwise which computed frame stands there
+    /// (a time plan's reconstruction), so it never shares features with the plain frame.
+    var variants: [Int] = []
 }
 
 nonisolated struct Prediction {

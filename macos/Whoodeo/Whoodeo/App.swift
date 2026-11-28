@@ -47,6 +47,9 @@ struct WhoodeoApp: App {
                 Button("Exportieren…") { session.pickExport() }
                     .keyboardShortcut("e")
                     .disabled(!session.canExport)
+                Button("Aktuelles Bild exportieren") { session.exportCurrentFrame() }
+                    .keyboardShortcut("e", modifiers: [.command, .shift])
+                    .disabled(session.frameCount == 0)
             }
             CommandGroup(after: .pasteboard) {
                 Button("Modell in den Papierkorb legen") { session.askDelete() }
@@ -115,7 +118,10 @@ nonisolated enum CLI {
         case "--upscale": try upscale(args)
         case "--decimate": try decimate(args)
         case "--move-cache": try moveCache(args)
-        default: throw CLIError(usage)
+        case "--timeplan": try timePlan(args)
+        case "--timeplan-selftest": try timePlanSelfTest()
+        case "--export-frame": try exportFrame(args)
+        default: throw CLIError(usage + "\n" + timePlanUsage + "\n" + exportFrameUsage)
         }
     }
 
@@ -294,7 +300,7 @@ nonisolated enum CLI {
     }
 
     /// The codec the window would feed: automatic MPEG-2 uses unknown until that slot is trained.
-    private static func wantedCodec(_ choice: CodecChoice, film: SourceCodec) -> SourceCodec {
+    static func wantedCodec(_ choice: CodecChoice, film: SourceCodec) -> SourceCodec {
         let wanted = choice.resolve(film: film)
         if choice == .auto, wanted == .mpeg2 { return .unknown }
         return wanted

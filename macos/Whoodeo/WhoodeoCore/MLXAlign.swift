@@ -50,6 +50,7 @@ nonisolated final class MLXAlignModel {
     private struct FrameKey: Hashable {
         var film: URL
         var slot: Int
+        var variant: Int
         var width: Int
         var height: Int
         var condition: [Float]
@@ -377,7 +378,16 @@ nonisolated final class MLXAlignModel {
         let low = MLXArray(stack, [1, channels, height, width]).transposed(0, 2, 3, 1)
         let cond = MLXArray(condition, [1, config.condition_size])
         let keys = frames.map { frames in
-            frames.slots.map { FrameKey(film: frames.film, slot: $0, width: width, height: height, condition: condition) }
+            frames.slots.indices.map { index in
+                FrameKey(
+                    film: frames.film,
+                    slot: frames.slots[index],
+                    variant: frames.variants.indices.contains(index) ? frames.variants[index] : 0,
+                    width: width,
+                    height: height,
+                    condition: condition
+                )
+            }
         }
         var next: [FrameKey: MLXArray] = [:]
         let out = self(low, condition: cond) { index, compute in

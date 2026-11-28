@@ -433,6 +433,14 @@ int source_count(const SourceFile *file) { return file->count; }
 int source_bits(const SourceFile *file) { return file->bits; }
 double source_fps(const SourceFile *file) { return file->fps; }
 
+int source_clipped(const SourceFile *file) { return file != NULL ? file->clipped : 0; }
+
+int source_declared(const SourceFile *file) {
+    if (file == NULL || file->fmt == NULL || file->video < 0) return 0;
+    int64_t declared = file->fmt->streams[file->video]->nb_frames;
+    return declared > 0 && declared < INT32_MAX ? (int)declared : 0;
+}
+
 const char *source_codec(const SourceFile *file) {
     if (file == NULL || file->fmt == NULL || file->video < 0) return "";
     return avcodec_get_name(file->fmt->streams[file->video]->codecpar->codec_id);

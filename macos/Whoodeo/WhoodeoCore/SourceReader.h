@@ -24,6 +24,10 @@ int source_height(const SourceFile *file);
 int source_count(const SourceFile *file);
 int source_bits(const SourceFile *file);
 double source_fps(const SourceFile *file);
+// The file ends before its index or header says: the count stops at the last readable picture.
+int source_clipped(const SourceFile *file);
+// Pictures the container header claims, 0 when it names none.
+int source_declared(const SourceFile *file);
 // FFmpeg's short name of the picture codec, "h264", "mpeg4", "mpeg2video", and so on.
 const char *source_codec(const SourceFile *file);
 int source_time(const SourceFile *file, int index, int64_t *value, int32_t *timescale);

@@ -4,6 +4,7 @@ import SwiftUI
 /// Source and preprocessing feed the upscaler; light and color work on its output, live.
 struct PipelinePanel: View {
     @EnvironmentObject private var session: Session
+    @State private var showsPlan = false
 
     var body: some View {
         ScrollView {
@@ -24,20 +25,32 @@ struct PipelinePanel: View {
     private var source: some View {
         VStack(alignment: .leading, spacing: 8) {
             header("Quelle")
-            Picker("Doppelte Bilder", selection: Binding(
-                get: { session.preprocess.decimate },
-                set: { session.setDecimate($0) }
+            Picker("Zeitstruktur", selection: Binding(
+                get: { session.preprocess.timing },
+                set: { session.setTiming($0) }
             )) {
-                ForEach(DecimateMode.allCases) { mode in
+                ForEach(TimingMode.allCases) { mode in
                     Text(mode.title).tag(mode)
                 }
             }
             .pickerStyle(.menu)
             .disabled(session.facts == nil || session.exporting)
-            .help("Lässt das Bild weg, das ein Transcode in jedem 6er- oder 5er-Takt wiederholt hat. Der Film läuft dann gleichmäßig mit seiner echten Bildrate, der Ton bleibt synchron. Automatisch sucht den Takt im Film.")
+            .help("Liest, wie ein Transcode die Bilder des Films umgerechnet hat, und macht das rückgängig. Automatisch misst den Film und rekonstruiert Mischbilder (Muster A, 25 → 30 fps), wenn das Muster klar ist; sonst bleibt der Film, wie er ist. Manuell nimmt den Plan auch bei geringer Zuversicht und folgt den Korrekturen im Detailfenster. Nur doppelte Bilder lässt das wiederholte Bild jedes 6er- oder 5er-Takts weg. Der Film läuft danach gleichmäßig, der Ton bleibt synchron.")
+            if session.preprocess.timing == .duplicates {
+                Picker("Takt", selection: Binding(
+                    get: { session.preprocess.decimateInForce },
+                    set: { session.setDecimate($0) }
+                )) {
+                    ForEach(DecimateMode.allCases.filter { $0 != .off }) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(session.facts == nil || session.exporting)
+            }
             if let progress = session.decimateProgress {
                 ProgressView(value: progress) {
-                    Text("Sucht doppelte Bilder …")
+                    Text(session.scanningTime ? "Misst Zeitstruktur …" : "Sucht doppelte Bilder …")
                 }
                 .controlSize(.small)
                 .font(.caption)
@@ -46,7 +59,20 @@ struct PipelinePanel: View {
                     .font(.caption)
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                if let warning = TimePlanSheet.warning(session.timePlan) {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                if session.timePlan != nil {
+                    Button("Zeitstruktur-Details …") { showsPlan = true }
+                        .controlSize(.small)
+                }
             }
+        }
+        .sheet(isPresented: $showsPlan) {
+            TimePlanSheet()
+                .environmentObject(session)
         }
     }
 

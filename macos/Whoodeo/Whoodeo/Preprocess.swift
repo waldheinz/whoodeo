@@ -5,19 +5,39 @@ import os
 /// A new stage is one more field here plus its part of the frame map or the picture, and a cache tag.
 /// Engine, export and model only ever see the film the stages make.
 nonisolated struct PreprocessConfig: Codable, Hashable, Sendable {
+    /// Which repeat cycle "nur doppelte Bilder" drops. Older lists only have this field.
     var decimate: DecimateMode = .off
+    /// How the time structure is read: off, a time plan (automatic or manual), or repeats only.
+    var timing: TimingMode = .off
+    /// Corrections of the time plan for stretches of the film.
+    var overrides: [TimeOverride] = []
 
     static let none = PreprocessConfig()
 
-    init(decimate: DecimateMode = .off) {
+    init(decimate: DecimateMode = .off, timing: TimingMode? = nil, overrides: [TimeOverride] = []) {
         self.decimate = decimate
+        self.timing = timing ?? (decimate == .off ? .off : .duplicates)
+        self.overrides = overrides
     }
 
     /// Missing keys keep their default, so older lists and later stages read alike.
+    /// A list from before time plans that drops repeats reads as "nur doppelte Bilder".
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         decimate = (try? values.decodeIfPresent(DecimateMode.self, forKey: .decimate)) ?? .off
+        timing = (try? values.decodeIfPresent(TimingMode.self, forKey: .timing))
+            ?? (decimate == .off ? .off : .duplicates)
+        overrides = (try? values.decodeIfPresent([TimeOverride].self, forKey: .overrides)) ?? []
     }
+
+    /// The repeat mode in force: only "nur doppelte Bilder" drops repeats.
+    var decimateInForce: DecimateMode {
+        guard timing == .duplicates else { return .off }
+        return decimate == .off ? .auto : decimate
+    }
+
+    /// A time plan is wanted.
+    var plansTime: Bool { timing == .auto || timing == .manual }
 }
 
 /// Repeated frames a transcode put in to reach its rate: one of every `cycle` frames is a copy.
@@ -54,18 +74,53 @@ nonisolated enum DecimateMode: String, Codable, CaseIterable, Identifiable, Send
     }
 }
 
-/// Which source frames make the film the app sees. Index `i` is source frame `raw[i]`.
-nonisolated struct FrameMap: Equatable, Sendable {
+/// The old name: a map of kept source frames is a time map whose frames are all copies.
+typealias FrameMap = TimeMap
+
+/// Which source frames make the film the app sees. Index `i` is source frame `raw[i]`,
+/// or, where `ops` says so, a frame the time solver computes around it. Frames are timed
+/// evenly: `cycle` source frames become `cycle - 1`.
+nonisolated struct TimeMap: Equatable, Sendable {
     /// Frames of the file the map was made for.
     let rawCount: Int
     /// Source frames per cycle; one of them is dropped.
     let cycle: Int
     let raw: [Int]
+    /// Per frame: 0 shows `raw[i]`, otherwise a TimeSolver recipe. Empty when every frame is a copy.
+    let ops: [UInt8]
+    /// Short hash of the time plan the map follows, nil for a plain decimate map.
+    let plan: String?
+    /// What the solver reconstructs with. Already part of `plan`'s hash.
+    let solver: SolverParams
+
+    init(rawCount: Int, cycle: Int, raw: [Int], ops: [UInt8] = [], plan: String? = nil, solver: SolverParams = .standard) {
+        self.rawCount = rawCount
+        self.cycle = cycle
+        self.raw = raw
+        self.ops = ops
+        self.plan = plan
+        self.solver = solver
+    }
 
     var count: Int { raw.count }
 
-    /// Suffix of the frame cache, so a decimated film never shares an archive with the plain one.
-    var cacheTag: String { "dec\(cycle)" }
+    /// Suffix of the frame cache, so a decimated or reconstructed film never shares an archive
+    /// with the plain one, and another plan never with this one.
+    /// Includes the solver version, so a new reconstruction never reads an older archive.
+    var cacheTag: String { plan.map { "tp\(TimeSolver.version)-\($0)" } ?? "dec\(cycle)" }
+
+    func op(at index: Int) -> UInt8 {
+        ops.indices.contains(index) ? ops[index] : 0
+    }
+
+    /// What the model's feature reuse keys a frame by besides its source frame: 0 for a copy,
+    /// otherwise the recipe and the plan, so features of one plan never stand in for another's.
+    func variant(at index: Int) -> Int {
+        let op = Int(op(at: index))
+        guard op != 0 else { return 0 }
+        let seed = plan.flatMap { Int($0.prefix(6), radix: 16) } ?? 0
+        return seed << 4 | op
+    }
 
     func fps(source: Double) -> Double {
         source * Double(cycle - 1) / Double(cycle)

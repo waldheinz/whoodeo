@@ -344,6 +344,7 @@ struct ContentView: View {
                     index: session.index,
                     count: session.frameCount,
                     coverage: session.coverage,
+                    plan: session.timePlan.map { TimeStrip(plan: $0, applied: session.facts?.plan == $0.hash) },
                     onPreview: { session.preview($0) },
                     onCommit: { session.endPreview() }
                 )
@@ -436,6 +437,7 @@ private struct FrameSlider: View {
     var index: Int
     var count: Int
     var coverage: Coverage
+    var plan: TimeStrip?
     var onPreview: (Int) -> Void
     var onCommit: () -> Void
 
@@ -449,6 +451,12 @@ private struct FrameSlider: View {
                     .frame(height: 4)
                 CoverageBar(coverage: coverage)
                     .equatable()
+                if let plan {
+                    plan
+                        .equatable()
+                        .frame(height: 2)
+                        .offset(y: 7)
+                }
                 Circle()
                     .fill(Color.white)
                     .shadow(color: .black.opacity(0.35), radius: 0.5, y: 0.5)
@@ -540,5 +548,44 @@ private struct CoverageBar: View, Equatable {
     private func frameIndex(_ pixel: Int, pixels: Int) -> Int {
         guard coverage.count > 0, pixels > 0 else { return 0 }
         return min(coverage.count, pixel * coverage.count / pixels)
+    }
+}
+
+/// The time plan under the track: green where mixes are rebuilt (paler when less sure),
+/// grey where the originals run, orange where the plan is unsure or the film ends early.
+/// Dimmed while the plan is not in force.
+struct TimeStrip: View, Equatable {
+    var plan: TimePlan
+    var applied: Bool
+
+    var body: some View {
+        Canvas { context, size in
+            guard plan.count > 0 else { return }
+            let scale = size.width / CGFloat(plan.count)
+            for segment in plan.segments {
+                let rect = CGRect(
+                    x: CGFloat(segment.from) * scale,
+                    y: 0,
+                    width: max(CGFloat(segment.to - segment.from) * scale, 1),
+                    height: size.height
+                )
+                context.fill(Path(rect), with: .color(TimeStrip.color(segment)))
+            }
+            if plan.usable < plan.count {
+                let rect = CGRect(x: CGFloat(plan.usable) * scale, y: 0, width: size.width - CGFloat(plan.usable) * scale, height: size.height)
+                context.fill(Path(rect), with: .color(.orange))
+            }
+        }
+        .opacity(applied ? 1 : 0.35)
+        .allowsHitTesting(false)
+    }
+
+    static func color(_ segment: TimeSegment) -> Color {
+        switch segment.kind {
+        case .original:
+            return Color.secondary.opacity(0.5)
+        case .blend:
+            return segment.confidence < 0.3 ? .orange : Color.green.opacity(0.45 + 0.55 * segment.confidence)
+        }
     }
 }
