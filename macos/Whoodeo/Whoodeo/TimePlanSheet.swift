@@ -29,8 +29,6 @@ struct TimePlanSheet: View {
                         Text(segment.kind == .blend ? "\(Int((segment.confidence * 100).rounded())) %" : "–").monospacedDigit()
                     }
                     .width(min: 70, ideal: 80)
-                    TableColumn("Rückfall") { Text($0.fallbacks > 0 ? "\($0.fallbacks)" : "").monospacedDigit() }
-                        .width(min: 50, ideal: 60)
                     TableColumn("Korrektur") { segment in
                         Text(correction(for: segment) ?? "")
                     }
@@ -58,7 +56,7 @@ struct TimePlanSheet: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Zeitstruktur").font(.headline)
             Text(plan.note).font(.callout)
-            Text("\(plan.groups.count) Gruppen (\(plan.fallback.count) Rückfall) · \(Int((plan.coverage * 100).rounded())) % rekonstruiert · \(plan.jumps) Phasensprünge · Zuversicht \(Int((plan.confidence * 100).rounded())) % · Plan \(plan.hash)\(plan.accepted ? "" : " · nicht übernommen")")
+            Text("\(plan.groups.count) Gruppen · \(Int((plan.coverage * 100).rounded())) % rekonstruiert · \(plan.jumps) Phasensprünge · Zuversicht \(Int((plan.confidence * 100).rounded())) % · Plan \(plan.hash)\(plan.accepted ? "" : " · nicht übernommen")")
                 .font(.caption)
                 .monospacedDigit()
                 .foregroundStyle(.secondary)

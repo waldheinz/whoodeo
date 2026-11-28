@@ -107,7 +107,7 @@ nonisolated struct TimeMap: Equatable, Sendable {
     /// Suffix of the frame cache, so a decimated or reconstructed film never shares an archive
     /// with the plain one, and another plan never with this one.
     /// Includes the solver version, so a new reconstruction never reads an older archive.
-    var cacheTag: String { plan.map { "tp\(TimeSolver.version)-\($0)" } ?? "dec\(cycle)" }
+    var cacheTag: String { plan.map { "tp\(TimeSolver.version)m\(TimePlanner.layout)-\($0)" } ?? "dec\(cycle)" }
 
     func op(at index: Int) -> UInt8 {
         ops.indices.contains(index) ? ops[index] : 0

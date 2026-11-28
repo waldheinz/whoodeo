@@ -158,7 +158,7 @@ nonisolated enum FrameExport {
         return folder
     }
 
-    /// Where the frame sits in the plan: its group start, whether that group falls back to copies.
+    /// Where the frame sits in the plan: its group start, and whether that group is reconstructed.
     private static func planInfo(_ plan: TimePlan, main: Int, op: UInt8) -> [String: Any] {
         func start(of group: [Int], containing frame: Int) -> Int? {
             var low = 0
@@ -169,22 +169,17 @@ nonisolated enum FrameExport {
             }
             return low > 0 ? group[low - 1] : nil
         }
-        let all = (plan.groups + plan.fallback).sorted()
         var result: [String: Any] = [
             "hash": plan.hash,
             "angenommen": plan.accepted,
             "gruppen": plan.groups.count,
-            "rueckfall_gruppen": plan.fallback.count,
         ]
-        if let group = start(of: all, containing: main), main <= group + 6 {
-            let fallback = plan.fallback.contains(group)
+        if let group = start(of: plan.groups, containing: main), main <= group + 6 {
             result["gruppenstart"] = group
             result["gruppenstart_o_nummer"] = main - group
-            result["fallback"] = fallback
-            result["gruppe_typ"] = fallback ? "Rückfall (Kopien)" : "rekonstruiert"
+            result["gruppe_typ"] = "rekonstruiert"
         } else {
             result["gruppenstart"] = NSNull()
-            result["fallback"] = NSNull()
             result["gruppe_typ"] = "keine Gruppe (Originale)"
         }
         if let segment = plan.segments.first(where: { main >= $0.from && main < $0.to }) {

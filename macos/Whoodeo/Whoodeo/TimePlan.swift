@@ -295,8 +295,6 @@ nonisolated struct TimeSegment: Codable, Equatable, Hashable, Sendable, Identifi
     var phase: Int?
     /// 0…1 from how clearly the right phase stands out from the others.
     var confidence: Double
-    /// Groups that copy because their mix did not fit.
-    var fallbacks: Int
     /// An override set this stretch.
     var forced: Bool
 
@@ -305,7 +303,7 @@ nonisolated struct TimeSegment: Codable, Equatable, Hashable, Sendable, Identifi
 
 /// What the planner made of a film: which groups are reconstructed, which stretches stay original.
 nonisolated struct TimePlan: Codable, Equatable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     var version: Int
     /// Frames of the file and how many of them decode.
@@ -313,9 +311,8 @@ nonisolated struct TimePlan: Codable, Equatable, Sendable {
     var usable: Int
     var declared: Int
     var sourceFps: Double
-    /// Starts (O0) of the type A groups, and the ones among them that copy instead.
+    /// Starts (O0) of the type A groups.
     var groups: [Int]
-    var fallback: [Int]
     var segments: [TimeSegment]
     /// Share of the readable frames inside reconstructed groups.
     var coverage: Double
@@ -338,8 +335,6 @@ nonisolated enum TimePlanner {
     struct Parameters {
         /// Cost of a frame outside a group, in units of the local noise level L.
         var gapCost: Double = 2.0
-        /// A group whose residual exceeds this many L copies instead of reconstructing.
-        var fallbackQ: Double = 3.0
         /// Type A when the residual is at most this share of the motion across the group
         /// (measured: type A 0.14…0.25, a ramp mix 0.30…0.39, as medians over ±25 groups).
         var maxRatio: Double = 0.27
@@ -470,18 +465,15 @@ nonisolated enum TimePlanner {
         }
 
         var kept: [Int] = []
-        var fallback: [Int] = []
         var keptSmooth: [Double] = []
         for index in starts.indices where keep[index] {
             let start = starts[index]
             kept.append(start)
             keptSmooth.append(smooth[index])
-            if rg[start] / level[start] >= parameters.fallbackQ { fallback.append(start) }
         }
 
         // Segments: a new mixing stretch at every phase change, original stretches between.
         var segments: [TimeSegment] = []
-        let fallbackSet = Set(fallback)
         func confidence(_ value: Double) -> Double {
             value.isNaN ? 0.5 : min(max((0.30 - value) / 0.15, 0), 1)
         }
@@ -503,21 +495,20 @@ nonisolated enum TimePlanner {
                     segmentFrom = cursor
                     jumps += 1
                 } else {
-                    segments.append(TimeSegment(from: cursor, to: from, kind: .original, phase: nil, confidence: 0, fallbacks: 0, forced: forced(cursor, from)))
+                    segments.append(TimeSegment(from: cursor, to: from, kind: .original, phase: nil, confidence: 0, forced: forced(cursor, from)))
                 }
             }
             let values = keptSmooth[index...end].filter { !$0.isNaN }
             segments.append(TimeSegment(
                 from: segmentFrom, to: to, kind: .blend, phase: from % 6,
                 confidence: confidence(values.isEmpty ? .nan : median(values)),
-                fallbacks: kept[index...end].filter { fallbackSet.contains($0) }.count,
                 forced: forced(segmentFrom, to)
             ))
             cursor = to
             index = end + 1
         }
         if cursor < n {
-            segments.append(TimeSegment(from: cursor, to: n, kind: .original, phase: nil, confidence: 0, fallbacks: 0, forced: forced(cursor, n)))
+            segments.append(TimeSegment(from: cursor, to: n, kind: .original, phase: nil, confidence: 0, forced: forced(cursor, n)))
         }
 
         let coverage = n > 0 ? Double(kept.count * 6) / Double(n) : 0
@@ -542,7 +533,7 @@ nonisolated enum TimePlanner {
         }
         var plan = TimePlan(
             version: TimePlan.currentVersion, count: features.count, usable: n, declared: features.declared,
-            sourceFps: fps, groups: kept, fallback: fallback, segments: segments,
+            sourceFps: fps, groups: kept, segments: segments,
             coverage: coverage, confidence: meanConfidence, jumps: jumps,
             accepted: accepted, note: notes.joined(separator: " · "), hash: "", solver: solver
         )
@@ -579,7 +570,7 @@ nonisolated enum TimePlanner {
 
     private static func hash(of plan: TimePlan) -> String {
         var data = Data()
-        for value in [plan.version, plan.count, plan.usable] + plan.groups + [-1] + plan.fallback + [-2] + plan.solver.hashWords {
+        for value in [plan.version, plan.count, plan.usable] + plan.groups + [-1] + plan.solver.hashWords {
             withUnsafeBytes(of: Int64(value).littleEndian) { data.append(contentsOf: $0) }
         }
         return SHA256.hash(data: data).prefix(4).map { String(format: "%02x", $0) }.joined()
@@ -592,13 +583,16 @@ nonisolated enum TimePlanner {
         return rest > 3 || (rest == 3 && whole % 2 == 1) ? whole + 1 : whole
     }
 
-    /// The film the app sees: five frames per group (O0, O1, O2, S3, S4; a fallback group
-    /// O0, O1, O2, O2, O6), elsewhere the sharpest five of every six originals.
+    /// Bumped when the frame layout of the map changes, so the frame cache keeps no older numbering.
+    /// 3: every type-A group is reconstructed (no copy fallback), and every group gives exactly five frames.
+    static let layout = 3
+
+    /// The film the app sees: five frames per group (O0, O1, O2, S3, S4),
+    /// elsewhere the sharpest five of every six originals.
     static func map(_ plan: TimePlan, sharp: [Float]) -> TimeMap {
         let n = plan.usable
         var kind = [UInt8](repeating: 0, count: n)
         for start in plan.groups where start + 6 < n { kind[start] = 1 }
-        for start in plan.fallback where start + 6 < n { kind[start] = 2 }
         var raw: [Int] = []
         var ops: [UInt8] = []
         raw.reserveCapacity(target(plan.count) + 8)
@@ -610,13 +604,11 @@ nonisolated enum TimePlanner {
         var t = 0
         while t < n {
             if kind[t] != 0 {
-                let rebuilt = kind[t] == 1
-                let last: (Int, UInt8) = rebuilt ? (t + 5, TimeSolver.opS4) : (t + 6, 0)
-                let fourth: (Int, UInt8) = rebuilt ? (t + 3, TimeSolver.opS3) : (t + 2, 0)
-                let outs: [(Int, UInt8)] = [(t, 0), (t + 1, 0), (t + 2, 0), fourth, last]
-                let need = target(t + 6) - raw.count
-                for out in outs.prefix(max(0, need)) { emit(out.0, out.1) }
-                if need > 5 { for _ in 0..<(need - 5) { emit(outs[4].0, outs[4].1) } }
+                let outs: [(Int, UInt8)] = [(t, 0), (t + 1, 0), (t + 2, 0), (t + 3, TimeSolver.opS3), (t + 5, TimeSolver.opS4)]
+                // Always all five. Counting by `target` would round a tie (group ends at source frame
+                // 3 mod 6) up and down in turns: one group showing its last frame twice, the next without it.
+                // The originals around a run take up the rounding.
+                for out in outs { emit(out.0, out.1) }
                 t += 6
                 continue
             }

@@ -86,7 +86,7 @@ nonisolated extension CLI {
         let originalFrames = originals.reduce(0) { $0 + $1.to - $1.from }
         fputs("Datei: \(features.count) Bilder lesbar \(plan.usable), laut Kopf \(features.declared)\(features.clipped ? ", abgeschnitten" : "")\(features.failedAt.map { ", Bild \($0) dekodiert nicht" } ?? "")\n", stdout)
         fputs(String(format: "Plan %@ in %.0f ms: %@\n", plan.hash, solveMs, plan.note), stdout)
-        fputs("  Gruppen \(plan.groups.count) (Rückfall \(plan.fallback.count)), Abdeckung \(String(format: "%.1f", plan.coverage * 100)) %, Zuversicht \(String(format: "%.2f", plan.confidence))\n", stdout)
+        fputs("  Gruppen \(plan.groups.count), Abdeckung \(String(format: "%.1f", plan.coverage * 100)) %, Zuversicht \(String(format: "%.2f", plan.confidence))\n", stdout)
         fputs("  Abschnitte: \(blends.count) Mischung, \(originals.count) Original (\(originalFrames) Bilder), Phasensprünge \(plan.jumps)\n", stdout)
         if plan.accepted {
             fputs("  übernommen: \(film.source.count) → \(map.count) Bilder, \(film.source.fps) → \(map.fps(source: film.source.fps)) fps, \(map.ops.filter { $0 != 0 }.count) rekonstruiert, Cache-Tag \(map.cacheTag)\n", stdout)
@@ -94,7 +94,7 @@ nonisolated extension CLI {
             fputs("  nicht übernommen (Automatisch bleibt aus): \(film.source.count) Bilder, \(film.source.fps) fps\n", stdout)
         }
         for segment in plan.segments.prefix(json ? Int.max : 12) {
-            fputs("  \(clock(segment.from, film.source.fps))–\(clock(segment.to, film.source.fps))  \(segment.kind.rawValue)\(segment.phase.map { " Phase \($0)" } ?? "")  Zuversicht \(String(format: "%.2f", segment.confidence))\(segment.fallbacks > 0 ? "  Rückfall \(segment.fallbacks)" : "")\(segment.forced ? "  (manuell)" : "")\n", stdout)
+            fputs("  \(clock(segment.from, film.source.fps))–\(clock(segment.to, film.source.fps))  \(segment.kind.rawValue)\(segment.phase.map { " Phase \($0)" } ?? "")  Zuversicht \(String(format: "%.2f", segment.confidence))\(segment.forced ? "  (manuell)" : "")\n", stdout)
         }
         if json { fputs("\(TimePlanner.cachedURL(filmID: id).path)\n", stdout) }
         guard plan.accepted else { return }
@@ -192,13 +192,12 @@ nonisolated extension CLI {
         check(wrong == 0, "alle Gruppen in der richtigen Phase (falsch: \(wrong))")
         check(plan.coverage > 0.97, "Abdeckung über 97 %")
         check(plan.jumps == 2, "zwei Phasensprünge (\(plan.jumps))")
-        check(plan.fallback.isEmpty, "kein Rückfall (\(plan.fallback.count))")
         let map = TimePlanner.map(plan, sharp: typeA.sharp)
         check(map.count == TimePlanner.target(count), "Bildzahl \(map.count) = 5/6 von \(count)")
         check(zip(map.raw, map.raw.dropFirst()).allSatisfy { $0 <= $1 }, "Quellbilder laufen vorwärts")
         let s3 = map.ops.filter { $0 == TimeSolver.opS3 }.count
         check(s3 == plan.groups.count, "je Gruppe ein S3 (\(s3))")
-        check(map.cacheTag == "tp\(TimeSolver.version)-\(plan.hash)", "Cache-Tag tp\(TimeSolver.version)-\(plan.hash)")
+        check(map.cacheTag == "tp\(TimeSolver.version)m\(TimePlanner.layout)-\(plan.hash)", "Cache-Tag tp\(TimeSolver.version)m\(TimePlanner.layout)-\(plan.hash)")
         var drift = 0
         for (index, source) in map.raw.enumerated() { drift = max(drift, abs(source - index * 6 / 5)) }
         check(drift <= 6, "höchstens 6 Quellbilder Versatz zur Zeitachse (\(drift))")

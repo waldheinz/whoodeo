@@ -266,8 +266,7 @@ nonisolated enum SolverFit {
     static let residualCap: Float = 100
 
     static func estimate(url: URL, plan: TimePlan, progress: ((Double) -> Void)? = nil) throws -> (params: SolverParams, groups: Int) {
-        let fallback = Set(plan.fallback)
-        let candidates = plan.groups.filter { !fallback.contains($0) && $0 + 6 < plan.usable }
+        let candidates = plan.groups.filter { $0 + 6 < plan.usable }
         guard candidates.count >= 8 else { return (.standard, 0) }
         let film = try Film.open(url)
         let wanted = min(groupCount, candidates.count)
